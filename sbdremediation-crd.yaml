@@ -1,0 +1,72 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: sbdremediations.medik8s.io
+  annotations:
+    api-approved.kubernetes.io: "https://github.com/medik8s/sbd-operator"
+spec:
+  group: medik8s.io
+  versions:
+  - name: v1alpha1
+    served: true
+    storage: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        description: "SBDRemediation is created by an external operator (e.g., Node Healthcheck Operator) to request SBD-based fencing for a specific unhealthy node. The SBD Operator will update its status."
+        properties:
+          apiVersion:
+            type: string
+            description: "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources"
+          kind:
+            type: string
+            description: "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds"
+          metadata:
+            type: object
+          spec:
+            type: object
+            description: "SBDRemediationSpec defines the desired state of SBDRemediation"
+            required:
+            - nodeName
+            properties:
+              nodeName:
+                type: string
+                description: "The name of the node to be remediated"
+                minLength: 1
+              remediationRequestTime:
+                type: string
+                format: date-time
+                description: "Timestamp of when the remediation was requested"
+          status:
+            type: object
+            description: "SBDRemediationStatus defines the observed state of SBDRemediation"
+            properties:
+              phase:
+                type: string
+                description: "Current phase of the remediation (e.g., 'Pending', 'FencingInProgress', 'FencedSuccessfully', 'Failed')"
+                enum:
+                - "Pending"
+                - "FencingInProgress"
+                - "FencedSuccessfully"
+                - "Failed"
+              message:
+                type: string
+                description: "A human-readable message describing the current status or error"
+    additionalPrinterColumns:
+    - name: Node
+      type: string
+      description: "The node to be remediated"
+      jsonPath: .spec.nodeName
+    - name: Phase
+      type: string
+      description: "Current phase of the remediation"
+      jsonPath: .status.phase
+    - name: Age
+      type: date
+      jsonPath: .metadata.creationTimestamp
+  scope: Namespaced
+  names:
+    plural: sbdremediations
+    singular: sbdremediation
+    kind: SBDRemediation
+    listKind: SBDRemediationList 

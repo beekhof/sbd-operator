@@ -23,6 +23,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strconv"
 	"sync"
@@ -44,6 +45,7 @@ var (
 	sbdUpdateInterval = flag.Duration("sbd-update-interval", 5*time.Second, "Interval for updating SBD device with node status")
 	peerCheckInterval = flag.Duration("peer-check-interval", 5*time.Second, "Interval for checking peer heartbeats")
 	logLevel          = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
+	rebootMethod      = flag.String("reboot-method", "panic", "Method to use for self-fencing (panic, systemctl-reboot)")
 )
 
 const (
@@ -200,7 +202,7 @@ func (pm *PeerMonitor) GetHealthyPeerCount() int {
 	return count
 }
 
-// SBDAgent represents the main SBD agent application
+// SBDAgent represents the main SBD agent with self-fencing capabilities
 type SBDAgent struct {
 	watchdog          WatchdogInterface
 	sbdDevice         BlockDevice
@@ -211,6 +213,7 @@ type SBDAgent struct {
 	sbdUpdateInterval time.Duration
 	heartbeatInterval time.Duration
 	peerCheckInterval time.Duration
+	rebootMethod      string
 	ctx               context.Context
 	cancel            context.CancelFunc
 	sbdHealthy        bool
@@ -218,21 +221,22 @@ type SBDAgent struct {
 	heartbeatSequence uint64
 	heartbeatSeqMutex sync.Mutex
 	peerMonitor       *PeerMonitor
+	selfFenceDetected bool
+	selfFenceMutex    sync.RWMutex
 }
 
-// NewSBDAgent creates a new SBD agent instance
-func NewSBDAgent(watchdogPath, sbdDevicePath, nodeName string, nodeID uint16, petInterval, sbdUpdateInterval, heartbeatInterval, peerCheckInterval time.Duration, sbdTimeoutSeconds uint) (*SBDAgent, error) {
-	// Initialize watchdog
+// NewSBDAgent creates a new SBD agent with the specified parameters
+func NewSBDAgent(watchdogPath, sbdDevicePath, nodeName string, nodeID uint16, petInterval, sbdUpdateInterval, heartbeatInterval, peerCheckInterval time.Duration, sbdTimeoutSeconds uint, rebootMethod string) (*SBDAgent, error) {
 	wd, err := watchdog.New(watchdogPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize watchdog: %w", err)
+		return nil, fmt.Errorf("failed to create watchdog: %w", err)
 	}
 
-	return NewSBDAgentWithWatchdog(wd, sbdDevicePath, nodeName, nodeID, petInterval, sbdUpdateInterval, heartbeatInterval, peerCheckInterval, sbdTimeoutSeconds)
+	return NewSBDAgentWithWatchdog(wd, sbdDevicePath, nodeName, nodeID, petInterval, sbdUpdateInterval, heartbeatInterval, peerCheckInterval, sbdTimeoutSeconds, rebootMethod)
 }
 
-// NewSBDAgentWithWatchdog creates a new SBD agent instance with a custom watchdog (for testing)
-func NewSBDAgentWithWatchdog(wd WatchdogInterface, sbdDevicePath, nodeName string, nodeID uint16, petInterval, sbdUpdateInterval, heartbeatInterval, peerCheckInterval time.Duration, sbdTimeoutSeconds uint) (*SBDAgent, error) {
+// NewSBDAgentWithWatchdog creates a new SBD agent with the specified watchdog instance
+func NewSBDAgentWithWatchdog(wd WatchdogInterface, sbdDevicePath, nodeName string, nodeID uint16, petInterval, sbdUpdateInterval, heartbeatInterval, peerCheckInterval time.Duration, sbdTimeoutSeconds uint, rebootMethod string) (*SBDAgent, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	agent := &SBDAgent{
@@ -244,18 +248,20 @@ func NewSBDAgentWithWatchdog(wd WatchdogInterface, sbdDevicePath, nodeName strin
 		sbdUpdateInterval: sbdUpdateInterval,
 		heartbeatInterval: heartbeatInterval,
 		peerCheckInterval: peerCheckInterval,
+		rebootMethod:      rebootMethod,
 		ctx:               ctx,
 		cancel:            cancel,
-		sbdHealthy:        true, // Start assuming healthy
+		sbdHealthy:        false,
 		heartbeatSequence: 0,
 		peerMonitor:       NewPeerMonitor(sbdTimeoutSeconds, nodeID),
+		selfFenceDetected: false,
 	}
 
-	// Initialize SBD device if specified
+	// Initialize SBD device if provided
 	if sbdDevicePath != "" {
 		if err := agent.initializeSBDDevice(); err != nil {
-			log.Printf("WARNING: Failed to initialize SBD device: %v", err)
-			agent.setSBDHealthy(false)
+			cancel()
+			return nil, fmt.Errorf("failed to initialize SBD device: %w", err)
 		}
 	}
 
@@ -491,6 +497,12 @@ func (s *SBDAgent) watchdogLoop() {
 			log.Printf("Watchdog loop stopping...")
 			return
 		case <-ticker.C:
+			// Never pet the watchdog if self-fence has been detected
+			if s.isSelfFenceDetected() {
+				log.Printf("CRITICAL: Self-fence detected - STOPPING watchdog petting to allow system reboot")
+				return
+			}
+
 			// Only pet the watchdog if SBD device is healthy (or not configured)
 			if s.sbdDevicePath == "" || s.isSBDHealthy() {
 				if err := s.watchdog.Pet(); err != nil {
@@ -587,6 +599,17 @@ func (s *SBDAgent) peerMonitorLoop() {
 			log.Printf("Peer monitor loop stopping...")
 			return
 		case <-ticker.C:
+			// First, check our own slot for fence messages directed at us
+			if err := s.readOwnSlotForFenceMessage(); err != nil {
+				log.Printf("DEBUG: Error reading own slot for fence messages: %v", err)
+			}
+
+			// If self-fence was detected, stop all operations
+			if s.isSelfFenceDetected() {
+				log.Printf("CRITICAL: Self-fence detected in peer monitor loop - stopping all operations")
+				return
+			}
+
 			// Read heartbeats from all peer slots
 			for peerNodeID := uint16(1); peerNodeID <= sbdprotocol.SBD_MAX_NODES; peerNodeID++ {
 				// Skip our own slot
@@ -680,6 +703,116 @@ func getSBDTimeoutFromEnv() uint {
 	return 30 // Default timeout
 }
 
+// getRebootMethodFromEnv gets the reboot method from environment variables if not provided via flag
+func getRebootMethodFromEnv() string {
+	envVars := []string{"SBD_REBOOT_METHOD", "REBOOT_METHOD"}
+
+	for _, envVar := range envVars {
+		if value := os.Getenv(envVar); value != "" {
+			if value == "panic" || value == "systemctl-reboot" {
+				return value
+			}
+		}
+	}
+
+	return "panic" // Default method
+}
+
+// isSelfFenceDetected checks if a self-fence has been detected
+func (s *SBDAgent) isSelfFenceDetected() bool {
+	s.selfFenceMutex.RLock()
+	defer s.selfFenceMutex.RUnlock()
+	return s.selfFenceDetected
+}
+
+// setSelfFenceDetected sets the self-fence detected flag
+func (s *SBDAgent) setSelfFenceDetected(detected bool) {
+	s.selfFenceMutex.Lock()
+	defer s.selfFenceMutex.Unlock()
+	s.selfFenceDetected = detected
+}
+
+// executeSelfFencing performs the self-fencing action based on the configured method
+func (s *SBDAgent) executeSelfFencing(reason string) {
+	log.Printf("CRITICAL: Self-fencing initiated! Reason: %s", reason)
+	log.Printf("CRITICAL: Reboot method: %s", s.rebootMethod)
+
+	// Mark self-fence as detected to stop watchdog petting
+	s.setSelfFenceDetected(true)
+
+	// Give some time for the log message to be written
+	time.Sleep(100 * time.Millisecond)
+
+	switch s.rebootMethod {
+	case "systemctl-reboot":
+		log.Printf("CRITICAL: Attempting systemctl reboot...")
+		if err := exec.Command("sudo", "systemctl", "reboot").Run(); err != nil {
+			log.Printf("ERROR: Failed to execute systemctl reboot: %v", err)
+			log.Printf("CRITICAL: Falling back to panic method")
+			panic(fmt.Sprintf("Self-fencing via systemctl failed: %v", err))
+		}
+	case "panic":
+		fallthrough
+	default:
+		log.Printf("CRITICAL: Initiating panic for immediate self-fencing")
+		panic(fmt.Sprintf("Self-fencing: %s", reason))
+	}
+}
+
+// readOwnSlotForFenceMessage reads the agent's own slot to check for fence messages
+func (s *SBDAgent) readOwnSlotForFenceMessage() error {
+	if s.sbdDevice == nil || s.sbdDevice.IsClosed() {
+		return fmt.Errorf("SBD device is not available")
+	}
+
+	// Calculate slot offset for our own node
+	slotOffset := int64(s.nodeID) * sbdprotocol.SBD_SLOT_SIZE
+
+	// Read the entire slot
+	slotData := make([]byte, sbdprotocol.SBD_SLOT_SIZE)
+	n, err := s.sbdDevice.ReadAt(slotData, slotOffset)
+	if err != nil {
+		return fmt.Errorf("failed to read own slot %d from offset %d: %w", s.nodeID, slotOffset, err)
+	}
+
+	if n != sbdprotocol.SBD_SLOT_SIZE {
+		return fmt.Errorf("partial read from own slot %d: read %d bytes, expected %d", s.nodeID, n, sbdprotocol.SBD_SLOT_SIZE)
+	}
+
+	// Try to unmarshal the message header
+	header, err := sbdprotocol.Unmarshal(slotData[:sbdprotocol.SBD_HEADER_SIZE])
+	if err != nil {
+		// Not a valid message, could be empty slot or heartbeat we wrote
+		log.Printf("DEBUG: Failed to unmarshal message from own slot: %v", err)
+		return nil
+	}
+
+	// Check if this is a fence message
+	if header.Type == sbdprotocol.SBD_MSG_TYPE_FENCE {
+		// Try to unmarshal as a fence message to get the target
+		fenceMsg, err := sbdprotocol.UnmarshalFence(slotData[:sbdprotocol.SBD_HEADER_SIZE+3])
+		if err != nil {
+			log.Printf("WARNING: Failed to unmarshal fence message from own slot: %v", err)
+			return nil
+		}
+
+		// Check if this fence message is directed at us
+		if fenceMsg.TargetNodeID == s.nodeID {
+			reason := fmt.Sprintf("Fence message received from node %d, reason: %s",
+				fenceMsg.Header.NodeID, sbdprotocol.GetFenceReasonName(fenceMsg.Reason))
+			log.Printf("CRITICAL: Fence message detected in own slot! %s", reason)
+
+			// Execute self-fencing immediately
+			s.executeSelfFencing(reason)
+		} else {
+			log.Printf("DEBUG: Fence message in own slot not directed at us (target: %d, us: %d)",
+				fenceMsg.TargetNodeID, s.nodeID)
+		}
+	}
+
+	return nil
+}
+
 func main() {
 	flag.Parse()
 
@@ -720,6 +853,18 @@ func main() {
 		log.Printf("Using SBD timeout from environment or default: %d seconds", sbdTimeoutValue)
 	}
 
+	// Determine reboot method
+	rebootMethodValue := *rebootMethod
+	if rebootMethodValue == "panic" { // Check if it's still the default
+		rebootMethodValue = getRebootMethodFromEnv()
+		log.Printf("Using reboot method from environment or default: %s", rebootMethodValue)
+	}
+
+	// Validate reboot method
+	if rebootMethodValue != "panic" && rebootMethodValue != "systemctl-reboot" {
+		log.Fatalf("Invalid reboot method: %s (must be 'panic' or 'systemctl-reboot')", rebootMethodValue)
+	}
+
 	// Calculate heartbeat interval (sbdTimeoutSeconds / 2)
 	heartbeatInterval := time.Duration(sbdTimeoutValue/2) * time.Second
 	if heartbeatInterval < time.Second {
@@ -736,7 +881,7 @@ func main() {
 	}
 
 	// Create SBD agent
-	agent, err := NewSBDAgent(*watchdogPath, *sbdDevice, nodeNameValue, nodeIDValue, *watchdogTimeout, *sbdUpdateInterval, heartbeatInterval, *peerCheckInterval, sbdTimeoutValue)
+	agent, err := NewSBDAgent(*watchdogPath, *sbdDevice, nodeNameValue, nodeIDValue, *watchdogTimeout, *sbdUpdateInterval, heartbeatInterval, *peerCheckInterval, sbdTimeoutValue, rebootMethodValue)
 	if err != nil {
 		log.Fatalf("Failed to create SBD agent: %v", err)
 	}

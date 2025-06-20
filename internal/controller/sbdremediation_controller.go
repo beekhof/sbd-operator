@@ -38,6 +38,7 @@ import (
 	"github.com/go-logr/logr"
 	medik8sv1alpha1 "github.com/medik8s/sbd-operator/api/v1alpha1"
 	"github.com/medik8s/sbd-operator/pkg/blockdevice"
+	"github.com/medik8s/sbd-operator/pkg/retry"
 	"github.com/medik8s/sbd-operator/pkg/sbdprotocol"
 )
 
@@ -56,14 +57,27 @@ const (
 	// ReasonWaitingForLeadership indicates waiting for leadership to perform fencing
 	ReasonWaitingForLeadership = "WaitingForLeadership"
 
-	// Retry configuration
-	maxRetryAttempts = 3
-	baseRetryDelay   = 5 * time.Second
-	maxRetryDelay    = 30 * time.Second
+	// Enhanced retry configuration for SBD Remediation operations
+	// MaxFencingRetries is the maximum number of retry attempts for fencing operations
+	MaxFencingRetries = 5
+	// InitialFencingRetryDelay is the initial delay between fencing operation retries
+	InitialFencingRetryDelay = 1 * time.Second
+	// MaxFencingRetryDelay is the maximum delay between fencing operation retries
+	MaxFencingRetryDelay = 30 * time.Second
+	// FencingRetryBackoffFactor is the exponential backoff factor for fencing operation retries
+	FencingRetryBackoffFactor = 2.0
 
 	// Status update retry configuration
-	maxStatusUpdateRetries = 5
-	statusUpdateDelay      = 100 * time.Millisecond
+	MaxStatusUpdateRetries    = 10
+	InitialStatusUpdateDelay  = 100 * time.Millisecond
+	MaxStatusUpdateDelay      = 5 * time.Second
+	StatusUpdateBackoffFactor = 1.5
+
+	// Kubernetes API retry configuration
+	MaxKubernetesAPIRetries    = 3
+	InitialKubernetesAPIDelay  = 200 * time.Millisecond
+	MaxKubernetesAPIDelay      = 10 * time.Second
+	KubernetesAPIBackoffFactor = 2.0
 
 	// Event reasons for SBDRemediation operations
 	ReasonFencingInitiated     = "FencingInitiated"
@@ -90,6 +104,11 @@ type SBDRemediationReconciler struct {
 	// SBD device configuration
 	sbdDevicePath string
 	sbdDevice     *blockdevice.Device
+
+	// Retry configurations for different operation types
+	fencingRetryConfig retry.Config
+	statusRetryConfig  retry.Config
+	apiRetryConfig     retry.Config
 }
 
 // emitEvent is a helper function to emit Kubernetes events for the SBDRemediation controller
@@ -199,6 +218,82 @@ func (r *SBDRemediationReconciler) getOperatorInstanceID() string {
 		return hostname
 	}
 	return "unknown-operator-instance"
+}
+
+// initializeRetryConfigs initializes the retry configurations for different operation types
+func (r *SBDRemediationReconciler) initializeRetryConfigs(logger logr.Logger) {
+	// Configuration for fencing operations (most critical)
+	r.fencingRetryConfig = retry.Config{
+		MaxRetries:    MaxFencingRetries,
+		InitialDelay:  InitialFencingRetryDelay,
+		MaxDelay:      MaxFencingRetryDelay,
+		BackoffFactor: FencingRetryBackoffFactor,
+		Logger:        logger.WithName("fencing-retry"),
+	}
+
+	// Configuration for status updates
+	r.statusRetryConfig = retry.Config{
+		MaxRetries:    MaxStatusUpdateRetries,
+		InitialDelay:  InitialStatusUpdateDelay,
+		MaxDelay:      MaxStatusUpdateDelay,
+		BackoffFactor: StatusUpdateBackoffFactor,
+		Logger:        logger.WithName("status-retry"),
+	}
+
+	// Configuration for Kubernetes API operations
+	r.apiRetryConfig = retry.Config{
+		MaxRetries:    MaxKubernetesAPIRetries,
+		InitialDelay:  InitialKubernetesAPIDelay,
+		MaxDelay:      MaxKubernetesAPIDelay,
+		BackoffFactor: KubernetesAPIBackoffFactor,
+		Logger:        logger.WithName("api-retry"),
+	}
+}
+
+// isTransientKubernetesError determines if a Kubernetes API error is transient and should be retried
+func (r *SBDRemediationReconciler) isTransientKubernetesError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Check for specific transient Kubernetes errors
+	if apierrors.IsConflict(err) ||
+		apierrors.IsServerTimeout(err) ||
+		apierrors.IsServiceUnavailable(err) ||
+		apierrors.IsTooManyRequests(err) ||
+		apierrors.IsTimeout(err) {
+		return true
+	}
+
+	// Check for temporary network issues
+	errMsg := err.Error()
+	transientPatterns := []string{
+		"connection refused",
+		"timeout",
+		"temporary failure",
+		"try again",
+		"server is currently unable",
+	}
+
+	for _, pattern := range transientPatterns {
+		if strings.Contains(strings.ToLower(errMsg), pattern) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// performKubernetesAPIOperationWithRetry performs a Kubernetes API operation with retry logic
+func (r *SBDRemediationReconciler) performKubernetesAPIOperationWithRetry(ctx context.Context, operation string, fn func() error, logger logr.Logger) error {
+	return retry.Do(ctx, r.apiRetryConfig, operation, func() error {
+		err := fn()
+		if err != nil {
+			// Wrap error with retry information
+			return retry.NewRetryableError(err, r.isTransientKubernetesError(err), operation)
+		}
+		return nil
+	})
 }
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
@@ -411,10 +506,10 @@ func (r *SBDRemediationReconciler) initializeSBDDevice(ctx context.Context, logg
 // performFencingWithRetry performs the fencing operation with retry logic for transient errors
 func (r *SBDRemediationReconciler) performFencingWithRetry(ctx context.Context, sbdRemediation *medik8sv1alpha1.SBDRemediation, targetNodeID uint16, logger logr.Logger) error {
 	var lastErr error
-	for attempt := 1; attempt <= maxRetryAttempts; attempt++ {
+	for attempt := 1; attempt <= MaxFencingRetries; attempt++ {
 		logger.Info("Attempting fencing operation",
 			"attempt", attempt,
-			"max-attempts", maxRetryAttempts,
+			"max-attempts", MaxFencingRetries,
 			"target-node", sbdRemediation.Spec.NodeName)
 
 		err := r.performFencing(ctx, sbdRemediation, targetNodeID)
@@ -433,14 +528,14 @@ func (r *SBDRemediationReconciler) performFencingWithRetry(ctx context.Context, 
 		}
 
 		// If this is the last attempt, don't wait
-		if attempt == maxRetryAttempts {
+		if attempt == MaxFencingRetries {
 			break
 		}
 
 		// Calculate exponential backoff delay
-		delay := time.Duration(attempt) * baseRetryDelay
-		if delay > maxRetryDelay {
-			delay = maxRetryDelay
+		delay := time.Duration(attempt) * InitialFencingRetryDelay
+		if delay > MaxFencingRetryDelay {
+			delay = MaxFencingRetryDelay
 		}
 
 		logger.Info("Fencing attempt failed, retrying",
@@ -458,7 +553,7 @@ func (r *SBDRemediationReconciler) performFencingWithRetry(ctx context.Context, 
 	}
 
 	// All attempts failed
-	return fmt.Errorf("fencing failed after %d attempts, last error: %w", maxRetryAttempts, lastErr)
+	return fmt.Errorf("fencing failed after %d attempts, last error: %w", MaxFencingRetries, lastErr)
 }
 
 // performFencing performs the actual fencing operation by writing a fence message to the SBD device
@@ -611,7 +706,7 @@ func (r *SBDRemediationReconciler) updateStatusRobust(ctx context.Context, sbdRe
 	// Update the status with retry logic
 	if err := r.updateStatusWithRetry(ctx, sbdRemediation); err != nil {
 		logger.Error(err, "Failed to update SBDRemediation status", "phase", phase, "message", message)
-		return ctrl.Result{RequeueAfter: baseRetryDelay}, err
+		return ctrl.Result{RequeueAfter: InitialFencingRetryDelay}, err
 	}
 
 	logger.Info("Status updated successfully", "phase", phase, "message", message)
@@ -637,11 +732,11 @@ func (r *SBDRemediationReconciler) updateStatusWithRetry(ctx context.Context, sb
 	logger := logf.FromContext(ctx)
 
 	return wait.ExponentialBackoff(wait.Backoff{
-		Duration: statusUpdateDelay,
-		Factor:   2.0,
+		Duration: InitialStatusUpdateDelay,
+		Factor:   StatusUpdateBackoffFactor,
 		Jitter:   0.1,
-		Steps:    maxStatusUpdateRetries,
-		Cap:      time.Second,
+		Steps:    MaxStatusUpdateRetries,
+		Cap:      MaxStatusUpdateDelay,
 	}, func() (bool, error) {
 		// Get the latest version to avoid conflicts
 		latest := &medik8sv1alpha1.SBDRemediation{}

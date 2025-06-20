@@ -19,6 +19,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -35,6 +37,7 @@ import (
 
 	"github.com/go-logr/logr"
 	medik8sv1alpha1 "github.com/medik8s/sbd-operator/api/v1alpha1"
+	"github.com/medik8s/sbd-operator/pkg/retry"
 )
 
 // Event types and reasons for SBDConfig controller
@@ -50,6 +53,16 @@ const (
 	ReasonReconcileError      = "ReconcileError"
 	ReasonDaemonSetError      = "DaemonSetError"
 	ReasonNamespaceError      = "NamespaceError"
+
+	// Retry configuration constants for SBDConfig controller
+	// MaxSBDConfigRetries is the maximum number of retry attempts for SBDConfig operations
+	MaxSBDConfigRetries = 3
+	// InitialSBDConfigRetryDelay is the initial delay between SBDConfig operation retries
+	InitialSBDConfigRetryDelay = 500 * time.Millisecond
+	// MaxSBDConfigRetryDelay is the maximum delay between SBDConfig operation retries
+	MaxSBDConfigRetryDelay = 10 * time.Second
+	// SBDConfigRetryBackoffFactor is the exponential backoff factor for SBDConfig operation retries
+	SBDConfigRetryBackoffFactor = 2.0
 )
 
 // SBDConfigReconciler reconciles a SBDConfig object
@@ -57,6 +70,66 @@ type SBDConfigReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
 	Recorder record.EventRecorder
+
+	// Retry configuration for Kubernetes API operations
+	retryConfig retry.Config
+}
+
+// initializeRetryConfig initializes the retry configuration for SBDConfig operations
+func (r *SBDConfigReconciler) initializeRetryConfig(logger logr.Logger) {
+	r.retryConfig = retry.Config{
+		MaxRetries:    MaxSBDConfigRetries,
+		InitialDelay:  InitialSBDConfigRetryDelay,
+		MaxDelay:      MaxSBDConfigRetryDelay,
+		BackoffFactor: SBDConfigRetryBackoffFactor,
+		Logger:        logger.WithName("sbdconfig-retry"),
+	}
+}
+
+// isTransientKubernetesError determines if a Kubernetes API error is transient and should be retried
+func (r *SBDConfigReconciler) isTransientKubernetesError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Check for specific transient Kubernetes errors
+	if errors.IsConflict(err) ||
+		errors.IsServerTimeout(err) ||
+		errors.IsServiceUnavailable(err) ||
+		errors.IsTooManyRequests(err) ||
+		errors.IsTimeout(err) {
+		return true
+	}
+
+	// Check for temporary network issues
+	errMsg := err.Error()
+	transientPatterns := []string{
+		"connection refused",
+		"timeout",
+		"temporary failure",
+		"try again",
+		"server is currently unable",
+	}
+
+	for _, pattern := range transientPatterns {
+		if strings.Contains(strings.ToLower(errMsg), pattern) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// performKubernetesAPIOperationWithRetry performs a Kubernetes API operation with retry logic
+func (r *SBDConfigReconciler) performKubernetesAPIOperationWithRetry(ctx context.Context, operation string, fn func() error, logger logr.Logger) error {
+	return retry.Do(ctx, r.retryConfig, operation, func() error {
+		err := fn()
+		if err != nil {
+			// Wrap error with retry information
+			return retry.NewRetryableError(err, r.isTransientKubernetesError(err), operation)
+		}
+		return nil
+	})
 }
 
 // emitEvent is a helper function to emit Kubernetes events for the SBDConfig controller
@@ -92,9 +165,18 @@ func (r *SBDConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		"controller", "SBDConfig",
 	)
 
-	// Retrieve the SBDConfig object
+	// Initialize retry configuration if not already done
+	if r.retryConfig.MaxRetries == 0 {
+		r.initializeRetryConfig(logger)
+	}
+
+	// Retrieve the SBDConfig object with retry logic
 	var sbdConfig medik8sv1alpha1.SBDConfig
-	if err := r.Get(ctx, req.NamespacedName, &sbdConfig); err != nil {
+	err := r.performKubernetesAPIOperationWithRetry(ctx, "get SBDConfig", func() error {
+		return r.Get(ctx, req.NamespacedName, &sbdConfig)
+	}, logger)
+
+	if err != nil {
 		if errors.IsNotFound(err) {
 			// The SBDConfig resource was deleted
 			logger.Info("SBDConfig resource not found, it may have been deleted",
@@ -102,10 +184,15 @@ func (r *SBDConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 				"namespace", req.Namespace)
 			return ctrl.Result{}, nil
 		}
-		// Error reading the object - requeue the request
-		logger.Error(err, "Failed to get SBDConfig",
+		// Error reading the object - requeue with backoff for transient errors
+		logger.Error(err, "Failed to get SBDConfig after retries",
 			"name", req.Name,
 			"namespace", req.Namespace)
+
+		// Return requeue with backoff for transient errors
+		if r.isTransientKubernetesError(err) {
+			return ctrl.Result{RequeueAfter: InitialSBDConfigRetryDelay}, err
+		}
 		return ctrl.Result{}, err
 	}
 
@@ -136,13 +223,22 @@ func (r *SBDConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		logger.V(1).Info("Set default watchdog path", "watchdogPath", sbdConfig.Spec.SbdWatchdogPath)
 	}
 
-	// Ensure the namespace exists
-	if err := r.ensureNamespace(ctx, &sbdConfig, sbdConfig.Spec.Namespace, logger); err != nil {
-		logger.Error(err, "Failed to ensure namespace exists",
+	// Ensure the namespace exists with retry logic
+	err = r.performKubernetesAPIOperationWithRetry(ctx, "ensure namespace", func() error {
+		return r.ensureNamespace(ctx, &sbdConfig, sbdConfig.Spec.Namespace, logger)
+	}, logger)
+
+	if err != nil {
+		logger.Error(err, "Failed to ensure namespace exists after retries",
 			"namespace", sbdConfig.Spec.Namespace,
 			"operation", "namespace-creation")
 		r.emitEventf(&sbdConfig, EventTypeWarning, ReasonNamespaceError,
 			"Failed to ensure namespace '%s' exists: %v", sbdConfig.Spec.Namespace, err)
+
+		// Return requeue with backoff for transient errors
+		if r.isTransientKubernetesError(err) {
+			return ctrl.Result{RequeueAfter: InitialSBDConfigRetryDelay}, err
+		}
 		return ctrl.Result{}, err
 	}
 
@@ -153,7 +249,7 @@ func (r *SBDConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		"daemonset.namespace", desiredDaemonSet.Namespace,
 	)
 
-	// Use CreateOrUpdate to manage the DaemonSet
+	// Use CreateOrUpdate to manage the DaemonSet with retry logic
 	actualDaemonSet := &appsv1.DaemonSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      desiredDaemonSet.Name,
@@ -161,21 +257,32 @@ func (r *SBDConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		},
 	}
 
-	result, err := controllerutil.CreateOrUpdate(ctx, r.Client, actualDaemonSet, func() error {
-		// Update the DaemonSet spec with the desired configuration
-		actualDaemonSet.Spec = desiredDaemonSet.Spec
-		actualDaemonSet.Labels = desiredDaemonSet.Labels
-		actualDaemonSet.Annotations = desiredDaemonSet.Annotations
+	var result controllerutil.OperationResult
+	err = r.performKubernetesAPIOperationWithRetry(ctx, "create or update DaemonSet", func() error {
+		var err error
+		result, err = controllerutil.CreateOrUpdate(ctx, r.Client, actualDaemonSet, func() error {
+			// Update the DaemonSet spec with the desired configuration
+			actualDaemonSet.Spec = desiredDaemonSet.Spec
+			actualDaemonSet.Labels = desiredDaemonSet.Labels
+			actualDaemonSet.Annotations = desiredDaemonSet.Annotations
 
-		// Set the controller reference
-		return controllerutil.SetControllerReference(&sbdConfig, actualDaemonSet, r.Scheme)
-	})
+			// Set the controller reference
+			return controllerutil.SetControllerReference(&sbdConfig, actualDaemonSet, r.Scheme)
+		})
+		return err
+	}, daemonSetLogger)
+
 	if err != nil {
-		daemonSetLogger.Error(err, "Failed to create or update DaemonSet",
+		daemonSetLogger.Error(err, "Failed to create or update DaemonSet after retries",
 			"operation", "daemonset-create-or-update",
-			"desired.replicas", desiredDaemonSet.Spec.Template.Spec.Containers[0].Image)
+			"desired.image", desiredDaemonSet.Spec.Template.Spec.Containers[0].Image)
 		r.emitEventf(&sbdConfig, EventTypeWarning, ReasonDaemonSetError,
 			"Failed to create or update DaemonSet '%s': %v", desiredDaemonSet.Name, err)
+
+		// Return requeue with backoff for transient errors
+		if r.isTransientKubernetesError(err) {
+			return ctrl.Result{RequeueAfter: InitialSBDConfigRetryDelay}, err
+		}
 		return ctrl.Result{}, err
 	}
 
@@ -199,13 +306,22 @@ func (r *SBDConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		daemonSetLogger.V(1).Info("DaemonSet unchanged")
 	}
 
-	// Update the SBDConfig status
-	if err := r.updateStatus(ctx, &sbdConfig, actualDaemonSet, logger); err != nil {
-		logger.Error(err, "Failed to update SBDConfig status",
+	// Update the SBDConfig status with retry logic
+	err = r.performKubernetesAPIOperationWithRetry(ctx, "update SBDConfig status", func() error {
+		return r.updateStatus(ctx, &sbdConfig, actualDaemonSet, logger)
+	}, logger)
+
+	if err != nil {
+		logger.Error(err, "Failed to update SBDConfig status after retries",
 			"operation", "status-update",
 			"daemonset.name", actualDaemonSet.Name)
 		r.emitEventf(&sbdConfig, EventTypeWarning, ReasonReconcileError,
 			"Failed to update SBDConfig status: %v", err)
+
+		// Return requeue with backoff for transient errors
+		if r.isTransientKubernetesError(err) {
+			return ctrl.Result{RequeueAfter: InitialSBDConfigRetryDelay}, err
+		}
 		return ctrl.Result{}, err
 	}
 

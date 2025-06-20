@@ -17,9 +17,13 @@ limitations under the License.
 package watchdog
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"time"
 
+	"github.com/go-logr/logr"
+	"github.com/medik8s/sbd-operator/pkg/retry"
 	"golang.org/x/sys/unix"
 )
 
@@ -39,6 +43,18 @@ const (
 	WDIOC_GETTIMEOUT = 0x40045707
 )
 
+// Retry configuration constants for watchdog operations
+const (
+	// MaxWatchdogRetries is the maximum number of retry attempts for watchdog operations
+	MaxWatchdogRetries = 2
+	// InitialWatchdogRetryDelay is the initial delay between watchdog retry attempts
+	InitialWatchdogRetryDelay = 50 * time.Millisecond
+	// MaxWatchdogRetryDelay is the maximum delay between watchdog retry attempts
+	MaxWatchdogRetryDelay = 500 * time.Millisecond
+	// WatchdogRetryBackoffFactor is the exponential backoff factor for watchdog retry delays
+	WatchdogRetryBackoffFactor = 2.0
+)
+
 // Watchdog represents a Linux kernel watchdog device interface.
 // It provides methods to interact with hardware watchdog devices through
 // the Linux watchdog subsystem.
@@ -49,6 +65,10 @@ type Watchdog struct {
 	path string
 	// isOpen tracks whether the watchdog device is currently open
 	isOpen bool
+	// logger for logging watchdog operations and retries
+	logger logr.Logger
+	// retryConfig holds the retry configuration for this watchdog
+	retryConfig retry.Config
 }
 
 // New creates a new Watchdog instance by opening the watchdog device at the specified path.
@@ -65,25 +85,53 @@ type Watchdog struct {
 // Once opened, the watchdog timer is typically activated and must be periodically
 // reset using the Pet() method to prevent system reset.
 func New(path string) (*Watchdog, error) {
+	return NewWithLogger(path, logr.Discard())
+}
+
+// NewWithLogger creates a new Watchdog instance with a logger for retry operations
+func NewWithLogger(path string, logger logr.Logger) (*Watchdog, error) {
 	if path == "" {
 		return nil, fmt.Errorf("watchdog device path cannot be empty")
 	}
 
-	// Open the watchdog device with write-only access
-	// Most watchdog devices require write access for ioctl operations
-	file, err := os.OpenFile(path, os.O_WRONLY, 0)
-	if err != nil {
-		// Wrap the error with additional context
-		if pathErr, ok := err.(*os.PathError); ok {
-			return nil, fmt.Errorf("failed to open watchdog device at %s: %w", path, pathErr)
+	// Configure retry settings for watchdog operations
+	retryConfig := retry.Config{
+		MaxRetries:    MaxWatchdogRetries,
+		InitialDelay:  InitialWatchdogRetryDelay,
+		MaxDelay:      MaxWatchdogRetryDelay,
+		BackoffFactor: WatchdogRetryBackoffFactor,
+		Logger:        logger.WithName("watchdog-retry"),
+	}
+
+	var file *os.File
+	var err error
+
+	// Retry watchdog opening for transient errors
+	ctx := context.Background()
+	err = retry.Do(ctx, retryConfig, "open watchdog device", func() error {
+		// Open the watchdog device with write-only access
+		// Most watchdog devices require write access for ioctl operations
+		file, err = os.OpenFile(path, os.O_WRONLY, 0)
+		if err != nil {
+			// Wrap the error with additional context and retry information
+			if pathErr, ok := err.(*os.PathError); ok {
+				return retry.NewRetryableError(pathErr, retry.IsTransientError(pathErr), "open watchdog device")
+			}
+			return retry.NewRetryableError(err, retry.IsTransientError(err), "open watchdog device")
 		}
+		return nil
+	})
+
+	if err != nil {
 		return nil, fmt.Errorf("failed to open watchdog device at %s: %w", path, err)
 	}
 
 	return &Watchdog{
-		file:   file,
-		path:   path,
-		isOpen: true,
+		file:        file,
+		path:        path,
+		isOpen:      true,
+		logger:      logger.WithName("watchdog").WithValues("path", path),
+		retryConfig: retryConfig,
 	}, nil
 }
 
@@ -92,11 +140,14 @@ func New(path string) (*Watchdog, error) {
 // to keep the system running. The frequency depends on the watchdog's
 // configured timeout value.
 //
+// This method includes retry logic for transient errors, as watchdog petting
+// is critical for system stability.
+//
 // Returns:
-//   - error: An error if the watchdog cannot be pet, or if the device is not open
+//   - error: An error if the watchdog cannot be pet after retries, or if the device is not open
 //
 // This method uses the WDIOC_KEEPALIVE ioctl command to communicate with
-// the kernel watchdog driver. If the ioctl fails, the watchdog timer
+// the kernel watchdog driver. If the ioctl fails consistently, the watchdog timer
 // continues counting down and may reset the system.
 func (w *Watchdog) Pet() error {
 	if !w.isOpen {
@@ -107,14 +158,26 @@ func (w *Watchdog) Pet() error {
 		return fmt.Errorf("watchdog file descriptor is nil")
 	}
 
-	// Use WDIOC_KEEPALIVE ioctl to reset the watchdog timer
-	// The third parameter (0) is ignored for WDIOC_KEEPALIVE
-	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(w.file.Fd()), WDIOC_KEEPALIVE, 0)
-	if errno != 0 {
-		// Convert syscall error to Go error
-		return fmt.Errorf("failed to pet watchdog at %s: %w", w.path, errno)
+	// Retry watchdog pet operations for transient errors
+	ctx := context.Background()
+	err := retry.Do(ctx, w.retryConfig, "pet watchdog", func() error {
+		// Use WDIOC_KEEPALIVE ioctl to reset the watchdog timer
+		// The third parameter (0) is ignored for WDIOC_KEEPALIVE
+		_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(w.file.Fd()), WDIOC_KEEPALIVE, 0)
+		if errno != 0 {
+			// Convert syscall error to Go error and determine if it's retryable
+			syscallErr := fmt.Errorf("ioctl WDIOC_KEEPALIVE failed: %w", errno)
+			return retry.NewRetryableError(syscallErr, retry.IsTransientError(errno), "pet watchdog")
+		}
+		return nil
+	})
+
+	if err != nil {
+		w.logger.Error(err, "Failed to pet watchdog after retries")
+		return fmt.Errorf("failed to pet watchdog at %s: %w", w.path, err)
 	}
 
+	w.logger.V(2).Info("Watchdog pet successful")
 	return nil
 }
 
@@ -154,6 +217,7 @@ func (w *Watchdog) Close() error {
 		return fmt.Errorf("failed to close watchdog device at %s: %w", w.path, err)
 	}
 
+	w.logger.V(1).Info("Watchdog device closed")
 	return nil
 }
 

@@ -20,9 +20,26 @@ limitations under the License.
 package blockdevice
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
+	"time"
+
+	"github.com/go-logr/logr"
+	"github.com/medik8s/sbd-operator/pkg/retry"
+)
+
+// Retry configuration constants for block device operations
+const (
+	// MaxRetryAttempts is the maximum number of retry attempts for transient errors
+	MaxRetryAttempts = 3
+	// InitialRetryDelay is the initial delay between retry attempts
+	InitialRetryDelay = 100 * time.Millisecond
+	// MaxRetryDelay is the maximum delay between retry attempts
+	MaxRetryDelay = 5 * time.Second
+	// RetryBackoffFactor is the exponential backoff factor for retry delays
+	RetryBackoffFactor = 2.0
 )
 
 // Device represents a raw block device that can be read from and written to.
@@ -33,6 +50,10 @@ type Device struct {
 	file *os.File
 	// path is the filesystem path to the block device
 	path string
+	// logger for logging device operations and retries
+	logger logr.Logger
+	// retryConfig holds the retry configuration for this device
+	retryConfig retry.Config
 }
 
 // Open opens a raw block device at the specified path for read/write operations.
@@ -54,20 +75,49 @@ type Device struct {
 //	}
 //	defer device.Close()
 func Open(path string) (*Device, error) {
+	return OpenWithLogger(path, logr.Discard())
+}
+
+// OpenWithLogger opens a raw block device with a logger for retry operations
+func OpenWithLogger(path string, logger logr.Logger) (*Device, error) {
 	if path == "" {
 		return nil, fmt.Errorf("device path cannot be empty")
 	}
 
-	// Open the device with read/write access and synchronous I/O
-	// O_SYNC ensures that all writes are immediately flushed to disk
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_SYNC, 0)
+	// Configure retry settings for device operations
+	retryConfig := retry.Config{
+		MaxRetries:    MaxRetryAttempts,
+		InitialDelay:  InitialRetryDelay,
+		MaxDelay:      MaxRetryDelay,
+		BackoffFactor: RetryBackoffFactor,
+		Logger:        logger.WithName("blockdevice-retry"),
+	}
+
+	var file *os.File
+	var err error
+
+	// Retry device opening for transient errors
+	ctx := context.Background()
+	err = retry.Do(ctx, retryConfig, "open block device", func() error {
+		// Open the device with read/write access and synchronous I/O
+		// O_SYNC ensures that all writes are immediately flushed to disk
+		file, err = os.OpenFile(path, os.O_RDWR|os.O_SYNC, 0)
+		if err != nil {
+			// Wrap error with retry information
+			return retry.NewRetryableError(err, retry.IsTransientError(err), "open block device")
+		}
+		return nil
+	})
+
 	if err != nil {
 		return nil, fmt.Errorf("failed to open block device %q: %w", path, err)
 	}
 
 	return &Device{
-		file: file,
-		path: path,
+		file:        file,
+		path:        path,
+		logger:      logger.WithName("blockdevice").WithValues("path", path),
+		retryConfig: retryConfig,
 	}, nil
 }
 
@@ -76,7 +126,7 @@ func Open(path string) (*Device, error) {
 // without affecting the device's current file position.
 //
 // This method is safe for concurrent use as it doesn't modify any shared state
-// and uses the positioned read system call.
+// and uses the positioned read system call. It includes retry logic for transient errors.
 //
 // Parameters:
 //   - p: The buffer to read data into
@@ -89,7 +139,7 @@ func Open(path string) (*Device, error) {
 // The method returns an error if:
 //   - The device has been closed
 //   - The offset is negative
-//   - A system-level read error occurs
+//   - A system-level read error occurs after retries
 func (d *Device) ReadAt(p []byte, off int64) (n int, err error) {
 	if d.file == nil {
 		return 0, fmt.Errorf("device %q is closed", d.path)
@@ -99,10 +149,25 @@ func (d *Device) ReadAt(p []byte, off int64) (n int, err error) {
 		return 0, fmt.Errorf("negative offset %d not allowed", off)
 	}
 
-	n, err = d.file.ReadAt(p, off)
+	// Retry read operations for transient errors
+	ctx := context.Background()
+	err = retry.Do(ctx, d.retryConfig, "read from block device", func() error {
+		n, err = d.file.ReadAt(p, off)
+		if err != nil && err != io.EOF {
+			// Wrap error with retry information
+			return retry.NewRetryableError(err, retry.IsTransientError(err), "read from block device")
+		}
+		return err // Return io.EOF as-is (not retryable)
+	})
+
 	if err != nil && err != io.EOF {
 		return n, fmt.Errorf("failed to read from device %q at offset %d: %w", d.path, off, err)
 	}
+
+	d.logger.V(2).Info("Block device read completed",
+		"offset", off,
+		"bytesRequested", len(p),
+		"bytesRead", n)
 
 	return n, err
 }
@@ -113,6 +178,7 @@ func (d *Device) ReadAt(p []byte, off int64) (n int, err error) {
 //
 // Since the device is opened with O_SYNC, this method ensures that data
 // is immediately written to the underlying storage before returning.
+// It includes retry logic for transient errors.
 //
 // This method is safe for concurrent use as it doesn't modify any shared state
 // and uses the positioned write system call.
@@ -128,7 +194,7 @@ func (d *Device) ReadAt(p []byte, off int64) (n int, err error) {
 // The method returns an error if:
 //   - The device has been closed
 //   - The offset is negative
-//   - A system-level write error occurs
+//   - A system-level write error occurs after retries
 //   - Not all bytes could be written
 func (d *Device) WriteAt(p []byte, off int64) (n int, err error) {
 	if d.file == nil {
@@ -139,14 +205,32 @@ func (d *Device) WriteAt(p []byte, off int64) (n int, err error) {
 		return 0, fmt.Errorf("negative offset %d not allowed", off)
 	}
 
-	n, err = d.file.WriteAt(p, off)
+	// Retry write operations for transient errors
+	ctx := context.Background()
+	err = retry.Do(ctx, d.retryConfig, "write to block device", func() error {
+		n, err = d.file.WriteAt(p, off)
+		if err != nil {
+			// Wrap error with retry information
+			return retry.NewRetryableError(err, retry.IsTransientError(err), "write to block device")
+		}
+
+		if n != len(p) {
+			// Partial write is considered a retryable error for block devices
+			partialErr := fmt.Errorf("partial write to device %q: wrote %d bytes, expected %d", d.path, n, len(p))
+			return retry.NewRetryableError(partialErr, true, "write to block device")
+		}
+
+		return nil
+	})
+
 	if err != nil {
 		return n, fmt.Errorf("failed to write to device %q at offset %d: %w", d.path, off, err)
 	}
 
-	if n != len(p) {
-		return n, fmt.Errorf("partial write to device %q: wrote %d bytes, expected %d", d.path, n, len(p))
-	}
+	d.logger.V(2).Info("Block device write completed",
+		"offset", off,
+		"bytesWritten", n,
+		"bytesRequested", len(p))
 
 	return n, nil
 }
@@ -159,22 +243,35 @@ func (d *Device) WriteAt(p []byte, off int64) (n int, err error) {
 // synchronous), calling Sync() provides an additional guarantee that all
 // data has been written to persistent storage. This is particularly important
 // for SBD operations where data integrity is critical.
+// It includes retry logic for transient errors.
 //
 // Returns:
 //   - error: An error if the sync operation fails
 //
 // The method returns an error if:
 //   - The device has been closed
-//   - A system-level sync error occurs
+//   - A system-level sync error occurs after retries
 func (d *Device) Sync() error {
 	if d.file == nil {
 		return fmt.Errorf("device %q is closed", d.path)
 	}
 
-	if err := d.file.Sync(); err != nil {
+	// Retry sync operations for transient errors
+	ctx := context.Background()
+	err := retry.Do(ctx, d.retryConfig, "sync block device", func() error {
+		err := d.file.Sync()
+		if err != nil {
+			// Wrap error with retry information
+			return retry.NewRetryableError(err, retry.IsTransientError(err), "sync block device")
+		}
+		return nil
+	})
+
+	if err != nil {
 		return fmt.Errorf("failed to sync device %q: %w", d.path, err)
 	}
 
+	d.logger.V(2).Info("Block device sync completed")
 	return nil
 }
 
@@ -213,6 +310,7 @@ func (d *Device) Close() error {
 		return fmt.Errorf("failed to close device %q: %w", d.path, err)
 	}
 
+	d.logger.V(1).Info("Block device closed")
 	return nil
 }
 

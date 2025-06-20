@@ -38,6 +38,7 @@ import (
 	"go.uber.org/zap/zapcore"
 
 	"github.com/medik8s/sbd-operator/pkg/blockdevice"
+	"github.com/medik8s/sbd-operator/pkg/retry"
 	"github.com/medik8s/sbd-operator/pkg/sbdprotocol"
 	"github.com/medik8s/sbd-operator/pkg/watchdog"
 )
@@ -63,6 +64,21 @@ const (
 	MaxNodeNameLength = 256
 	// DefaultNodeID is the placeholder node ID used when none is specified
 	DefaultNodeID = 1
+
+	// Retry configuration constants for SBD Agent operations
+	// MaxCriticalRetries is the maximum number of retry attempts for critical operations
+	MaxCriticalRetries = 3
+	// InitialCriticalRetryDelay is the initial delay between critical operation retries
+	InitialCriticalRetryDelay = 200 * time.Millisecond
+	// MaxCriticalRetryDelay is the maximum delay between critical operation retries
+	MaxCriticalRetryDelay = 2 * time.Second
+	// CriticalRetryBackoffFactor is the exponential backoff factor for critical operation retries
+	CriticalRetryBackoffFactor = 2.0
+
+	// MaxConsecutiveFailures is the maximum number of consecutive failures before triggering self-fence
+	MaxConsecutiveFailures = 5
+	// FailureCountResetInterval is the interval after which failure counts are reset
+	FailureCountResetInterval = 30 * time.Second
 )
 
 // Global logger instance
@@ -363,6 +379,14 @@ type SBDAgent struct {
 	selfFenceMutex    sync.RWMutex
 	metricsPort       int
 	metricsServer     *http.Server
+
+	// Failure tracking and retry configuration
+	watchdogFailureCount  int
+	sbdFailureCount       int
+	heartbeatFailureCount int
+	lastFailureReset      time.Time
+	failureCountMutex     sync.RWMutex
+	retryConfig           retry.Config
 }
 
 // NewSBDAgent creates a new SBD agent with the specified parameters
@@ -377,7 +401,45 @@ func NewSBDAgent(watchdogPath, sbdDevicePath, nodeName string, nodeID uint16, pe
 
 // NewSBDAgentWithWatchdog creates a new SBD agent with the specified watchdog instance
 func NewSBDAgentWithWatchdog(wd WatchdogInterface, sbdDevicePath, nodeName string, nodeID uint16, petInterval, sbdUpdateInterval, heartbeatInterval, peerCheckInterval time.Duration, sbdTimeoutSeconds uint, rebootMethod string, metricsPort int) (*SBDAgent, error) {
+	// Validate required parameters
+	if wd == nil {
+		return nil, fmt.Errorf("watchdog interface cannot be nil")
+	}
+
+	if wd.Path() == "" {
+		return nil, fmt.Errorf("watchdog path cannot be empty")
+	}
+
+	if nodeName == "" {
+		return nil, fmt.Errorf("node name cannot be empty")
+	}
+
+	if nodeID == 0 || nodeID > 255 {
+		return nil, fmt.Errorf("node ID must be between 1 and 255, got %d", nodeID)
+	}
+
+	if petInterval <= 0 {
+		return nil, fmt.Errorf("pet interval must be positive, got %v", petInterval)
+	}
+
+	if rebootMethod != "panic" && rebootMethod != "systemctl-reboot" {
+		return nil, fmt.Errorf("invalid reboot method '%s', must be 'panic' or 'systemctl-reboot'", rebootMethod)
+	}
+
+	if metricsPort <= 0 || metricsPort > 65535 {
+		return nil, fmt.Errorf("metrics port must be between 1 and 65535, got %d", metricsPort)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
+
+	// Configure retry settings for critical operations
+	retryConfig := retry.Config{
+		MaxRetries:    MaxCriticalRetries,
+		InitialDelay:  InitialCriticalRetryDelay,
+		MaxDelay:      MaxCriticalRetryDelay,
+		BackoffFactor: CriticalRetryBackoffFactor,
+		Logger:        logger.WithName("sbd-agent-retry"),
+	}
 
 	agent := &SBDAgent{
 		watchdog:          wd,
@@ -396,6 +458,13 @@ func NewSBDAgentWithWatchdog(wd WatchdogInterface, sbdDevicePath, nodeName strin
 		peerMonitor:       NewPeerMonitor(sbdTimeoutSeconds, nodeID, logger),
 		selfFenceDetected: false,
 		metricsPort:       metricsPort,
+
+		// Initialize failure tracking
+		watchdogFailureCount:  0,
+		sbdFailureCount:       0,
+		heartbeatFailureCount: 0,
+		lastFailureReset:      time.Now(),
+		retryConfig:           retryConfig,
 	}
 
 	// Initialize Prometheus metrics
@@ -489,6 +558,77 @@ func (s *SBDAgent) getNextHeartbeatSequence() uint64 {
 	defer s.heartbeatSeqMutex.Unlock()
 	s.heartbeatSequence++
 	return s.heartbeatSequence
+}
+
+// incrementFailureCount safely increments the failure count for a specific operation type
+func (s *SBDAgent) incrementFailureCount(operationType string) int {
+	s.failureCountMutex.Lock()
+	defer s.failureCountMutex.Unlock()
+
+	// Reset failure counts if enough time has passed
+	if time.Since(s.lastFailureReset) > FailureCountResetInterval {
+		s.watchdogFailureCount = 0
+		s.sbdFailureCount = 0
+		s.heartbeatFailureCount = 0
+		s.lastFailureReset = time.Now()
+		logger.V(1).Info("Reset failure counts due to time interval")
+	}
+
+	switch operationType {
+	case "watchdog":
+		s.watchdogFailureCount++
+		return s.watchdogFailureCount
+	case "sbd":
+		s.sbdFailureCount++
+		return s.sbdFailureCount
+	case "heartbeat":
+		s.heartbeatFailureCount++
+		return s.heartbeatFailureCount
+	default:
+		return 0
+	}
+}
+
+// resetFailureCount safely resets the failure count for a specific operation type
+func (s *SBDAgent) resetFailureCount(operationType string) {
+	s.failureCountMutex.Lock()
+	defer s.failureCountMutex.Unlock()
+
+	switch operationType {
+	case "watchdog":
+		if s.watchdogFailureCount > 0 {
+			logger.V(1).Info("Reset watchdog failure count", "previousCount", s.watchdogFailureCount)
+			s.watchdogFailureCount = 0
+		}
+	case "sbd":
+		if s.sbdFailureCount > 0 {
+			logger.V(1).Info("Reset SBD failure count", "previousCount", s.sbdFailureCount)
+			s.sbdFailureCount = 0
+		}
+	case "heartbeat":
+		if s.heartbeatFailureCount > 0 {
+			logger.V(1).Info("Reset heartbeat failure count", "previousCount", s.heartbeatFailureCount)
+			s.heartbeatFailureCount = 0
+		}
+	}
+}
+
+// shouldTriggerSelfFence checks if consecutive failures exceed the threshold
+func (s *SBDAgent) shouldTriggerSelfFence() (bool, string) {
+	s.failureCountMutex.RLock()
+	defer s.failureCountMutex.RUnlock()
+
+	if s.watchdogFailureCount >= MaxConsecutiveFailures {
+		return true, fmt.Sprintf("watchdog pet failures exceeded threshold (%d)", MaxConsecutiveFailures)
+	}
+	if s.sbdFailureCount >= MaxConsecutiveFailures {
+		return true, fmt.Sprintf("SBD device failures exceeded threshold (%d)", MaxConsecutiveFailures)
+	}
+	if s.heartbeatFailureCount >= MaxConsecutiveFailures {
+		return true, fmt.Sprintf("heartbeat write failures exceeded threshold (%d)", MaxConsecutiveFailures)
+	}
+
+	return false, ""
 }
 
 // writeNodeIDToSBD writes the node name to the SBD device at the predefined offset
@@ -706,17 +846,45 @@ func (s *SBDAgent) watchdogLoop() {
 				return
 			}
 
+			// Check if we should trigger self-fence due to consecutive failures
+			if shouldFence, reason := s.shouldTriggerSelfFence(); shouldFence {
+				logger.Error(nil, "Triggering self-fence due to consecutive failures", "reason", reason)
+				s.executeSelfFencing(reason)
+				return
+			}
+
 			// Only pet the watchdog if SBD device is healthy (or not configured)
 			if s.sbdDevicePath == "" || s.isSBDHealthy() {
-				if err := s.watchdog.Pet(); err != nil {
-					logger.Error(err, "Failed to pet watchdog", "watchdogPath", s.watchdog.Path())
+				// Use retry mechanism for watchdog petting
+				err := retry.Do(s.ctx, s.retryConfig, "pet watchdog", func() error {
+					return s.watchdog.Pet()
+				})
+
+				if err != nil {
+					failureCount := s.incrementFailureCount("watchdog")
+					logger.Error(err, "Failed to pet watchdog after retries",
+						"watchdogPath", s.watchdog.Path(),
+						"failureCount", failureCount,
+						"maxFailures", MaxConsecutiveFailures)
+
 					// Mark agent as unhealthy on watchdog failures
 					agentHealthyGauge.Set(0)
-					// Continue trying - don't exit on pet failure
+
+					// Check if we've exceeded the failure threshold
+					if failureCount >= MaxConsecutiveFailures {
+						logger.Error(nil, "Watchdog pet failures exceeded threshold, will trigger self-fence on next iteration",
+							"failureCount", failureCount,
+							"threshold", MaxConsecutiveFailures)
+					}
+					// Continue trying - don't exit on pet failure, let the failure count mechanism handle it
 				} else {
+					// Success - reset failure count and update metrics
+					s.resetFailureCount("watchdog")
 					logger.V(1).Info("Watchdog pet successful", "watchdogPath", s.watchdog.Path())
+
 					// Increment successful watchdog pets counter
 					watchdogPetsCounter.Inc()
+
 					// Update agent health status based on SBD health
 					if s.sbdDevicePath == "" || s.isSBDHealthy() {
 						agentHealthyGauge.Set(1)
@@ -748,15 +916,31 @@ func (s *SBDAgent) sbdDeviceLoop() {
 			logger.Info("SBD device loop stopping")
 			return
 		case <-ticker.C:
-			if err := s.writeNodeIDToSBD(); err != nil {
-				logger.Error(err, "Failed to write node ID to SBD device",
+			// Use retry mechanism for SBD device operations
+			err := retry.Do(s.ctx, s.retryConfig, "write node ID to SBD", func() error {
+				return s.writeNodeIDToSBD()
+			})
+
+			if err != nil {
+				failureCount := s.incrementFailureCount("sbd")
+				logger.Error(err, "Failed to write node ID to SBD device after retries",
 					"devicePath", s.sbdDevicePath,
-					"nodeID", s.nodeID)
+					"nodeID", s.nodeID,
+					"failureCount", failureCount,
+					"maxFailures", MaxConsecutiveFailures)
+
 				s.setSBDHealthy(false)
 				// Increment SBD I/O errors counter
 				sbdIOErrorsCounter.Inc()
 				// Mark agent as unhealthy
 				agentHealthyGauge.Set(0)
+
+				// Check if we've exceeded the failure threshold
+				if failureCount >= MaxConsecutiveFailures {
+					logger.Error(nil, "SBD device failures exceeded threshold, will trigger self-fence on next watchdog iteration",
+						"failureCount", failureCount,
+						"threshold", MaxConsecutiveFailures)
+				}
 
 				// Try to reinitialize the device on next iteration
 				if s.sbdDevice != nil && !s.sbdDevice.IsClosed() {
@@ -765,6 +949,8 @@ func (s *SBDAgent) sbdDeviceLoop() {
 					}
 				}
 			} else {
+				// Success - reset failure count and update status
+				s.resetFailureCount("sbd")
 				logger.V(1).Info("Successfully updated SBD device with node ID",
 					"devicePath", s.sbdDevicePath,
 					"nodeID", s.nodeID)
@@ -789,15 +975,31 @@ func (s *SBDAgent) heartbeatLoop() {
 			logger.Info("SBD heartbeat loop stopping")
 			return
 		case <-ticker.C:
-			if err := s.writeHeartbeatToSBD(); err != nil {
-				logger.Error(err, "Failed to write heartbeat to SBD device",
+			// Use retry mechanism for heartbeat operations
+			err := retry.Do(s.ctx, s.retryConfig, "write heartbeat to SBD", func() error {
+				return s.writeHeartbeatToSBD()
+			})
+
+			if err != nil {
+				failureCount := s.incrementFailureCount("heartbeat")
+				logger.Error(err, "Failed to write heartbeat to SBD device after retries",
 					"devicePath", s.sbdDevicePath,
-					"nodeID", s.nodeID)
+					"nodeID", s.nodeID,
+					"failureCount", failureCount,
+					"maxFailures", MaxConsecutiveFailures)
+
 				s.setSBDHealthy(false)
 				// Increment SBD I/O errors counter
 				sbdIOErrorsCounter.Inc()
 				// Mark agent as unhealthy
 				agentHealthyGauge.Set(0)
+
+				// Check if we've exceeded the failure threshold
+				if failureCount >= MaxConsecutiveFailures {
+					logger.Error(nil, "Heartbeat write failures exceeded threshold, will trigger self-fence on next watchdog iteration",
+						"failureCount", failureCount,
+						"threshold", MaxConsecutiveFailures)
+				}
 
 				// Try to reinitialize the device on next iteration
 				if s.sbdDevice != nil && !s.sbdDevice.IsClosed() {
@@ -807,6 +1009,8 @@ func (s *SBDAgent) heartbeatLoop() {
 					}
 				}
 			} else {
+				// Success - reset failure count and update status
+				s.resetFailureCount("heartbeat")
 				// Only mark as healthy if it was previously unhealthy
 				// The regular SBD device loop will also update this
 				if !s.isSBDHealthy() {

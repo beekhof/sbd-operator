@@ -7,7 +7,7 @@
 *.dll
 *.so
 *.dylib
-bin/manager
+bin
 
 # Test binary, built with `go test -c`
 *.test

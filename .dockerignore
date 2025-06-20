@@ -1,3 +1,106 @@
 # More info: https://docs.docker.com/engine/reference/builder/#dockerignore-file
 # Ignore build and test binaries.
 bin/
+
+# Git files and directories
+.git
+.gitignore
+.gitattributes
+
+# Build artifacts and binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Coverage files
+*.prof
+cover.out
+coverage.*
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Documentation that's not needed in container
+README.md
+CHANGELOG.md
+LICENSE
+docs/
+*.md
+
+# Configuration files not needed in container
+.editorconfig
+.golangci.yml
+
+# Container and deployment files
+Dockerfile*
+docker-compose.*
+.dockerignore
+
+# Kubernetes manifests (not needed in container)
+config/
+manifests/
+deploy/
+k8s/
+
+# Test files and test data
+*_test.go
+testdata/
+test/
+
+# Development files
+Makefile
+scripts/
+
+# Dependencies cache (will be rebuilt in container)
+vendor/
+
+# Environment files
+.env
+.env.*
+
+# Node modules (if any)
+node_modules/
+
+# Python cache (if any)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Certificate files (security)
+*.pem
+*.key
+*.crt
+*.p12
+
+# Backup files
+*.bak
+*.backup
+
+# Archives
+*.zip
+*.tar.gz
+*.tar
+*.rar

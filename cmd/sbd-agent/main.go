@@ -68,6 +68,9 @@ const (
 // Global logger instance
 var logger logr.Logger
 
+// metricsOnce ensures metrics are only registered once
+var metricsOnce sync.Once
+
 // initializeLogger initializes the structured logger with the specified log level
 func initializeLogger(level string) error {
 	// Parse log level
@@ -413,12 +416,14 @@ func NewSBDAgentWithWatchdog(wd WatchdogInterface, sbdDevicePath, nodeName strin
 
 // initMetrics initializes Prometheus metrics and starts the metrics server
 func (s *SBDAgent) initMetrics() error {
-	// Register all metrics with the default registry
-	prometheus.MustRegister(agentHealthyGauge)
-	prometheus.MustRegister(sbdIOErrorsCounter)
-	prometheus.MustRegister(watchdogPetsCounter)
-	prometheus.MustRegister(peerStatusGaugeVec)
-	prometheus.MustRegister(selfFencedCounter)
+	// Register all metrics with the default registry only once
+	metricsOnce.Do(func() {
+		prometheus.MustRegister(agentHealthyGauge)
+		prometheus.MustRegister(sbdIOErrorsCounter)
+		prometheus.MustRegister(watchdogPetsCounter)
+		prometheus.MustRegister(peerStatusGaugeVec)
+		prometheus.MustRegister(selfFencedCounter)
+	})
 
 	// Initialize agent healthy status to 1 (healthy by default)
 	agentHealthyGauge.Set(1)
@@ -1065,6 +1070,222 @@ func (s *SBDAgent) readOwnSlotForFenceMessage() error {
 	return nil
 }
 
+// runPreflightChecks performs critical startup validation before entering main event loops
+func runPreflightChecks(watchdogPath, sbdDevicePath, nodeName string, nodeID uint16) error {
+	logger.Info("Running pre-flight checks",
+		"watchdogPath", watchdogPath,
+		"sbdDevicePath", sbdDevicePath,
+		"nodeName", nodeName,
+		"nodeID", nodeID)
+
+	// 1. Watchdog Device Availability Check
+	if err := checkWatchdogDevice(watchdogPath); err != nil {
+		return fmt.Errorf("watchdog device pre-flight check failed: %w", err)
+	}
+	logger.Info("Pre-flight check passed: watchdog device accessible", "watchdogPath", watchdogPath)
+
+	// 2. Shared SBD Device Accessibility Check (if configured)
+	if sbdDevicePath != "" {
+		if err := checkSBDDevice(sbdDevicePath, nodeID, nodeName); err != nil {
+			return fmt.Errorf("SBD device pre-flight check failed: %w", err)
+		}
+		logger.Info("Pre-flight check passed: SBD device accessible and read/write test successful",
+			"sbdDevicePath", sbdDevicePath,
+			"nodeID", nodeID)
+	} else {
+		logger.Info("Pre-flight check skipped: no SBD device configured (watchdog-only mode)")
+	}
+
+	// 3. Node ID/Name Resolution Check
+	if err := checkNodeIDNameResolution(nodeName, nodeID); err != nil {
+		return fmt.Errorf("node ID/name resolution pre-flight check failed: %w", err)
+	}
+	logger.Info("Pre-flight check passed: node ID/name resolution successful",
+		"nodeName", nodeName,
+		"nodeID", nodeID)
+
+	logger.Info("All pre-flight checks passed successfully")
+	return nil
+}
+
+// checkWatchdogDevice verifies the watchdog device exists and can be opened
+func checkWatchdogDevice(watchdogPath string) error {
+	logger.V(1).Info("Checking watchdog device availability", "watchdogPath", watchdogPath)
+
+	// Check if the watchdog device file exists
+	if _, err := os.Stat(watchdogPath); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("watchdog device does not exist: %s", watchdogPath)
+		}
+		return fmt.Errorf("failed to stat watchdog device %s: %w", watchdogPath, err)
+	}
+
+	// Try to open the watchdog device to verify access permissions
+	file, err := os.OpenFile(watchdogPath, os.O_WRONLY, 0)
+	if err != nil {
+		return fmt.Errorf("failed to open watchdog device %s: %w", watchdogPath, err)
+	}
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			logger.Error(closeErr, "Failed to close watchdog device during pre-flight check",
+				"watchdogPath", watchdogPath)
+		}
+	}()
+
+	logger.V(1).Info("Watchdog device successfully opened and closed", "watchdogPath", watchdogPath)
+	return nil
+}
+
+// checkSBDDevice verifies the SBD device exists and performs a minimal read/write test
+func checkSBDDevice(sbdDevicePath string, nodeID uint16, nodeName string) error {
+	logger.V(1).Info("Checking SBD device accessibility", "sbdDevicePath", sbdDevicePath, "nodeID", nodeID)
+
+	// Check if the SBD device file exists
+	if _, err := os.Stat(sbdDevicePath); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("SBD device does not exist: %s", sbdDevicePath)
+		}
+		return fmt.Errorf("failed to stat SBD device %s: %w", sbdDevicePath, err)
+	}
+
+	// Try to open the SBD device using the blockdevice package
+	device, err := blockdevice.Open(sbdDevicePath)
+	if err != nil {
+		return fmt.Errorf("failed to open SBD device %s: %w", sbdDevicePath, err)
+	}
+	defer func() {
+		if closeErr := device.Close(); closeErr != nil {
+			logger.Error(closeErr, "Failed to close SBD device during pre-flight check",
+				"sbdDevicePath", sbdDevicePath)
+		}
+	}()
+
+	// Perform minimal read/write test: write node ID to its slot and read it back
+	if err := performSBDReadWriteTest(device, nodeID, nodeName); err != nil {
+		return fmt.Errorf("SBD device read/write test failed: %w", err)
+	}
+
+	logger.V(1).Info("SBD device read/write test completed successfully",
+		"sbdDevicePath", sbdDevicePath,
+		"nodeID", nodeID)
+	return nil
+}
+
+// performSBDReadWriteTest writes the node ID to its slot and reads it back to verify functionality
+func performSBDReadWriteTest(device BlockDevice, nodeID uint16, nodeName string) error {
+	logger.V(1).Info("Performing SBD device read/write test", "nodeID", nodeID, "nodeName", nodeName)
+
+	// Calculate slot offset for this node
+	slotOffset := int64(nodeID) * sbdprotocol.SBD_SLOT_SIZE
+
+	// Create a test heartbeat message
+	sequence := uint64(1) // Use sequence 1 for pre-flight test
+	testHeader := sbdprotocol.NewHeartbeat(nodeID, sequence)
+	testMsg := sbdprotocol.SBDHeartbeatMessage{Header: testHeader}
+
+	// Marshal the test message
+	testMsgBytes, err := sbdprotocol.MarshalHeartbeat(testMsg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal test heartbeat message: %w", err)
+	}
+
+	// Write test message to the node's slot
+	n, err := device.WriteAt(testMsgBytes, slotOffset)
+	if err != nil {
+		return fmt.Errorf("failed to write test message to SBD device at offset %d: %w", slotOffset, err)
+	}
+
+	if n != len(testMsgBytes) {
+		return fmt.Errorf("partial write to SBD device: wrote %d bytes, expected %d", n, len(testMsgBytes))
+	}
+
+	// Sync to ensure data is written to storage
+	if err := device.Sync(); err != nil {
+		return fmt.Errorf("failed to sync SBD device after test write: %w", err)
+	}
+
+	// Read back the data to verify write was successful
+	readBuffer := make([]byte, len(testMsgBytes))
+	readN, err := device.ReadAt(readBuffer, slotOffset)
+	if err != nil {
+		return fmt.Errorf("failed to read test message from SBD device at offset %d: %w", slotOffset, err)
+	}
+
+	if readN != len(testMsgBytes) {
+		return fmt.Errorf("partial read from SBD device: read %d bytes, expected %d", readN, len(testMsgBytes))
+	}
+
+	// Verify the data matches what we wrote
+	for i, b := range testMsgBytes {
+		if readBuffer[i] != b {
+			return fmt.Errorf("data mismatch at byte %d: wrote 0x%02x, read 0x%02x", i, b, readBuffer[i])
+		}
+	}
+
+	// Try to unmarshal the read data to ensure it's valid
+	readHeader, err := sbdprotocol.Unmarshal(readBuffer[:sbdprotocol.SBD_HEADER_SIZE])
+	if err != nil {
+		return fmt.Errorf("failed to unmarshal test message read from SBD device: %w", err)
+	}
+
+	// Verify the header matches our expectations
+	if readHeader.NodeID != nodeID {
+		return fmt.Errorf("node ID mismatch: expected %d, got %d", nodeID, readHeader.NodeID)
+	}
+
+	if readHeader.Sequence != sequence {
+		return fmt.Errorf("sequence mismatch: expected %d, got %d", sequence, readHeader.Sequence)
+	}
+
+	if readHeader.Type != sbdprotocol.SBD_MSG_TYPE_HEARTBEAT {
+		return fmt.Errorf("message type mismatch: expected %d, got %d", sbdprotocol.SBD_MSG_TYPE_HEARTBEAT, readHeader.Type)
+	}
+
+	logger.V(1).Info("SBD device read/write test successful",
+		"nodeID", nodeID,
+		"sequence", sequence,
+		"slotOffset", slotOffset,
+		"bytesWritten", n,
+		"bytesRead", readN)
+
+	return nil
+}
+
+// checkNodeIDNameResolution verifies that the node name and ID are valid and consistent
+func checkNodeIDNameResolution(nodeName string, nodeID uint16) error {
+	logger.V(1).Info("Checking node ID/name resolution", "nodeName", nodeName, "nodeID", nodeID)
+
+	// Validate node name is not empty
+	if nodeName == "" {
+		return fmt.Errorf("node name is empty")
+	}
+
+	// Validate node name length
+	if len(nodeName) > MaxNodeNameLength {
+		return fmt.Errorf("node name too long: %d characters, maximum allowed: %d", len(nodeName), MaxNodeNameLength)
+	}
+
+	// Validate node ID is within valid range
+	if nodeID < 1 || nodeID > sbdprotocol.SBD_MAX_NODES {
+		return fmt.Errorf("node ID %d is out of valid range [1, %d]", nodeID, sbdprotocol.SBD_MAX_NODES)
+	}
+
+	// Additional validation: ensure node name contains only valid characters
+	// (printable ASCII characters, no control characters)
+	for i, r := range nodeName {
+		if r < 32 || r > 126 {
+			return fmt.Errorf("node name contains invalid character at position %d: 0x%02x", i, r)
+		}
+	}
+
+	logger.V(1).Info("Node ID/name resolution successful",
+		"nodeName", nodeName,
+		"nodeNameLength", len(nodeName),
+		"nodeID", nodeID)
+
+	return nil
+}
+
 func main() {
 	flag.Parse()
 
@@ -1150,6 +1371,12 @@ func main() {
 			logger.Error(err, "SBD device validation failed", "sbdDevice", *sbdDevice)
 			os.Exit(1)
 		}
+	}
+
+	// Run pre-flight checks before creating the agent
+	if err := runPreflightChecks(*watchdogPath, *sbdDevice, nodeNameValue, nodeIDValue); err != nil {
+		logger.Error(err, "Pre-flight checks failed")
+		os.Exit(1)
 	}
 
 	// Create SBD agent

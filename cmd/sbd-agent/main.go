@@ -20,33 +20,60 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/medik8s/sbd-operator/pkg/blockdevice"
 	"github.com/medik8s/sbd-operator/pkg/watchdog"
 )
 
 var (
-	watchdogPath    = flag.String("watchdog-path", "/dev/watchdog", "Path to the watchdog device")
-	watchdogTimeout = flag.Duration("watchdog-timeout", 30*time.Second, "Watchdog pet interval")
-	sbdDevice       = flag.String("sbd-device", "", "Path to the SBD block device")
-	logLevel        = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
+	watchdogPath      = flag.String("watchdog-path", "/dev/watchdog", "Path to the watchdog device")
+	watchdogTimeout   = flag.Duration("watchdog-timeout", 30*time.Second, "Watchdog pet interval")
+	sbdDevice         = flag.String("sbd-device", "", "Path to the SBD block device")
+	nodeName          = flag.String("node-name", "", "Name of this Kubernetes node")
+	sbdUpdateInterval = flag.Duration("sbd-update-interval", 5*time.Second, "Interval for updating SBD device with node status")
+	logLevel          = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 )
+
+const (
+	// SBDNodeIDOffset is the offset where node ID is written in the SBD device
+	SBDNodeIDOffset = 0
+	// MaxNodeNameLength is the maximum length for a node name in SBD device
+	MaxNodeNameLength = 256
+)
+
+// BlockDevice defines the interface for block device operations
+type BlockDevice interface {
+	io.ReaderAt
+	io.WriterAt
+	Sync() error
+	Close() error
+	Path() string
+	IsClosed() bool
+}
 
 // SBDAgent represents the main SBD agent application
 type SBDAgent struct {
-	watchdog      *watchdog.Watchdog
-	sbdDevicePath string
-	petInterval   time.Duration
-	ctx           context.Context
-	cancel        context.CancelFunc
+	watchdog          *watchdog.Watchdog
+	sbdDevice         BlockDevice
+	sbdDevicePath     string
+	nodeName          string
+	petInterval       time.Duration
+	sbdUpdateInterval time.Duration
+	ctx               context.Context
+	cancel            context.CancelFunc
+	sbdHealthy        bool
+	sbdHealthyMutex   sync.RWMutex
 }
 
 // NewSBDAgent creates a new SBD agent instance
-func NewSBDAgent(watchdogPath, sbdDevicePath string, petInterval time.Duration) (*SBDAgent, error) {
+func NewSBDAgent(watchdogPath, sbdDevicePath, nodeName string, petInterval, sbdUpdateInterval time.Duration) (*SBDAgent, error) {
 	// Initialize watchdog
 	wd, err := watchdog.New(watchdogPath)
 	if err != nil {
@@ -55,13 +82,92 @@ func NewSBDAgent(watchdogPath, sbdDevicePath string, petInterval time.Duration) 
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	return &SBDAgent{
-		watchdog:      wd,
-		sbdDevicePath: sbdDevicePath,
-		petInterval:   petInterval,
-		ctx:           ctx,
-		cancel:        cancel,
-	}, nil
+	agent := &SBDAgent{
+		watchdog:          wd,
+		sbdDevicePath:     sbdDevicePath,
+		nodeName:          nodeName,
+		petInterval:       petInterval,
+		sbdUpdateInterval: sbdUpdateInterval,
+		ctx:               ctx,
+		cancel:            cancel,
+		sbdHealthy:        true, // Start assuming healthy
+	}
+
+	// Initialize SBD device if specified
+	if sbdDevicePath != "" {
+		if err := agent.initializeSBDDevice(); err != nil {
+			log.Printf("WARNING: Failed to initialize SBD device: %v", err)
+			agent.setSBDHealthy(false)
+		}
+	}
+
+	return agent, nil
+}
+
+// initializeSBDDevice opens and initializes the SBD block device
+func (s *SBDAgent) initializeSBDDevice() error {
+	if s.sbdDevicePath == "" {
+		return fmt.Errorf("SBD device path not specified")
+	}
+
+	device, err := blockdevice.Open(s.sbdDevicePath)
+	if err != nil {
+		return fmt.Errorf("failed to open SBD device %s: %w", s.sbdDevicePath, err)
+	}
+
+	s.sbdDevice = device
+	log.Printf("Successfully opened SBD device: %s", s.sbdDevicePath)
+	return nil
+}
+
+// setSBDDevice allows setting a custom SBD device (useful for testing)
+func (s *SBDAgent) setSBDDevice(device BlockDevice) {
+	s.sbdDevice = device
+}
+
+// setSBDHealthy safely updates the SBD health status
+func (s *SBDAgent) setSBDHealthy(healthy bool) {
+	s.sbdHealthyMutex.Lock()
+	defer s.sbdHealthyMutex.Unlock()
+	s.sbdHealthy = healthy
+}
+
+// isSBDHealthy safely reads the SBD health status
+func (s *SBDAgent) isSBDHealthy() bool {
+	s.sbdHealthyMutex.RLock()
+	defer s.sbdHealthyMutex.RUnlock()
+	return s.sbdHealthy
+}
+
+// writeNodeIDToSBD writes the node name to the SBD device at the predefined offset
+func (s *SBDAgent) writeNodeIDToSBD() error {
+	if s.sbdDevice == nil || s.sbdDevice.IsClosed() {
+		// Try to reinitialize the device
+		if err := s.initializeSBDDevice(); err != nil {
+			return fmt.Errorf("SBD device is closed and reinitialize failed: %w", err)
+		}
+	}
+
+	// Prepare node name data with fixed size
+	nodeData := make([]byte, MaxNodeNameLength)
+	copy(nodeData, []byte(s.nodeName))
+
+	// Write node name to SBD device
+	n, err := s.sbdDevice.WriteAt(nodeData, SBDNodeIDOffset)
+	if err != nil {
+		return fmt.Errorf("failed to write node ID to SBD device: %w", err)
+	}
+
+	if n != len(nodeData) {
+		return fmt.Errorf("partial write to SBD device: wrote %d bytes, expected %d", n, len(nodeData))
+	}
+
+	// Ensure data is committed to storage
+	if err := s.sbdDevice.Sync(); err != nil {
+		return fmt.Errorf("failed to sync SBD device: %w", err)
+	}
+
+	return nil
 }
 
 // Start begins the SBD agent operations
@@ -69,16 +175,17 @@ func (s *SBDAgent) Start() error {
 	log.Printf("Starting SBD Agent...")
 	log.Printf("Watchdog device: %s", s.watchdog.Path())
 	log.Printf("SBD device: %s", s.sbdDevicePath)
+	log.Printf("Node name: %s", s.nodeName)
 	log.Printf("Pet interval: %s", s.petInterval)
+	log.Printf("SBD update interval: %s", s.sbdUpdateInterval)
 
 	// Start the watchdog monitoring goroutine
 	go s.watchdogLoop()
 
-	// TODO: Add SBD device monitoring and message handling
-	// This would include:
-	// - Reading SBD messages from the block device
-	// - Processing fence requests
-	// - Updating node status
+	// Start SBD device monitoring if available
+	if s.sbdDevicePath != "" {
+		go s.sbdDeviceLoop()
+	}
 
 	log.Printf("SBD Agent started successfully")
 	return nil
@@ -90,6 +197,13 @@ func (s *SBDAgent) Stop() error {
 
 	// Cancel context to stop all goroutines
 	s.cancel()
+
+	// Close SBD device
+	if s.sbdDevice != nil && !s.sbdDevice.IsClosed() {
+		if err := s.sbdDevice.Close(); err != nil {
+			log.Printf("Error closing SBD device: %v", err)
+		}
+	}
 
 	// Close watchdog device
 	if s.watchdog != nil {
@@ -115,11 +229,49 @@ func (s *SBDAgent) watchdogLoop() {
 			log.Printf("Watchdog loop stopping...")
 			return
 		case <-ticker.C:
-			if err := s.watchdog.Pet(); err != nil {
-				log.Printf("ERROR: Failed to pet watchdog: %v", err)
-				// Continue trying - don't exit on pet failure
+			// Only pet the watchdog if SBD device is healthy (or not configured)
+			if s.sbdDevicePath == "" || s.isSBDHealthy() {
+				if err := s.watchdog.Pet(); err != nil {
+					log.Printf("ERROR: Failed to pet watchdog: %v", err)
+					// Continue trying - don't exit on pet failure
+				} else {
+					log.Printf("DEBUG: Watchdog pet successful")
+				}
 			} else {
-				log.Printf("DEBUG: Watchdog pet successful")
+				log.Printf("WARNING: Skipping watchdog pet - SBD device is unhealthy")
+				// This will cause the system to reboot via watchdog timeout
+				// This is the desired behavior for self-fencing when SBD fails
+			}
+		}
+	}
+}
+
+// sbdDeviceLoop continuously updates the SBD device with node status
+func (s *SBDAgent) sbdDeviceLoop() {
+	ticker := time.NewTicker(s.sbdUpdateInterval)
+	defer ticker.Stop()
+
+	log.Printf("Starting SBD device loop with interval %s", s.sbdUpdateInterval)
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			log.Printf("SBD device loop stopping...")
+			return
+		case <-ticker.C:
+			if err := s.writeNodeIDToSBD(); err != nil {
+				log.Printf("ERROR: Failed to write node ID to SBD device: %v", err)
+				s.setSBDHealthy(false)
+
+				// Try to reinitialize the device on next iteration
+				if s.sbdDevice != nil && !s.sbdDevice.IsClosed() {
+					if closeErr := s.sbdDevice.Close(); closeErr != nil {
+						log.Printf("ERROR: Failed to close SBD device: %v", closeErr)
+					}
+				}
+			} else {
+				log.Printf("DEBUG: Successfully updated SBD device with node ID")
+				s.setSBDHealthy(true)
 			}
 		}
 	}
@@ -145,11 +297,45 @@ func validateSBDDevice(devicePath string) error {
 	return nil
 }
 
+// getNodeNameFromEnv gets the node name from environment variables if not provided via flag
+func getNodeNameFromEnv() string {
+	// Try various common environment variables
+	envVars := []string{"NODE_NAME", "HOSTNAME", "NODENAME"}
+
+	for _, envVar := range envVars {
+		if value := os.Getenv(envVar); value != "" {
+			return value
+		}
+	}
+
+	// Fallback to hostname
+	if hostname, err := os.Hostname(); err == nil {
+		return hostname
+	}
+
+	return ""
+}
+
 func main() {
 	flag.Parse()
 
 	log.Printf("SBD Agent starting...")
 	log.Printf("Version: development")
+
+	// Determine node name
+	nodeNameValue := *nodeName
+	if nodeNameValue == "" {
+		nodeNameValue = getNodeNameFromEnv()
+		if nodeNameValue == "" {
+			log.Fatalf("Node name must be specified via --node-name flag or NODE_NAME environment variable")
+		}
+		log.Printf("Using node name from environment: %s", nodeNameValue)
+	}
+
+	// Validate node name length
+	if len(nodeNameValue) > MaxNodeNameLength {
+		log.Fatalf("Node name too long: %d bytes (max %d)", len(nodeNameValue), MaxNodeNameLength)
+	}
 
 	// Validate required parameters
 	if *sbdDevice == "" {
@@ -161,7 +347,7 @@ func main() {
 	}
 
 	// Create SBD agent
-	agent, err := NewSBDAgent(*watchdogPath, *sbdDevice, *watchdogTimeout)
+	agent, err := NewSBDAgent(*watchdogPath, *sbdDevice, nodeNameValue, *watchdogTimeout, *sbdUpdateInterval)
 	if err != nil {
 		log.Fatalf("Failed to create SBD agent: %v", err)
 	}

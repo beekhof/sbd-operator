@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -29,6 +30,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/medik8s/sbd-operator/pkg/blockdevice"
 	"github.com/medik8s/sbd-operator/pkg/sbdprotocol"
@@ -46,6 +50,7 @@ var (
 	peerCheckInterval = flag.Duration("peer-check-interval", 5*time.Second, "Interval for checking peer heartbeats")
 	logLevel          = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 	rebootMethod      = flag.String("reboot-method", "panic", "Method to use for self-fencing (panic, systemctl-reboot)")
+	metricsPort       = flag.Int("metrics-port", 8080, "Port for Prometheus metrics endpoint")
 )
 
 const (
@@ -55,6 +60,44 @@ const (
 	MaxNodeNameLength = 256
 	// DefaultNodeID is the placeholder node ID used when none is specified
 	DefaultNodeID = 1
+)
+
+// Prometheus metrics definitions
+var (
+	// sbd_agent_status_healthy: 1 if the agent is healthy, 0 otherwise
+	// This metric indicates overall agent health including watchdog and SBD device access
+	agentHealthyGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "sbd_agent_status_healthy",
+		Help: "SBD Agent health status (1 = healthy, 0 = unhealthy)",
+	})
+
+	// sbd_device_io_errors_total: Total number of I/O errors with shared SBD device
+	// This metric tracks all I/O operation failures when interacting with the SBD device
+	sbdIOErrorsCounter = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "sbd_device_io_errors_total",
+		Help: "Total number of I/O errors encountered when interacting with the shared SBD device",
+	})
+
+	// sbd_watchdog_pets_total: Total number of successful watchdog pets
+	// This metric counts how many times the kernel watchdog has been successfully petted
+	watchdogPetsCounter = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "sbd_watchdog_pets_total",
+		Help: "Total number of times the local kernel watchdog has been successfully petted",
+	})
+
+	// sbd_peer_status: Current liveness status of each peer node
+	// This metric uses labels to track the status of each peer node in the cluster
+	peerStatusGaugeVec = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "sbd_peer_status",
+		Help: "Current liveness status of each peer node (1 = alive, 0 = unhealthy/down)",
+	}, []string{"node_id", "node_name", "status"})
+
+	// sbd_self_fenced_total: Total number of self-fence initiations
+	// This metric counts how many times this agent has initiated self-fencing
+	selfFencedCounter = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "sbd_self_fenced_total",
+		Help: "Total number of times the agent has initiated a self-fence",
+	})
 )
 
 // BlockDevice defines the interface for block device operations
@@ -134,6 +177,9 @@ func (pm *PeerMonitor) UpdatePeer(nodeID uint16, timestamp, sequence uint64) {
 		peer.LastSeen = now
 		peer.IsHealthy = true
 
+		// Update Prometheus metrics
+		pm.updatePeerMetrics(nodeID, peer.IsHealthy)
+
 		// Log status change
 		if !wasHealthy {
 			log.Printf("INFO: Peer node %d is now healthy (timestamp=%d, sequence=%d)", nodeID, timestamp, sequence)
@@ -157,6 +203,11 @@ func (pm *PeerMonitor) CheckPeerLiveness() {
 
 		// Consider peer unhealthy if we haven't seen a heartbeat within timeout
 		peer.IsHealthy = timeSinceLastSeen <= timeout
+
+		// Update metrics if status changed
+		if wasHealthy != peer.IsHealthy {
+			pm.updatePeerMetrics(nodeID, peer.IsHealthy)
+		}
 
 		// Log status change
 		if wasHealthy && !peer.IsHealthy {
@@ -202,6 +253,21 @@ func (pm *PeerMonitor) GetHealthyPeerCount() int {
 	return count
 }
 
+// updatePeerMetrics updates Prometheus metrics for peer status
+func (pm *PeerMonitor) updatePeerMetrics(nodeID uint16, isHealthy bool) {
+	nodeIDStr := fmt.Sprintf("%d", nodeID)
+	nodeName := fmt.Sprintf("node-%d", nodeID) // Simple node name mapping
+
+	// Set the metric value based on health status
+	if isHealthy {
+		peerStatusGaugeVec.WithLabelValues(nodeIDStr, nodeName, "alive").Set(1)
+		peerStatusGaugeVec.WithLabelValues(nodeIDStr, nodeName, "unhealthy").Set(0)
+	} else {
+		peerStatusGaugeVec.WithLabelValues(nodeIDStr, nodeName, "alive").Set(0)
+		peerStatusGaugeVec.WithLabelValues(nodeIDStr, nodeName, "unhealthy").Set(1)
+	}
+}
+
 // SBDAgent represents the main SBD agent with self-fencing capabilities
 type SBDAgent struct {
 	watchdog          WatchdogInterface
@@ -223,20 +289,22 @@ type SBDAgent struct {
 	peerMonitor       *PeerMonitor
 	selfFenceDetected bool
 	selfFenceMutex    sync.RWMutex
+	metricsPort       int
+	metricsServer     *http.Server
 }
 
 // NewSBDAgent creates a new SBD agent with the specified parameters
-func NewSBDAgent(watchdogPath, sbdDevicePath, nodeName string, nodeID uint16, petInterval, sbdUpdateInterval, heartbeatInterval, peerCheckInterval time.Duration, sbdTimeoutSeconds uint, rebootMethod string) (*SBDAgent, error) {
+func NewSBDAgent(watchdogPath, sbdDevicePath, nodeName string, nodeID uint16, petInterval, sbdUpdateInterval, heartbeatInterval, peerCheckInterval time.Duration, sbdTimeoutSeconds uint, rebootMethod string, metricsPort int) (*SBDAgent, error) {
 	wd, err := watchdog.New(watchdogPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create watchdog: %w", err)
 	}
 
-	return NewSBDAgentWithWatchdog(wd, sbdDevicePath, nodeName, nodeID, petInterval, sbdUpdateInterval, heartbeatInterval, peerCheckInterval, sbdTimeoutSeconds, rebootMethod)
+	return NewSBDAgentWithWatchdog(wd, sbdDevicePath, nodeName, nodeID, petInterval, sbdUpdateInterval, heartbeatInterval, peerCheckInterval, sbdTimeoutSeconds, rebootMethod, metricsPort)
 }
 
 // NewSBDAgentWithWatchdog creates a new SBD agent with the specified watchdog instance
-func NewSBDAgentWithWatchdog(wd WatchdogInterface, sbdDevicePath, nodeName string, nodeID uint16, petInterval, sbdUpdateInterval, heartbeatInterval, peerCheckInterval time.Duration, sbdTimeoutSeconds uint, rebootMethod string) (*SBDAgent, error) {
+func NewSBDAgentWithWatchdog(wd WatchdogInterface, sbdDevicePath, nodeName string, nodeID uint16, petInterval, sbdUpdateInterval, heartbeatInterval, peerCheckInterval time.Duration, sbdTimeoutSeconds uint, rebootMethod string, metricsPort int) (*SBDAgent, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	agent := &SBDAgent{
@@ -255,6 +323,12 @@ func NewSBDAgentWithWatchdog(wd WatchdogInterface, sbdDevicePath, nodeName strin
 		heartbeatSequence: 0,
 		peerMonitor:       NewPeerMonitor(sbdTimeoutSeconds, nodeID),
 		selfFenceDetected: false,
+		metricsPort:       metricsPort,
+	}
+
+	// Initialize Prometheus metrics
+	if err := agent.initMetrics(); err != nil {
+		log.Printf("WARNING: Failed to initialize metrics: %v", err)
 	}
 
 	// Initialize SBD device if provided
@@ -266,6 +340,38 @@ func NewSBDAgentWithWatchdog(wd WatchdogInterface, sbdDevicePath, nodeName strin
 	}
 
 	return agent, nil
+}
+
+// initMetrics initializes Prometheus metrics and starts the metrics server
+func (s *SBDAgent) initMetrics() error {
+	// Register all metrics with the default registry
+	prometheus.MustRegister(agentHealthyGauge)
+	prometheus.MustRegister(sbdIOErrorsCounter)
+	prometheus.MustRegister(watchdogPetsCounter)
+	prometheus.MustRegister(peerStatusGaugeVec)
+	prometheus.MustRegister(selfFencedCounter)
+
+	// Initialize agent healthy status to 1 (healthy by default)
+	agentHealthyGauge.Set(1)
+
+	// Set up the HTTP server for metrics
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+
+	s.metricsServer = &http.Server{
+		Addr:    fmt.Sprintf(":%d", s.metricsPort),
+		Handler: mux,
+	}
+
+	// Start the metrics server in a goroutine
+	go func() {
+		log.Printf("Starting Prometheus metrics server on port %d", s.metricsPort)
+		if err := s.metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("ERROR: Metrics server failed: %v", err)
+		}
+	}()
+
+	return nil
 }
 
 // initializeSBDDevice opens and initializes the SBD block device
@@ -397,6 +503,8 @@ func (s *SBDAgent) readPeerHeartbeat(peerNodeID uint16) error {
 	slotData := make([]byte, sbdprotocol.SBD_SLOT_SIZE)
 	n, err := s.sbdDevice.ReadAt(slotData, slotOffset)
 	if err != nil {
+		// Increment SBD I/O errors counter for read failures
+		sbdIOErrorsCounter.Inc()
 		return fmt.Errorf("failed to read peer %d heartbeat from offset %d: %w", peerNodeID, slotOffset, err)
 	}
 
@@ -466,6 +574,15 @@ func (s *SBDAgent) Stop() error {
 	// Cancel context to stop all goroutines
 	s.cancel()
 
+	// Shutdown metrics server
+	if s.metricsServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := s.metricsServer.Shutdown(ctx); err != nil {
+			log.Printf("Error shutting down metrics server: %v", err)
+		}
+	}
+
 	// Close SBD device
 	if s.sbdDevice != nil && !s.sbdDevice.IsClosed() {
 		if err := s.sbdDevice.Close(); err != nil {
@@ -507,12 +624,22 @@ func (s *SBDAgent) watchdogLoop() {
 			if s.sbdDevicePath == "" || s.isSBDHealthy() {
 				if err := s.watchdog.Pet(); err != nil {
 					log.Printf("ERROR: Failed to pet watchdog: %v", err)
+					// Mark agent as unhealthy on watchdog failures
+					agentHealthyGauge.Set(0)
 					// Continue trying - don't exit on pet failure
 				} else {
 					log.Printf("DEBUG: Watchdog pet successful")
+					// Increment successful watchdog pets counter
+					watchdogPetsCounter.Inc()
+					// Update agent health status based on SBD health
+					if s.sbdDevicePath == "" || s.isSBDHealthy() {
+						agentHealthyGauge.Set(1)
+					}
 				}
 			} else {
 				log.Printf("WARNING: Skipping watchdog pet - SBD device is unhealthy")
+				// Mark agent as unhealthy when SBD device is unhealthy
+				agentHealthyGauge.Set(0)
 				// This will cause the system to reboot via watchdog timeout
 				// This is the desired behavior for self-fencing when SBD fails
 			}
@@ -536,6 +663,10 @@ func (s *SBDAgent) sbdDeviceLoop() {
 			if err := s.writeNodeIDToSBD(); err != nil {
 				log.Printf("ERROR: Failed to write node ID to SBD device: %v", err)
 				s.setSBDHealthy(false)
+				// Increment SBD I/O errors counter
+				sbdIOErrorsCounter.Inc()
+				// Mark agent as unhealthy
+				agentHealthyGauge.Set(0)
 
 				// Try to reinitialize the device on next iteration
 				if s.sbdDevice != nil && !s.sbdDevice.IsClosed() {
@@ -546,6 +677,8 @@ func (s *SBDAgent) sbdDeviceLoop() {
 			} else {
 				log.Printf("DEBUG: Successfully updated SBD device with node ID")
 				s.setSBDHealthy(true)
+				// Update agent health status
+				agentHealthyGauge.Set(1)
 			}
 		}
 	}
@@ -567,6 +700,10 @@ func (s *SBDAgent) heartbeatLoop() {
 			if err := s.writeHeartbeatToSBD(); err != nil {
 				log.Printf("ERROR: Failed to write heartbeat to SBD device: %v", err)
 				s.setSBDHealthy(false)
+				// Increment SBD I/O errors counter
+				sbdIOErrorsCounter.Inc()
+				// Mark agent as unhealthy
+				agentHealthyGauge.Set(0)
 
 				// Try to reinitialize the device on next iteration
 				if s.sbdDevice != nil && !s.sbdDevice.IsClosed() {
@@ -580,6 +717,8 @@ func (s *SBDAgent) heartbeatLoop() {
 				if !s.isSBDHealthy() {
 					log.Printf("DEBUG: SBD device recovered during heartbeat write")
 					s.setSBDHealthy(true)
+					// Update agent health status
+					agentHealthyGauge.Set(1)
 				}
 			}
 		}
@@ -737,6 +876,11 @@ func (s *SBDAgent) executeSelfFencing(reason string) {
 	log.Printf("CRITICAL: Self-fencing initiated! Reason: %s", reason)
 	log.Printf("CRITICAL: Reboot method: %s", s.rebootMethod)
 
+	// Increment self-fenced counter
+	selfFencedCounter.Inc()
+	// Mark agent as unhealthy
+	agentHealthyGauge.Set(0)
+
 	// Mark self-fence as detected to stop watchdog petting
 	s.setSelfFenceDetected(true)
 
@@ -881,7 +1025,7 @@ func main() {
 	}
 
 	// Create SBD agent
-	agent, err := NewSBDAgent(*watchdogPath, *sbdDevice, nodeNameValue, nodeIDValue, *watchdogTimeout, *sbdUpdateInterval, heartbeatInterval, *peerCheckInterval, sbdTimeoutValue, rebootMethodValue)
+	agent, err := NewSBDAgent(*watchdogPath, *sbdDevice, nodeNameValue, nodeIDValue, *watchdogTimeout, *sbdUpdateInterval, heartbeatInterval, *peerCheckInterval, sbdTimeoutValue, rebootMethodValue, *metricsPort)
 	if err != nil {
 		log.Fatalf("Failed to create SBD agent: %v", err)
 	}

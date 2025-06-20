@@ -380,7 +380,7 @@ func TestSBDAgent_ReadPeerHeartbeat(t *testing.T) {
 
 	// Create agent
 	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "/dev/mock-sbd", "test-node", 1,
-		1*time.Second, 1*time.Second, 1*time.Second, 1*time.Second, 30, "panic")
+		1*time.Second, 1*time.Second, 1*time.Second, 1*time.Second, 30, "panic", 8080)
 	if err != nil {
 		t.Fatalf("Failed to create SBD agent: %v", err)
 	}
@@ -435,7 +435,7 @@ func TestSBDAgent_ReadPeerHeartbeat_InvalidMessage(t *testing.T) {
 
 	// Create agent
 	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "/dev/mock-sbd", "test-node", 1,
-		1*time.Second, 1*time.Second, 1*time.Second, 1*time.Second, 30, "panic")
+		1*time.Second, 1*time.Second, 1*time.Second, 1*time.Second, 30, "panic", 8080)
 	if err != nil {
 		t.Fatalf("Failed to create SBD agent: %v", err)
 	}
@@ -472,7 +472,7 @@ func TestSBDAgent_ReadPeerHeartbeat_DeviceError(t *testing.T) {
 
 	// Create agent
 	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "/dev/mock-sbd", "test-node", 1,
-		1*time.Second, 1*time.Second, 1*time.Second, 1*time.Second, 30, "panic")
+		1*time.Second, 1*time.Second, 1*time.Second, 1*time.Second, 30, "panic", 8080)
 	if err != nil {
 		t.Fatalf("Failed to create SBD agent: %v", err)
 	}
@@ -498,7 +498,7 @@ func TestSBDAgent_ReadPeerHeartbeat_NodeIDMismatch(t *testing.T) {
 
 	// Create agent
 	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "/dev/mock-sbd", "test-node", 1,
-		1*time.Second, 1*time.Second, 1*time.Second, 1*time.Second, 30, "panic")
+		1*time.Second, 1*time.Second, 1*time.Second, 1*time.Second, 30, "panic", 8080)
 	if err != nil {
 		t.Fatalf("Failed to create SBD agent: %v", err)
 	}
@@ -545,7 +545,7 @@ func TestSBDAgent_PeerMonitorLoop_Integration(t *testing.T) {
 	mockDevice := NewMockBlockDevice("/dev/mock-sbd", int(sbdprotocol.SBD_MAX_NODES*sbdprotocol.SBD_SLOT_SIZE))
 
 	// Create agent with short check interval for testing
-	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second, 100*time.Millisecond, 1, "panic")
+	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second, 100*time.Millisecond, 1, "panic", 8080)
 	if err != nil {
 		t.Fatalf("Failed to create agent: %v", err)
 	}
@@ -618,7 +618,7 @@ func TestSBDAgent_NewSBDAgent(t *testing.T) {
 		t.Fatalf("Failed to create mock SBD device: %v", err)
 	}
 
-	agent, err := NewSBDAgent(watchdogPath, sbdPath, "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second, 5*time.Second, 30, "panic")
+	agent, err := NewSBDAgent(watchdogPath, sbdPath, "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second, 5*time.Second, 30, "panic", 8080)
 	if err != nil {
 		t.Fatalf("Failed to create agent: %v", err)
 	}
@@ -645,7 +645,7 @@ func TestSBDAgent_WriteHeartbeatToSBD(t *testing.T) {
 	mockWatchdog := NewMockWatchdog("/dev/watchdog")
 	mockDevice := NewMockBlockDevice("/dev/mock-sbd", int(sbdprotocol.SBD_MAX_NODES*sbdprotocol.SBD_SLOT_SIZE))
 
-	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 2, 30*time.Second, 5*time.Second, 15*time.Second, 5*time.Second, 30, "panic")
+	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 2, 30*time.Second, 5*time.Second, 15*time.Second, 5*time.Second, 30, "panic", 8080)
 	if err != nil {
 		t.Fatalf("Failed to create agent: %v", err)
 	}
@@ -694,7 +694,7 @@ func TestSBDAgent_WriteHeartbeatToSBD_DeviceError(t *testing.T) {
 	mockWatchdog := NewMockWatchdog("/dev/watchdog")
 	mockDevice := NewMockBlockDevice("/dev/mock-sbd", int(sbdprotocol.SBD_MAX_NODES*sbdprotocol.SBD_SLOT_SIZE))
 
-	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second, 5*time.Second, 30, "panic")
+	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second, 5*time.Second, 30, "panic", 8080)
 	if err != nil {
 		t.Fatalf("Failed to create agent: %v", err)
 	}
@@ -717,7 +717,7 @@ func TestSBDAgent_WriteHeartbeatToSBD_SyncError(t *testing.T) {
 	mockWatchdog := NewMockWatchdog("/dev/watchdog")
 	mockDevice := NewMockBlockDevice("/dev/mock-sbd", int(sbdprotocol.SBD_MAX_NODES*sbdprotocol.SBD_SLOT_SIZE))
 
-	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second, 5*time.Second, 30, "panic")
+	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second, 5*time.Second, 30, "panic", 8080)
 	if err != nil {
 		t.Fatalf("Failed to create agent: %v", err)
 	}
@@ -743,7 +743,7 @@ func TestSBDAgent_WriteHeartbeatToSBD_SyncError(t *testing.T) {
 func TestSBDAgent_SBDHealthStatus(t *testing.T) {
 	mockWatchdog := NewMockWatchdog("/dev/watchdog")
 	// Use empty SBD device path so initialization doesn't fail
-	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second, 5*time.Second, 30, "panic")
+	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second, 5*time.Second, 30, "panic", 8080)
 	if err != nil {
 		t.Fatalf("Failed to create agent: %v", err)
 	}
@@ -769,7 +769,7 @@ func TestSBDAgent_SBDHealthStatus(t *testing.T) {
 
 func TestSBDAgent_HeartbeatSequence(t *testing.T) {
 	mockWatchdog := NewMockWatchdog("/dev/watchdog")
-	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second, 5*time.Second, 30, "panic")
+	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second, 5*time.Second, 30, "panic", 8080)
 	if err != nil {
 		t.Fatalf("Failed to create agent: %v", err)
 	}
@@ -849,7 +849,7 @@ func BenchmarkSBDAgent_WriteHeartbeat(b *testing.B) {
 	mockWatchdog := NewMockWatchdog("/dev/watchdog")
 	mockDevice := NewMockBlockDevice("/dev/mock-sbd", int(sbdprotocol.SBD_MAX_NODES*sbdprotocol.SBD_SLOT_SIZE))
 
-	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second, 5*time.Second, 30, "panic")
+	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second, 5*time.Second, 30, "panic", 8080)
 	if err != nil {
 		b.Fatalf("Failed to create agent: %v", err)
 	}
@@ -869,7 +869,7 @@ func BenchmarkSBDAgent_ReadPeerHeartbeat(b *testing.B) {
 	mockWatchdog := NewMockWatchdog("/dev/watchdog")
 	mockDevice := NewMockBlockDevice("/dev/mock-sbd", int(sbdprotocol.SBD_MAX_NODES*sbdprotocol.SBD_SLOT_SIZE))
 
-	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second, 5*time.Second, 30, "panic")
+	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second, 5*time.Second, 30, "panic", 8080)
 	if err != nil {
 		b.Fatalf("Failed to create agent: %v", err)
 	}
@@ -907,7 +907,7 @@ func TestSBDAgent_ReadOwnSlotForFenceMessage(t *testing.T) {
 
 	// Create agent without SBD device path to avoid initialization issues
 	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 5,
-		1*time.Second, 1*time.Second, 1*time.Second, 1*time.Second, 30, "panic")
+		1*time.Second, 1*time.Second, 1*time.Second, 1*time.Second, 30, "panic", 8080)
 	if err != nil {
 		t.Fatalf("Failed to create SBD agent: %v", err)
 	}
@@ -957,7 +957,7 @@ func TestSBDAgent_ReadOwnSlotForFenceMessage_WrongTarget(t *testing.T) {
 
 	// Create agent with node ID 5 without SBD device path
 	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 5,
-		1*time.Second, 1*time.Second, 1*time.Second, 1*time.Second, 30, "panic")
+		1*time.Second, 1*time.Second, 1*time.Second, 1*time.Second, 30, "panic", 8080)
 	if err != nil {
 		t.Fatalf("Failed to create SBD agent: %v", err)
 	}
@@ -989,7 +989,7 @@ func TestSBDAgent_SelfFenceStatus(t *testing.T) {
 
 	// Create agent
 	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 5,
-		1*time.Second, 1*time.Second, 1*time.Second, 1*time.Second, 30, "panic")
+		1*time.Second, 1*time.Second, 1*time.Second, 1*time.Second, 30, "panic", 8080)
 	if err != nil {
 		t.Fatalf("Failed to create SBD agent: %v", err)
 	}
@@ -1084,7 +1084,7 @@ func TestSBDAgent_WatchdogLoop_WithSelfFence(t *testing.T) {
 
 	// Create agent with short pet interval for testing
 	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 5,
-		50*time.Millisecond, 1*time.Second, 1*time.Second, 1*time.Second, 30, "panic")
+		50*time.Millisecond, 1*time.Second, 1*time.Second, 1*time.Second, 30, "panic", 8080)
 	if err != nil {
 		t.Fatalf("Failed to create SBD agent: %v", err)
 	}

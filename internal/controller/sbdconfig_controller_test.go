@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -27,11 +28,71 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	medik8sv1alpha1 "github.com/medik8s/sbd-operator/api/v1alpha1"
 )
+
+// MockEventRecorder is a mock implementation of record.EventRecorder for testing
+type MockEventRecorder struct {
+	Events []Event
+	mutex  sync.RWMutex
+}
+
+// Event represents a recorded event for testing
+type Event struct {
+	Object    runtime.Object
+	EventType string
+	Reason    string
+	Message   string
+}
+
+// Event records an event for testing
+func (m *MockEventRecorder) Event(object runtime.Object, eventtype, reason, message string) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.Events = append(m.Events, Event{
+		Object:    object,
+		EventType: eventtype,
+		Reason:    reason,
+		Message:   message,
+	})
+}
+
+// Eventf records a formatted event for testing
+func (m *MockEventRecorder) Eventf(object runtime.Object, eventtype, reason, messageFmt string, args ...interface{}) {
+	m.Event(object, eventtype, reason, fmt.Sprintf(messageFmt, args...))
+}
+
+// AnnotatedEventf records an annotated formatted event for testing
+func (m *MockEventRecorder) AnnotatedEventf(object runtime.Object, annotations map[string]string, eventtype, reason, messageFmt string, args ...interface{}) {
+	m.Eventf(object, eventtype, reason, messageFmt, args...)
+}
+
+// GetEvents returns a copy of recorded events for testing
+func (m *MockEventRecorder) GetEvents() []Event {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	events := make([]Event, len(m.Events))
+	copy(events, m.Events)
+	return events
+}
+
+// Reset clears all recorded events
+func (m *MockEventRecorder) Reset() {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.Events = nil
+}
+
+// NewMockEventRecorder creates a new MockEventRecorder
+func NewMockEventRecorder() *MockEventRecorder {
+	return &MockEventRecorder{
+		Events: make([]Event, 0),
+	}
+}
 
 var _ = Describe("SBDConfig Controller", func() {
 	Context("When reconciling a resource", func() {
@@ -422,6 +483,145 @@ var _ = Describe("SBDConfig Controller", func() {
 
 			Expect(daemonSet.Spec.Template.Spec.Containers[0].Image).To(Equal("sbd-agent:latest"))
 			Expect(daemonSet.Namespace).To(Equal("sbd-system"))
+		})
+	})
+
+	Context("When testing event emission", func() {
+		const (
+			resourceName = "test-events-sbdconfig"
+			namespace    = "test-events-system"
+		)
+
+		ctx := context.Background()
+		typeNamespacedName := types.NamespacedName{Name: resourceName}
+
+		var controllerReconciler *SBDConfigReconciler
+		var mockRecorder *MockEventRecorder
+
+		BeforeEach(func() {
+			mockRecorder = NewMockEventRecorder()
+			controllerReconciler = &SBDConfigReconciler{
+				Client:   k8sClient,
+				Scheme:   k8sClient.Scheme(),
+				Recorder: mockRecorder,
+			}
+		})
+
+		AfterEach(func() {
+			// Clean up resources
+			resource := &medik8sv1alpha1.SBDConfig{}
+			err := k8sClient.Get(ctx, typeNamespacedName, resource)
+			if err == nil {
+				k8sClient.Delete(ctx, resource)
+			}
+
+			testNamespace := &corev1.Namespace{}
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: namespace}, testNamespace)
+			if err == nil {
+				k8sClient.Delete(ctx, testNamespace)
+			}
+		})
+
+		It("should emit events during successful reconciliation", func() {
+			By("creating the SBDConfig resource")
+			resource := &medik8sv1alpha1.SBDConfig{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: resourceName,
+				},
+				Spec: medik8sv1alpha1.SBDConfigSpec{
+					SbdWatchdogPath: "/dev/watchdog",
+					Image:           "test-sbd-agent:latest",
+					Namespace:       namespace,
+				},
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+			By("reconciling the resource")
+			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(reconcile.Result{}))
+
+			By("verifying events were emitted")
+			events := mockRecorder.GetEvents()
+			Expect(len(events)).To(BeNumerically(">=", 2))
+
+			// Check for namespace creation event
+			namespaceEvent := false
+			for _, event := range events {
+				if event.Reason == ReasonNamespaceCreated && event.EventType == EventTypeNormal {
+					namespaceEvent = true
+					Expect(event.Message).To(ContainSubstring(namespace))
+					break
+				}
+			}
+			Expect(namespaceEvent).To(BeTrue(), "Namespace creation event should be emitted")
+
+			// Check for DaemonSet management event
+			daemonSetEvent := false
+			for _, event := range events {
+				if event.Reason == ReasonDaemonSetManaged && event.EventType == EventTypeNormal {
+					daemonSetEvent = true
+					Expect(event.Message).To(ContainSubstring("DaemonSet"))
+					break
+				}
+			}
+			Expect(daemonSetEvent).To(BeTrue(), "DaemonSet management event should be emitted")
+
+			// Check for reconciliation success event
+			reconcileEvent := false
+			for _, event := range events {
+				if event.Reason == ReasonSBDConfigReconciled && event.EventType == EventTypeNormal {
+					reconcileEvent = true
+					Expect(event.Message).To(ContainSubstring(resourceName))
+					break
+				}
+			}
+			Expect(reconcileEvent).To(BeTrue(), "SBDConfig reconciled event should be emitted")
+		})
+
+		It("should emit events for helper methods", func() {
+			By("testing emitEvent helper")
+			resource := &medik8sv1alpha1.SBDConfig{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName},
+			}
+
+			controllerReconciler.emitEvent(resource, EventTypeNormal, "TestReason", "Test message")
+
+			events := mockRecorder.GetEvents()
+			Expect(len(events)).To(Equal(1))
+			Expect(events[0].EventType).To(Equal(EventTypeNormal))
+			Expect(events[0].Reason).To(Equal("TestReason"))
+			Expect(events[0].Message).To(Equal("Test message"))
+
+			By("testing emitEventf helper")
+			mockRecorder.Reset()
+			controllerReconciler.emitEventf(resource, EventTypeWarning, "TestFormat", "Formatted message: %s", "test-value")
+
+			events = mockRecorder.GetEvents()
+			Expect(len(events)).To(Equal(1))
+			Expect(events[0].EventType).To(Equal(EventTypeWarning))
+			Expect(events[0].Reason).To(Equal("TestFormat"))
+			Expect(events[0].Message).To(Equal("Formatted message: test-value"))
+		})
+
+		It("should handle nil recorder gracefully", func() {
+			By("setting recorder to nil")
+			controllerReconciler.Recorder = nil
+
+			resource := &medik8sv1alpha1.SBDConfig{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName},
+			}
+
+			By("calling event methods with nil recorder")
+			// These should not panic
+			controllerReconciler.emitEvent(resource, EventTypeNormal, "TestReason", "Test message")
+			controllerReconciler.emitEventf(resource, EventTypeWarning, "TestFormat", "Formatted message: %s", "test-value")
+
+			// No events should be recorded
+			events := mockRecorder.GetEvents()
+			Expect(len(events)).To(Equal(0))
 		})
 	})
 

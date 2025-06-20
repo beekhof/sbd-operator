@@ -29,6 +29,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -62,12 +63,25 @@ const (
 	// Status update retry configuration
 	maxStatusUpdateRetries = 5
 	statusUpdateDelay      = 100 * time.Millisecond
+
+	// Event reasons for SBDRemediation operations
+	ReasonFencingInitiated     = "FencingInitiated"
+	ReasonNodeFenced           = "NodeFenced"
+	ReasonFencingFailed        = "FencingFailed"
+	ReasonSBDDeviceError       = "SBDDeviceError"
+	ReasonNodeIDMappingError   = "NodeIDMappingError"
+	ReasonLeadershipWaiting    = "LeadershipWaiting"
+	ReasonRemediationCompleted = "RemediationCompleted"
+	ReasonRemediationFailed    = "RemediationFailed"
+	ReasonRemediationInitiated = "RemediationInitiated"
+	ReasonFinalizerProcessed   = "FinalizerProcessed"
 )
 
 // SBDRemediationReconciler reconciles a SBDRemediation object
 type SBDRemediationReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
 
 	// Leadership tracking - simple approach using environment variable or config
 	leaderElectionEnabled bool
@@ -75,6 +89,20 @@ type SBDRemediationReconciler struct {
 	// SBD device configuration
 	sbdDevicePath string
 	sbdDevice     *blockdevice.Device
+}
+
+// emitEvent is a helper function to emit Kubernetes events for the SBDRemediation controller
+func (r *SBDRemediationReconciler) emitEvent(object client.Object, eventType, reason, message string) {
+	if r.Recorder != nil {
+		r.Recorder.Event(object, eventType, reason, message)
+	}
+}
+
+// emitEventf is a helper function to emit formatted Kubernetes events for the SBDRemediation controller
+func (r *SBDRemediationReconciler) emitEventf(object client.Object, eventType, reason, messageFmt string, args ...interface{}) {
+	if r.Recorder != nil {
+		r.Recorder.Eventf(object, eventType, reason, messageFmt, args...)
+	}
 }
 
 // FencingError represents an error that occurred during the fencing process
@@ -100,6 +128,7 @@ func (e *FencingError) Error() string {
 // +kubebuilder:rbac:groups=medik8s.medik8s.io,resources=sbdremediations/finalizers,verbs=update
 // +kubebuilder:rbac:groups=medik8s.medik8s.io,resources=sbdconfigs,verbs=get;list;watch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;create;update;patch;watch
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // SetLeaderElectionEnabled sets whether leader election is enabled for this controller
 func (r *SBDRemediationReconciler) SetLeaderElectionEnabled(enabled bool) {
@@ -199,6 +228,9 @@ func (r *SBDRemediationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	// Handle deletion
 	if !sbdRemediation.DeletionTimestamp.IsZero() {
+		logger.Info("SBDRemediation is being deleted, processing finalizers")
+		r.emitEventf(&sbdRemediation, EventTypeNormal, ReasonFinalizerProcessed,
+			"Processing deletion of SBDRemediation for node '%s'", sbdRemediation.Spec.NodeName)
 		return r.handleDeletion(ctx, &sbdRemediation)
 	}
 
@@ -209,113 +241,90 @@ func (r *SBDRemediationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			logger.Error(err, "Failed to add finalizer")
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{Requeue: true}, nil
+		logger.Info("Added finalizer to SBDRemediation")
 	}
 
-	// Initialize status if empty
+	// Emit initial event for remediation initiation
 	if sbdRemediation.Status.Phase == "" {
-		result, err := r.updateStatusRobust(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhasePending,
-			"SBD remediation request received and queued for processing")
-		if err != nil {
-			return result, err
-		}
-		return ctrl.Result{Requeue: true}, nil
+		r.emitEventf(&sbdRemediation, EventTypeNormal, ReasonRemediationInitiated,
+			"SBD remediation initiated for node '%s'", sbdRemediation.Spec.NodeName)
 	}
 
-	/*
-	 * LEADERSHIP CHECK - CRITICAL FOR FENCING SAFETY
-	 *
-	 * Fencing operations must only be performed by the leader operator instance
-	 * to prevent race conditions, conflicting decisions, and potential data corruption.
-	 * Non-leader instances will wait and requeue until they become leader or another
-	 * leader processes the remediation.
-	 */
+	// Check if we already completed this remediation
+	if sbdRemediation.Status.Phase == medik8sv1alpha1.SBDRemediationPhaseFencedSuccessfully {
+		logger.Info("SBDRemediation already completed successfully")
+		return ctrl.Result{}, nil
+	}
+
+	// Leadership check - only the leader should perform fencing operations
 	if r.leaderElectionEnabled && !r.IsLeader() {
 		logger.Info("⏳ Not the leader - waiting for leadership to perform fencing operations")
+		r.emitEventf(&sbdRemediation, EventTypeNormal, ReasonLeadershipWaiting,
+			"Waiting for leadership to perform fencing for node '%s'", sbdRemediation.Spec.NodeName)
 		return r.updateStatusRobust(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseWaitingForLeadership,
-			"Waiting for operator instance to become leader before performing fencing operations")
+			"Waiting for operator leadership to perform fencing operations")
 	}
 
-	// Check if remediation is already completed or failed
-	switch sbdRemediation.Status.Phase {
-	case medik8sv1alpha1.SBDRemediationPhaseFencedSuccessfully:
-		logger.Info("✅ SBDRemediation already completed successfully")
-		return ctrl.Result{}, nil
-	case medik8sv1alpha1.SBDRemediationPhaseFailed:
-		logger.Info("❌ SBDRemediation previously failed - checking if retry is needed")
-		// For failed remediations, we could implement retry logic here
-		// For now, we'll leave them as failed unless manually updated
-		return ctrl.Result{}, nil
-	}
+	logger.Info("🎯 Leader confirmed - proceeding with fencing operations", "nodeName", sbdRemediation.Spec.NodeName)
 
-	logger.Info("🎯 Processing SBDRemediation as leader",
-		"target-node", sbdRemediation.Spec.NodeName,
-		"reason", sbdRemediation.Spec.Reason)
-
-	// Determine target node ID
+	// Convert node name to node ID
 	targetNodeID, err := r.nodeNameToNodeID(sbdRemediation.Spec.NodeName)
 	if err != nil {
-		logger.Error(err, "Failed to determine node ID for target node", "node-name", sbdRemediation.Spec.NodeName)
-		_, updateErr := r.updateStatusRobust(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseFailed,
-			fmt.Sprintf("Failed to determine node ID for node %q: %v", sbdRemediation.Spec.NodeName, err))
-		if updateErr != nil {
-			logger.Error(updateErr, "Failed to update status after node ID mapping error")
-			return ctrl.Result{}, updateErr
-		}
-		return ctrl.Result{}, nil // Don't requeue for permanent errors
+		logger.Error(err, "Failed to map node name to node ID", "nodeName", sbdRemediation.Spec.NodeName)
+		r.emitEventf(&sbdRemediation, EventTypeWarning, ReasonNodeIDMappingError,
+			"Failed to map node name '%s' to node ID: %v", sbdRemediation.Spec.NodeName, err)
+		return r.updateStatusRobust(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseFailed,
+			fmt.Sprintf("Failed to map node name to node ID: %v", err))
 	}
 
-	// Update status with node ID if not already set
-	if sbdRemediation.Status.NodeID == nil || *sbdRemediation.Status.NodeID != targetNodeID {
-		// Update the resource in memory first
+	// Initialize SBD device if needed
+	if r.sbdDevice == nil {
+		if err := r.initializeSBDDevice(ctx); err != nil {
+			logger.Error(err, "Failed to initialize SBD device")
+			r.emitEventf(&sbdRemediation, EventTypeWarning, ReasonSBDDeviceError,
+				"Failed to initialize SBD device for fencing node '%s': %v", sbdRemediation.Spec.NodeName, err)
+			return r.updateStatusRobust(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseFailed,
+				fmt.Sprintf("Failed to initialize SBD device: %v", err))
+		}
+	}
+
+	// Update status to indicate fencing is in progress
+	if sbdRemediation.Status.Phase != medik8sv1alpha1.SBDRemediationPhaseFencingInProgress {
+		// Set NodeID in status before updating
 		sbdRemediation.Status.NodeID = &targetNodeID
 		sbdRemediation.Status.OperatorInstance = r.getOperatorInstanceID()
 
-		// Use a separate update for non-status fields
-		if err := r.updateStatusWithRetry(ctx, &sbdRemediation); err != nil {
-			logger.Error(err, "Failed to update status with node ID")
-			return ctrl.Result{RequeueAfter: baseRetryDelay}, err
-		}
-	}
-
-	// Update status to indicate fencing is in progress (only if not already in progress)
-	if sbdRemediation.Status.Phase != medik8sv1alpha1.SBDRemediationPhaseFencingInProgress {
-		result, err := r.updateStatusRobust(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseFencingInProgress,
-			fmt.Sprintf("Writing fence message for node %s (NodeID: %d) to SBD device", sbdRemediation.Spec.NodeName, targetNodeID))
-		if err != nil {
+		if result, err := r.updateStatusRobust(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseFencingInProgress,
+			fmt.Sprintf("Initiating fencing for node %s (ID: %d)", sbdRemediation.Spec.NodeName, targetNodeID)); err != nil {
 			return result, err
 		}
+
+		// Emit event for fencing initiation
+		r.emitEventf(&sbdRemediation, EventTypeNormal, ReasonFencingInitiated,
+			"Fencing initiated for node '%s' via SBD", sbdRemediation.Spec.NodeName)
 	}
 
 	// Perform the fencing operation with retry logic
 	if err := r.performFencingWithRetry(ctx, &sbdRemediation, targetNodeID); err != nil {
-		logger.Error(err, "Failed to perform fencing operation after retries")
+		logger.Error(err, "Failed to fence node", "nodeName", sbdRemediation.Spec.NodeName, "nodeID", targetNodeID)
 
-		// Determine if this is a permanent failure or temporary
-		var fencingErr *FencingError
-		var message string
-		if errors.As(err, &fencingErr) {
-			message = fmt.Sprintf("Fencing operation failed: %s", fencingErr.Error())
-		} else {
-			message = fmt.Sprintf("Fencing operation failed: %v", err)
-		}
+		// Emit failure event
+		r.emitEventf(&sbdRemediation, EventTypeWarning, ReasonFencingFailed,
+			"Failed to fence node '%s' via SBD: %s", sbdRemediation.Spec.NodeName, err.Error())
 
-		_, updateErr := r.updateStatusRobust(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseFailed, message)
-		if updateErr != nil {
-			logger.Error(updateErr, "Failed to update status after fencing failure")
-			return ctrl.Result{}, updateErr
-		}
-		return ctrl.Result{}, nil // Don't requeue after marking as failed
+		return r.updateStatusRobust(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseFailed,
+			fmt.Sprintf("Fencing failed: %v", err))
 	}
 
-	// Mark as completed successfully
-	result, err := r.updateStatusRobust(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseFencedSuccessfully,
-		"Node successfully fenced via SBD.")
+	logger.Info("✅ Successfully fenced node", "nodeName", sbdRemediation.Spec.NodeName, "nodeID", targetNodeID)
 
-	logger.Info("✅ SBDRemediation completed successfully",
-		"target-node", sbdRemediation.Spec.NodeName,
-		"node-id", targetNodeID)
-	return result, err
+	// Emit success event
+	r.emitEventf(&sbdRemediation, EventTypeNormal, ReasonNodeFenced,
+		"Node '%s' successfully fenced via SBD", sbdRemediation.Spec.NodeName)
+
+	// Update status to indicate successful fencing
+	return r.updateStatusRobust(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseFencedSuccessfully,
+		fmt.Sprintf("Node %s (ID: %d) successfully fenced via SBD device", sbdRemediation.Spec.NodeName, targetNodeID))
 }
 
 // initializeSBDDevice initializes the SBD device connection if not already done

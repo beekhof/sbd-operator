@@ -231,10 +231,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Create leadership-aware controllers
+	// Create leadership-aware controllers with EventRecorder
 	sbdRemediationReconciler := &controller.SBDRemediationReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("sbd-remediation-controller"),
 	}
 
 	// Set leadership configuration
@@ -248,8 +249,9 @@ func main() {
 	}
 
 	if err := (&controller.SBDConfigReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("sbd-config-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "SBDConfig")
 		os.Exit(1)

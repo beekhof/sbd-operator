@@ -27,6 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -35,10 +36,40 @@ import (
 	medik8sv1alpha1 "github.com/medik8s/sbd-operator/api/v1alpha1"
 )
 
+// Event types and reasons for SBDConfig controller
+const (
+	// Event types
+	EventTypeNormal  = "Normal"
+	EventTypeWarning = "Warning"
+
+	// Event reasons for SBDConfig operations
+	ReasonSBDConfigReconciled = "SBDConfigReconciled"
+	ReasonDaemonSetManaged    = "DaemonSetManaged"
+	ReasonNamespaceCreated    = "NamespaceCreated"
+	ReasonReconcileError      = "ReconcileError"
+	ReasonDaemonSetError      = "DaemonSetError"
+	ReasonNamespaceError      = "NamespaceError"
+)
+
 // SBDConfigReconciler reconciles a SBDConfig object
 type SBDConfigReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
+}
+
+// emitEvent is a helper function to emit Kubernetes events for the SBDConfig controller
+func (r *SBDConfigReconciler) emitEvent(object client.Object, eventType, reason, message string) {
+	if r.Recorder != nil {
+		r.Recorder.Event(object, eventType, reason, message)
+	}
+}
+
+// emitEventf is a helper function to emit formatted Kubernetes events for the SBDConfig controller
+func (r *SBDConfigReconciler) emitEventf(object client.Object, eventType, reason, messageFmt string, args ...interface{}) {
+	if r.Recorder != nil {
+		r.Recorder.Eventf(object, eventType, reason, messageFmt, args...)
+	}
 }
 
 // +kubebuilder:rbac:groups=medik8s.medik8s.io,resources=sbdconfigs,verbs=get;list;watch;create;update;patch;delete
@@ -46,6 +77,7 @@ type SBDConfigReconciler struct {
 // +kubebuilder:rbac:groups=medik8s.medik8s.io,resources=sbdconfigs/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=daemonsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -81,8 +113,10 @@ func (r *SBDConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	// Ensure the namespace exists
-	if err := r.ensureNamespace(ctx, sbdConfig.Spec.Namespace); err != nil {
+	if err := r.ensureNamespace(ctx, &sbdConfig, sbdConfig.Spec.Namespace); err != nil {
 		logger.Error(err, "Failed to ensure namespace exists", "namespace", sbdConfig.Spec.Namespace)
+		r.emitEventf(&sbdConfig, EventTypeWarning, ReasonNamespaceError,
+			"Failed to ensure namespace '%s' exists: %v", sbdConfig.Spec.Namespace, err)
 		return ctrl.Result{}, err
 	}
 
@@ -108,34 +142,60 @@ func (r *SBDConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	})
 	if err != nil {
 		logger.Error(err, "Failed to create or update DaemonSet", "DaemonSet", desiredDaemonSet.Name)
+		r.emitEventf(&sbdConfig, EventTypeWarning, ReasonDaemonSetError,
+			"Failed to create or update DaemonSet '%s': %v", desiredDaemonSet.Name, err)
 		return ctrl.Result{}, err
 	}
 
 	logger.Info("DaemonSet operation completed", "DaemonSet", actualDaemonSet.Name, "operation", result)
 
+	// Emit event for DaemonSet management
+	if result == controllerutil.OperationResultCreated {
+		r.emitEventf(&sbdConfig, EventTypeNormal, ReasonDaemonSetManaged,
+			"DaemonSet '%s' for SBD Agent created successfully", actualDaemonSet.Name)
+	} else if result == controllerutil.OperationResultUpdated {
+		r.emitEventf(&sbdConfig, EventTypeNormal, ReasonDaemonSetManaged,
+			"DaemonSet '%s' for SBD Agent updated successfully", actualDaemonSet.Name)
+	} else {
+		r.emitEventf(&sbdConfig, EventTypeNormal, ReasonDaemonSetManaged,
+			"DaemonSet '%s' for SBD Agent managed", actualDaemonSet.Name)
+	}
+
 	// Update the SBDConfig status
 	if err := r.updateStatus(ctx, &sbdConfig, actualDaemonSet); err != nil {
 		logger.Error(err, "Failed to update SBDConfig status")
+		r.emitEventf(&sbdConfig, EventTypeWarning, ReasonReconcileError,
+			"Failed to update SBDConfig status: %v", err)
 		return ctrl.Result{}, err
 	}
 
 	logger.Info("Successfully reconciled SBDConfig", "name", sbdConfig.Name, "namespace", sbdConfig.Namespace)
 
+	// Emit success event for SBDConfig reconciliation
+	r.emitEventf(&sbdConfig, EventTypeNormal, ReasonSBDConfigReconciled,
+		"SBDConfig '%s' successfully reconciled", sbdConfig.Name)
+
 	return ctrl.Result{}, nil
 }
 
 // ensureNamespace creates the namespace if it doesn't exist
-func (r *SBDConfigReconciler) ensureNamespace(ctx context.Context, namespaceName string) error {
+func (r *SBDConfigReconciler) ensureNamespace(ctx context.Context, sbdConfig *medik8sv1alpha1.SBDConfig, namespaceName string) error {
 	namespace := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: namespaceName,
 		},
 	}
 
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, namespace, func() error {
+	result, err := controllerutil.CreateOrUpdate(ctx, r.Client, namespace, func() error {
 		// No changes needed for namespace
 		return nil
 	})
+
+	if err == nil && result == controllerutil.OperationResultCreated {
+		// Emit event for namespace creation
+		r.emitEventf(sbdConfig, EventTypeNormal, ReasonNamespaceCreated,
+			"Namespace '%s' created for SBD system", namespaceName)
+	}
 
 	return err
 }

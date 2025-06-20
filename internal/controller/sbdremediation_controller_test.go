@@ -201,7 +201,7 @@ var _ = Describe("SBDRemediation Controller", func() {
 				Expect(k8sClient.Get(ctx, namespacedName, finalResource)).To(Succeed())
 
 				Expect(finalResource.Status.Phase).To(Equal(medik8sv1alpha1.SBDRemediationPhaseFencedSuccessfully))
-				Expect(finalResource.Status.Message).To(Equal("Node successfully fenced via SBD."))
+				Expect(finalResource.Status.Message).To(Equal("Node worker-5 (ID: 5) successfully fenced via SBD device"))
 				Expect(finalResource.Status.NodeID).NotTo(BeNil())
 				Expect(*finalResource.Status.NodeID).To(Equal(uint16(5)))
 				Expect(finalResource.Status.FenceMessageWritten).To(BeTrue())
@@ -259,7 +259,7 @@ var _ = Describe("SBDRemediation Controller", func() {
 				Expect(k8sClient.Get(ctx, namespacedName, updatedResource)).To(Succeed())
 
 				Expect(updatedResource.Status.Phase).To(Equal(medik8sv1alpha1.SBDRemediationPhaseFailed))
-				Expect(updatedResource.Status.Message).To(ContainSubstring("Failed to determine node ID"))
+				Expect(updatedResource.Status.Message).To(ContainSubstring("Failed to map node name to node ID"))
 				Expect(updatedResource.Status.LastUpdateTime).NotTo(BeNil())
 			})
 
@@ -299,8 +299,7 @@ var _ = Describe("SBDRemediation Controller", func() {
 				Expect(k8sClient.Get(ctx, namespacedName, updatedResource)).To(Succeed())
 
 				Expect(updatedResource.Status.Phase).To(Equal(medik8sv1alpha1.SBDRemediationPhaseFailed))
-				Expect(updatedResource.Status.Message).To(ContainSubstring("Fencing operation failed"))
-				Expect(updatedResource.Status.Message).To(ContainSubstring("SBD device initialization"))
+				Expect(updatedResource.Status.Message).To(ContainSubstring("Failed to initialize SBD device"))
 			})
 
 			It("should handle status update idempotency correctly", func() {
@@ -381,7 +380,7 @@ var _ = Describe("SBDRemediation Controller", func() {
 				updatedResource := &medik8sv1alpha1.SBDRemediation{}
 				Expect(k8sClient.Get(ctx, namespacedName, updatedResource)).To(Succeed())
 				Expect(updatedResource.Status.Phase).To(Equal(medik8sv1alpha1.SBDRemediationPhaseFencedSuccessfully))
-				Expect(updatedResource.Status.Message).To(Equal("Node successfully fenced via SBD."))
+				Expect(updatedResource.Status.Message).To(Equal("Node worker-7 (ID: 7) successfully fenced via SBD device"))
 			})
 		})
 
@@ -437,12 +436,11 @@ var _ = Describe("SBDRemediation Controller", func() {
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 
-				// First reconcile to add finalizer
-				result, err := reconciler.Reconcile(ctx, reconcile.Request{
+				// First reconcile to complete the fencing
+				_, err := reconciler.Reconcile(ctx, reconcile.Request{
 					NamespacedName: namespacedName,
 				})
 				Expect(err).NotTo(HaveOccurred())
-				Expect(result.Requeue).To(BeTrue()) // Should requeue after adding finalizer
 
 				// Manually update status to completed
 				updatedResource := &medik8sv1alpha1.SBDRemediation{}
@@ -455,11 +453,11 @@ var _ = Describe("SBDRemediation Controller", func() {
 				Expect(k8sClient.Status().Update(ctx, updatedResource)).To(Succeed())
 
 				By("Reconciling the already completed resource")
-				result, err = reconciler.Reconcile(ctx, reconcile.Request{
+				result, err := reconciler.Reconcile(ctx, reconcile.Request{
 					NamespacedName: namespacedName,
 				})
 				Expect(err).NotTo(HaveOccurred())
-				Expect(result.Requeue).To(BeFalse()) // Should not requeue for completed resource
+				Expect(result).To(Equal(reconcile.Result{})) // Should not requeue for completed resource
 
 				By("Verifying the resource status remains unchanged")
 				finalResource := &medik8sv1alpha1.SBDRemediation{}
@@ -590,6 +588,162 @@ var _ = Describe("SBDRemediation Controller", func() {
 
 			// Clean up
 			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+		})
+	})
+
+	Context("When testing event emission for SBDRemediation", func() {
+		var (
+			reconciler     *SBDRemediationReconciler
+			mockRecorder   *MockEventRecorder
+			ctx            context.Context
+			resourceName   string
+			namespacedName types.NamespacedName
+		)
+
+		BeforeEach(func() {
+			ctx = context.Background()
+			resourceName = fmt.Sprintf("test-events-remediation-%d", time.Now().UnixNano())
+			namespacedName = types.NamespacedName{
+				Name:      resourceName,
+				Namespace: "default",
+			}
+
+			// Create temporary SBD device for tests
+			tempDir, err := ioutil.TempDir("", "sbd-event-test-")
+			Expect(err).NotTo(HaveOccurred())
+
+			mockSBDDevice := filepath.Join(tempDir, "sbd-device")
+			err = ioutil.WriteFile(mockSBDDevice, make([]byte, 512*1024), 0644)
+			Expect(err).NotTo(HaveOccurred())
+
+			mockRecorder = NewMockEventRecorder()
+			reconciler = &SBDRemediationReconciler{
+				Client:                k8sClient,
+				Scheme:                k8sClient.Scheme(),
+				Recorder:              mockRecorder,
+				leaderElectionEnabled: false, // Disable for tests
+				sbdDevicePath:         mockSBDDevice,
+			}
+		})
+
+		AfterEach(func() {
+			resource := &medik8sv1alpha1.SBDRemediation{}
+			err := k8sClient.Get(ctx, namespacedName, resource)
+			if err == nil {
+				k8sClient.Delete(ctx, resource)
+			}
+		})
+
+		It("should emit events for helper methods", func() {
+			By("testing emitEvent helper")
+			resource := &medik8sv1alpha1.SBDRemediation{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: "default"},
+			}
+
+			reconciler.emitEvent(resource, EventTypeNormal, "TestReason", "Test message")
+
+			events := mockRecorder.GetEvents()
+			Expect(len(events)).To(Equal(1))
+			Expect(events[0].EventType).To(Equal(EventTypeNormal))
+			Expect(events[0].Reason).To(Equal("TestReason"))
+			Expect(events[0].Message).To(Equal("Test message"))
+
+			By("testing emitEventf helper")
+			mockRecorder.Reset()
+			reconciler.emitEventf(resource, EventTypeWarning, "TestFormat", "Formatted message: %s", "test-value")
+
+			events = mockRecorder.GetEvents()
+			Expect(len(events)).To(Equal(1))
+			Expect(events[0].EventType).To(Equal(EventTypeWarning))
+			Expect(events[0].Reason).To(Equal("TestFormat"))
+			Expect(events[0].Message).To(Equal("Formatted message: test-value"))
+		})
+
+		It("should emit events for node ID mapping errors", func() {
+			By("creating SBDRemediation with invalid node name")
+			resource := &medik8sv1alpha1.SBDRemediation{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      resourceName,
+					Namespace: "default",
+				},
+				Spec: medik8sv1alpha1.SBDRemediationSpec{
+					NodeName: "invalid-node-name",
+					Reason:   medik8sv1alpha1.SBDRemediationReasonNodeUnresponsive,
+				},
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+			By("reconciling the resource")
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: namespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("verifying events were emitted")
+			events := mockRecorder.GetEvents()
+			Expect(len(events)).To(BeNumerically(">=", 2))
+
+			// Check for remediation initiated event
+			remediationInitiatedEvent := false
+			for _, event := range events {
+				if event.Reason == ReasonRemediationInitiated && event.EventType == EventTypeNormal {
+					remediationInitiatedEvent = true
+					Expect(event.Message).To(ContainSubstring("invalid-node-name"))
+					break
+				}
+			}
+			Expect(remediationInitiatedEvent).To(BeTrue(), "Remediation initiated event should be emitted")
+
+			// Check for node ID mapping error event
+			nodeIDErrorEvent := false
+			for _, event := range events {
+				if event.Reason == ReasonNodeIDMappingError && event.EventType == EventTypeWarning {
+					nodeIDErrorEvent = true
+					Expect(event.Message).To(ContainSubstring("invalid-node-name"))
+					break
+				}
+			}
+			Expect(nodeIDErrorEvent).To(BeTrue(), "Node ID mapping error event should be emitted")
+		})
+
+		It("should emit events for leadership waiting", func() {
+			By("testing leadership waiting event emission directly")
+			resource := &medik8sv1alpha1.SBDRemediation{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: "default"},
+				Spec: medik8sv1alpha1.SBDRemediationSpec{
+					NodeName: "worker-1",
+					Reason:   medik8sv1alpha1.SBDRemediationReasonNodeUnresponsive,
+				},
+			}
+
+			// Test the event emission directly
+			reconciler.emitEventf(resource, EventTypeNormal, ReasonLeadershipWaiting,
+				"Waiting for leadership to perform fencing for node '%s'", resource.Spec.NodeName)
+
+			By("verifying leadership waiting event was emitted")
+			events := mockRecorder.GetEvents()
+			Expect(len(events)).To(Equal(1))
+			Expect(events[0].EventType).To(Equal(EventTypeNormal))
+			Expect(events[0].Reason).To(Equal(ReasonLeadershipWaiting))
+			Expect(events[0].Message).To(ContainSubstring("worker-1"))
+		})
+
+		It("should handle nil recorder gracefully", func() {
+			By("setting recorder to nil")
+			reconciler.Recorder = nil
+
+			resource := &medik8sv1alpha1.SBDRemediation{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: "default"},
+			}
+
+			By("calling event methods with nil recorder")
+			// These should not panic
+			reconciler.emitEvent(resource, EventTypeNormal, "TestReason", "Test message")
+			reconciler.emitEventf(resource, EventTypeWarning, "TestFormat", "Formatted message: %s", "test-value")
+
+			// No events should be recorded
+			events := mockRecorder.GetEvents()
+			Expect(len(events)).To(Equal(0))
 		})
 	})
 })

@@ -74,3 +74,71 @@ make docker-build-agent
 # Build both binaries locally
 make build build-agent
 ```
+
+## Running End-to-End Tests
+
+### Prerequisites for CRC (OpenShift)
+
+The e2e tests now use **CRC (CodeReady Containers)** with OpenShift by default. To run the tests, you need:
+
+1. **Install CRC**: Download from [Red Hat Developers](https://developers.redhat.com/products/codeready-containers/download)
+2. **Setup CRC**: Follow the setup guide to configure CRC with appropriate resources
+3. **Start CRC**: Ensure CRC is running before running tests
+
+### Running E2E Tests
+
+```bash
+# Run e2e tests on CRC OpenShift cluster (default)
+make test-e2e
+
+# Explicitly run on CRC OpenShift
+make test-e2e-crc
+
+# Run on Kind Kubernetes (legacy support)
+make test-e2e-kind
+
+# Setup CRC cluster without running tests
+make setup-test-e2e
+
+# Stop CRC cluster after tests
+make cleanup-test-e2e
+```
+
+### CRC Setup Commands
+
+```bash
+# Initial CRC setup (one-time)
+crc setup
+
+# Start CRC cluster
+crc start
+
+# Check CRC status
+crc status
+
+# Stop CRC cluster
+crc stop
+
+# Get OpenShift console URL
+crc console --url
+
+# Get admin credentials
+crc console --credentials
+```
+
+### Environment Variables
+
+- `USE_CRC=true`: Force using CRC OpenShift cluster
+- `USE_CRC=false`: Force using Kind Kubernetes cluster  
+- `CERT_MANAGER_INSTALL_SKIP=true`: Skip CertManager installation
+
+### OpenShift vs Kubernetes Differences
+
+When running on OpenShift (CRC), the tests automatically handle:
+
+- **Security Context Constraints (SCC)** instead of Pod Security Standards
+- **OpenShift Routes** for ingress (if applicable)
+- **OpenShift Registry** for container images
+- **oc** command instead of kubectl where needed
+
+The tests are backward compatible with Kind/Kubernetes for development environments.

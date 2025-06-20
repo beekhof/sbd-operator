@@ -69,27 +69,59 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
-# The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
+# The default setup assumes CRC (CodeReady Containers) is installed and starts/uses the OpenShift cluster.
 # CertManager is installed by default; skip with:
 # - CERT_MANAGER_INSTALL_SKIP=true
-KIND_CLUSTER ?= sbd-operator-test-e2e
+CRC_CLUSTER ?= sbd-operator-test-e2e
 
 .PHONY: setup-test-e2e
-setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
-	@command -v $(KIND) >/dev/null 2>&1 || { \
-		echo "Kind is not installed. Please install Kind manually."; \
+setup-test-e2e: ## Set up a CRC OpenShift cluster for e2e tests if it is not running
+	@command -v crc >/dev/null 2>&1 || { \
+		echo "CRC is not installed. Please install CRC manually."; \
+		echo "Visit: https://developers.redhat.com/products/codeready-containers/download"; \
 		exit 1; \
 	}
-	$(KIND) create cluster --name $(KIND_CLUSTER)
+	@echo "Checking CRC status..."
+	@if ! crc status | grep -q "OpenShift.*Running"; then \
+		echo "CRC cluster is not running. Starting CRC..."; \
+		crc start; \
+	else \
+		echo "CRC cluster is already running"; \
+	fi
+	@echo "Setting up CRC environment..."
+	@eval $$(crc oc-env) && oc whoami || { \
+		echo "Failed to authenticate with CRC cluster"; \
+		exit 1; \
+	}
 
 .PHONY: test-e2e
-test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	KIND_CLUSTER=$(KIND_CLUSTER) go test ./test/e2e/ -v -ginkgo.v
-	$(MAKE) cleanup-test-e2e
+test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests on CRC OpenShift cluster.
+	@echo "Running e2e tests on CRC OpenShift cluster..."
+	@eval $$(crc oc-env) && go test ./test/e2e/ -v -ginkgo.v
+
+.PHONY: test-e2e-crc
+test-e2e-crc: ## Run e2e tests specifically on CRC OpenShift cluster
+	@echo "Setting up and running e2e tests on CRC OpenShift cluster..."
+	@export USE_CRC=true && $(MAKE) test-e2e
+
+.PHONY: test-e2e-kind
+test-e2e-kind: ## Run e2e tests on Kind Kubernetes cluster (legacy support)
+	@echo "Setting up and running e2e tests on Kind cluster..."
+	@export USE_CRC=false && \
+	command -v kind >/dev/null 2>&1 || { \
+		echo "Kind is not installed. Please install Kind manually."; \
+		exit 1; \
+	} && \
+	if ! kind get clusters | grep -q "$(CRC_CLUSTER)"; then \
+		kind create cluster --name $(CRC_CLUSTER); \
+	fi && \
+	KIND_CLUSTER=$(CRC_CLUSTER) go test ./test/e2e/ -v -ginkgo.v && \
+	kind delete cluster --name $(CRC_CLUSTER)
 
 .PHONY: cleanup-test-e2e
-cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
-	@$(KIND) delete cluster --name $(KIND_CLUSTER)
+cleanup-test-e2e: ## Stop the CRC OpenShift cluster used for e2e tests
+	@echo "Stopping CRC cluster..."
+	@crc stop || true
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter

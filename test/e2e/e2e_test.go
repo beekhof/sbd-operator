@@ -54,11 +54,22 @@ var _ = Describe("Manager", Ordered, func() {
 		_, err := utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
 
-		By("labeling the namespace to enforce the restricted security policy")
-		cmd = exec.Command("kubectl", "label", "--overwrite", "ns", namespace,
-			"pod-security.kubernetes.io/enforce=restricted")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to label namespace with restricted policy")
+		// Check if we're running on OpenShift (CRC)
+		isOpenShift := utils.IsCRCEnvironment() || os.Getenv("USE_CRC") == "true"
+
+		if isOpenShift {
+			By("configuring OpenShift security context constraints")
+			// For OpenShift, we need to use SecurityContextConstraints instead of Pod Security Standards
+			cmd = exec.Command("oc", "adm", "policy", "add-scc-to-group", "anyuid", "system:serviceaccounts:"+namespace)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to add anyuid SCC to namespace")
+		} else {
+			By("labeling the namespace to enforce the restricted security policy")
+			cmd = exec.Command("kubectl", "label", "--overwrite", "ns", namespace,
+				"pod-security.kubernetes.io/enforce=restricted")
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to label namespace with restricted policy")
+		}
 
 		By("installing CRDs")
 		cmd = exec.Command("make", "install")

@@ -58,11 +58,21 @@ var _ = BeforeSuite(func() {
 	_, err := utils.Run(cmd)
 	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the manager(Operator) image")
 
-	// TODO(user): If you want to change the e2e test vendor from Kind, ensure the image is
-	// built and available before running the tests. Also, remove the following block.
-	By("loading the manager(Operator) image on Kind")
-	err = utils.LoadImageToKindClusterWithName(projectImage)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the manager(Operator) image into Kind")
+	// Check if we're using CRC or Kind
+	if utils.IsCRCEnvironment() || os.Getenv("USE_CRC") == "true" {
+		By("setting up CRC environment for OpenShift")
+		cmd = exec.Command("bash", "-c", "eval $(crc oc-env)")
+		_, err = utils.Run(cmd)
+		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to set up CRC environment")
+
+		By("loading the manager(Operator) image to CRC")
+		err = utils.LoadImageToCRCCluster(projectImage)
+		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the manager(Operator) image into CRC")
+	} else {
+		By("loading the manager(Operator) image on Kind")
+		err = utils.LoadImageToKindClusterWithName(projectImage)
+		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the manager(Operator) image into Kind")
+	}
 
 	// The tests-e2e are intended to run on a temporary cluster that is created and destroyed for testing.
 	// To prevent errors when tests run in environments with CertManager already installed,

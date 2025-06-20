@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2" // nolint:revive,staticcheck
@@ -175,6 +176,128 @@ func LoadImageToKindClusterWithName(name string) error {
 	cmd := exec.Command("kind", kindOptions...)
 	_, err := Run(cmd)
 	return err
+}
+
+// LoadImageToCRCCluster loads a local docker image to the CRC OpenShift cluster
+func LoadImageToCRCCluster(name string) error {
+	// For CRC, we need to build and push the image to the internal registry
+	// or load it directly to CRC's docker daemon
+
+	// First, check if CRC is running
+	cmd := exec.Command("crc", "status")
+	output, err := Run(cmd)
+	if err != nil {
+		return fmt.Errorf("failed to check CRC status: %w", err)
+	}
+
+	if !strings.Contains(output, "Running") {
+		return fmt.Errorf("CRC is not running. Please start CRC first")
+	}
+
+	// Set up CRC environment
+	cmd = exec.Command("bash", "-c", "eval $(crc oc-env) && oc whoami")
+	if _, err := Run(cmd); err != nil {
+		return fmt.Errorf("failed to set up CRC environment: %w", err)
+	}
+
+	// For e2e tests, we have several options:
+	// 1. Use podman to load the image directly (CRC uses podman internally)
+	// 2. Push to CRC's internal registry
+	// 3. Use docker save/load with CRC's docker daemon
+
+	// Option 1: Try to use podman directly
+	if err := loadImageToCRCPodman(name); err == nil {
+		return nil
+	}
+
+	// Option 2: Fallback to docker context switching
+	return loadImageToCRCDocker(name)
+}
+
+// loadImageToCRCPodman attempts to load image using podman
+func loadImageToCRCPodman(name string) error {
+	// Save the image using docker
+	cmd := exec.Command("docker", "save", name)
+	saveOutput, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to save image with docker: %w", err)
+	}
+
+	// Load the image using CRC's podman
+	cmd = exec.Command("crc", "podman", "load")
+	cmd.Stdin = strings.NewReader(string(saveOutput))
+	if _, err := Run(cmd); err != nil {
+		return fmt.Errorf("failed to load image with CRC podman: %w", err)
+	}
+
+	return nil
+}
+
+// loadImageToCRCDocker attempts to load image using docker with CRC context
+func loadImageToCRCDocker(name string) error {
+	// Get CRC machine IP for docker context
+	cmd := exec.Command("crc", "ip")
+	crcIP, err := Run(cmd)
+	if err != nil {
+		return fmt.Errorf("failed to get CRC IP: %w", err)
+	}
+	crcIP = strings.TrimSpace(crcIP)
+
+	// Try to use docker with CRC's docker daemon
+	dockerHost := fmt.Sprintf("tcp://%s:2376", crcIP)
+
+	// Save image locally first
+	tempFile := "/tmp/crc-image-" + extractImageName(name) + ".tar"
+	cmd = exec.Command("docker", "save", "-o", tempFile, name)
+	if _, err := Run(cmd); err != nil {
+		return fmt.Errorf("failed to save image to file: %w", err)
+	}
+	defer os.Remove(tempFile)
+
+	// Load image to CRC's docker daemon
+	cmd = exec.Command("docker", "load", "-i", tempFile)
+	cmd.Env = append(os.Environ(), "DOCKER_HOST="+dockerHost)
+	if _, err := Run(cmd); err != nil {
+		// If this fails, the image might already be available
+		// or we're in a different setup. Log and continue.
+		fmt.Printf("Warning: failed to load image to CRC docker daemon: %v\n", err)
+	}
+
+	return nil
+}
+
+// getCRCDockerSocket returns the path to CRC's docker socket
+func getCRCDockerSocket() string {
+	// This might need adjustment based on CRC version
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".crc", "machines", "crc", "docker.sock")
+}
+
+// extractImageName extracts the image name from a full image tag
+func extractImageName(fullImage string) string {
+	parts := strings.Split(fullImage, "/")
+	imagePart := parts[len(parts)-1]
+	return strings.Split(imagePart, ":")[0]
+}
+
+// LoadImageToCluster loads an image to the appropriate cluster (Kind or CRC)
+func LoadImageToCluster(name string) error {
+	// Check if we're running in CRC mode (environment variable or detection)
+	if os.Getenv("USE_CRC") == "true" || IsCRCEnvironment() {
+		return LoadImageToCRCCluster(name)
+	}
+	return LoadImageToKindClusterWithName(name)
+}
+
+// IsCRCEnvironment detects if we're in a CRC environment
+func IsCRCEnvironment() bool {
+	// Check if crc command is available and running
+	cmd := exec.Command("crc", "status")
+	output, err := Run(cmd)
+	if err != nil {
+		return false
+	}
+	return strings.Contains(output, "Running")
 }
 
 // GetNonEmptyLines converts given command output string into individual objects

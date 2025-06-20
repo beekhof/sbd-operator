@@ -67,9 +67,12 @@ func main() {
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
-	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
+	// Leader election is ENABLED BY DEFAULT for SBD operator since fencing operations
+	// must be performed by exactly one instance to avoid conflicts and ensure safety
+	flag.BoolVar(&enableLeaderElection, "leader-elect", true,
 		"Enable leader election for controller manager. "+
-			"Enabling this will ensure there is only one active controller manager.")
+			"Enabling this will ensure there is only one active controller manager. "+
+			"CRITICAL for SBD fencing operations - disabling this can cause data corruption or split-brain scenarios!")
 	flag.BoolVar(&secureMetrics, "metrics-secure", true,
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
 	flag.StringVar(&webhookCertPath, "webhook-cert-path", "", "The directory that contains the webhook certificate.")
@@ -88,6 +91,34 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	/*
+	 * LEADER ELECTION IS CRITICAL FOR SBD FENCING OPERATIONS
+	 *
+	 * The SBD (Storage-Based Death) operator performs fencing operations by writing
+	 * fence messages to shared storage devices. These operations are inherently
+	 * destructive and must be performed by exactly one operator instance to prevent:
+	 *
+	 * 1. Race conditions: Multiple operators writing fence messages simultaneously
+	 * 2. Split-brain scenarios: Conflicting fencing decisions
+	 * 3. Data corruption: Overlapping writes to SBD device slots
+	 * 4. Operational chaos: Multiple agents attempting to fence the same node
+	 *
+	 * Leader election ensures that only the elected leader can:
+	 * - Write fence messages to the shared SBD storage device
+	 * - Make fencing decisions for unhealthy nodes
+	 * - Coordinate with SBD agents across the cluster
+	 *
+	 * When leadership changes, the old leader immediately stops all fencing
+	 * operations, and the new leader takes over responsibility for cluster health.
+	 */
+
+	// Log leadership configuration prominently
+	if enableLeaderElection {
+		setupLog.Info("Leader election ENABLED - this operator instance will participate in leader election for SBD fencing operations")
+	} else {
+		setupLog.Error(nil, "WARNING: Leader election DISABLED - this is unsafe for production SBD deployments and may cause data corruption!")
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -184,22 +215,36 @@ func main() {
 		WebhookServer:          webhookServer,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "9f76b534.medik8s.io",
+		LeaderElectionID:       "sbd-operator-leader-election",
 		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
 		// when the Manager ends. This requires the binary to immediately end when the
 		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
 		// speeds up voluntary leader transitions as the new leader don't have to wait
 		// LeaseDuration time first.
 		//
-		// In the default scaffold provided, the program ends immediately after
-		// the manager stops, so would be fine to enable this option. However,
-		// if you are doing or is intended to do any operation such as perform cleanups
-		// after the manager stops then its usage might be unsafe.
-		// LeaderElectionReleaseOnCancel: true,
+		// For SBD operator, we enable this to ensure fast failover between operator instances
+		// when performing critical fencing operations.
+		LeaderElectionReleaseOnCancel: true,
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
+	}
+
+	// Create leadership-aware controllers
+	sbdRemediationReconciler := &controller.SBDRemediationReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}
+
+	// Set leadership configuration
+	sbdRemediationReconciler.SetLeaderElectionEnabled(enableLeaderElection)
+
+	// Set up leadership tracking
+	if enableLeaderElection {
+		setupLog.Info("Leader election ENABLED - SBD fencing operations will only be performed by the elected leader")
+	} else {
+		setupLog.Info("Leader election DISABLED - this instance will act as leader for SBD fencing operations")
 	}
 
 	if err := (&controller.SBDConfigReconciler{
@@ -209,10 +254,7 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "SBDConfig")
 		os.Exit(1)
 	}
-	if err := (&controller.SBDRemediationReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
+	if err := sbdRemediationReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "SBDRemediation")
 		os.Exit(1)
 	}

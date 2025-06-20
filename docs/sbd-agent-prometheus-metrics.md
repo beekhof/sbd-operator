@@ -81,9 +81,65 @@ sbd_peer_status{node_id="3",node_name="node-3",status="unhealthy"} 1
 sbd_self_fenced_total 0
 ```
 
+## Kubernetes Deployment
+
+### Deploy Metrics Service and ServiceMonitor
+
+Deploy the Service and ServiceMonitor resources for Prometheus integration:
+
+```bash
+# Deploy the metrics service and ServiceMonitor
+kubectl apply -f deploy/sbd-agent-metrics.yaml
+
+# Verify the service is created
+kubectl get service -n sbd-system sbd-agent-metrics
+
+# Verify the ServiceMonitor is created (requires Prometheus Operator)
+kubectl get servicemonitor -n sbd-system sbd-agent
+```
+
+### Update SBD Agent DaemonSet
+
+If your SBD Agent DaemonSet doesn't expose the metrics port, update it to include the metrics port:
+
+```yaml
+# Add to the sbd-agent container in your DaemonSet spec
+spec:
+  template:
+    spec:
+      containers:
+      - name: sbd-agent
+        # ... existing configuration ...
+        args:
+        - "--metrics-port=8080"  # Add this argument
+        # ... other arguments ...
+        ports:
+        - name: metrics
+          containerPort: 8080
+          protocol: TCP
+```
+
+### Complete Deployment Example
+
+```bash
+# 1. Deploy the SBD system namespace
+kubectl apply -f deploy/sbd-system-namespace.yaml
+
+# 2. Deploy the SBD Agent DaemonSet
+kubectl apply -f deploy/sbd-agent-daemonset-simple.yaml
+
+# 3. Deploy the metrics service and ServiceMonitor
+kubectl apply -f deploy/sbd-agent-metrics.yaml
+
+# 4. Verify deployment
+kubectl get pods -n sbd-system
+kubectl get services -n sbd-system
+kubectl get servicemonitor -n sbd-system
+```
+
 ## Prometheus Configuration
 
-### Scrape Configuration
+### Manual Scrape Configuration
 Add this to your Prometheus configuration to scrape SBD Agent metrics:
 
 ```yaml
@@ -96,23 +152,12 @@ scrape_configs:
 ```
 
 ### Kubernetes ServiceMonitor
-For Kubernetes deployments with the Prometheus Operator:
+For Kubernetes deployments with the Prometheus Operator, the ServiceMonitor in `deploy/sbd-agent-metrics.yaml` provides:
 
-```yaml
-apiVersion: monitoring.coreos.com/v1
-kind: ServiceMonitor
-metadata:
-  name: sbd-agent-metrics
-  namespace: sbd-system
-spec:
-  selector:
-    matchLabels:
-      app: sbd-agent
-  endpoints:
-  - port: metrics
-    interval: 15s
-    path: /metrics
-```
+- **Automatic Discovery**: Prometheus automatically discovers SBD Agent pods
+- **Label Enrichment**: Adds node, pod, namespace, and host_ip labels
+- **Metric Filtering**: Only collects SBD-related metrics (`sbd_*`)
+- **Proper Job Labeling**: Sets job label to `sbd-agent`
 
 ## Alerting Rules
 
@@ -156,6 +201,33 @@ groups:
       summary: "SBD Agent initiated self-fence on {{ $labels.instance }}"
       description: "SBD Agent on {{ $labels.instance }} has initiated {{ $value }} self-fence event(s) in the last minute"
 ```
+
+## Troubleshooting
+
+### Check Metrics Availability
+```bash
+# Test metrics endpoint from within the cluster
+kubectl exec -n sbd-system <sbd-agent-pod> -- curl -s http://localhost:8080/metrics
+
+# Port-forward to access metrics locally
+kubectl port-forward -n sbd-system <sbd-agent-pod> 8080:8080
+curl http://localhost:8080/metrics
+```
+
+### Verify ServiceMonitor Discovery
+```bash
+# Check if Prometheus discovered the ServiceMonitor
+kubectl get servicemonitor -n sbd-system sbd-agent -o yaml
+
+# Check Prometheus targets (if accessible)
+# Look for sbd-agent job in Prometheus UI under Status > Targets
+```
+
+### Common Issues
+
+1. **ServiceMonitor not discovered**: Ensure Prometheus Operator is installed and has proper RBAC
+2. **No metrics scraped**: Verify SBD Agent is exposing metrics on port 8080
+3. **Missing node labels**: Check that the Service selector matches the DaemonSet pod labels
 
 ## Implementation Details
 

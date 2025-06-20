@@ -20,6 +20,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -27,558 +29,669 @@ import (
 	"github.com/medik8s/sbd-operator/pkg/sbdprotocol"
 )
 
-// MockBlockDevice implements the BlockDevice interface for testing
+// MockBlockDevice is a mock implementation of BlockDevice for testing
 type MockBlockDevice struct {
-	data           map[int64][]byte
-	dataMutex      sync.RWMutex
-	path           string
-	closed         bool
-	closedMutex    sync.RWMutex
-	writeError     error
-	readError      error
-	syncError      error
-	closeError     error
-	writeCallCount int
-	readCallCount  int
-	syncCallCount  int
+	data      []byte
+	path      string
+	closed    bool
+	failRead  bool
+	failWrite bool
+	failSync  bool
+	mutex     sync.RWMutex
 }
 
-// NewMockBlockDevice creates a new mock block device
-func NewMockBlockDevice(path string) *MockBlockDevice {
+// NewMockBlockDevice creates a new mock block device with the specified size
+func NewMockBlockDevice(path string, size int) *MockBlockDevice {
 	return &MockBlockDevice{
-		data: make(map[int64][]byte),
+		data: make([]byte, size),
 		path: path,
 	}
 }
 
-// SetWriteError sets an error to be returned on write operations
-func (m *MockBlockDevice) SetWriteError(err error) {
-	m.writeError = err
-}
+func (m *MockBlockDevice) ReadAt(p []byte, off int64) (int, error) {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
 
-// SetReadError sets an error to be returned on read operations
-func (m *MockBlockDevice) SetReadError(err error) {
-	m.readError = err
-}
-
-// SetSyncError sets an error to be returned on sync operations
-func (m *MockBlockDevice) SetSyncError(err error) {
-	m.syncError = err
-}
-
-// SetCloseError sets an error to be returned on close operations
-func (m *MockBlockDevice) SetCloseError(err error) {
-	m.closeError = err
-}
-
-// GetWriteCallCount returns the number of times WriteAt was called
-func (m *MockBlockDevice) GetWriteCallCount() int {
-	return m.writeCallCount
-}
-
-// GetReadCallCount returns the number of times ReadAt was called
-func (m *MockBlockDevice) GetReadCallCount() int {
-	return m.readCallCount
-}
-
-// GetSyncCallCount returns the number of times Sync was called
-func (m *MockBlockDevice) GetSyncCallCount() int {
-	return m.syncCallCount
-}
-
-// GetDataAt returns the data written at a specific offset
-func (m *MockBlockDevice) GetDataAt(offset int64, length int) []byte {
-	m.dataMutex.RLock()
-	defer m.dataMutex.RUnlock()
-
-	result := make([]byte, length)
-	for i := 0; i < length; i++ {
-		if data, exists := m.data[offset+int64(i)]; exists && len(data) > 0 {
-			result[i] = data[0]
-		}
-	}
-	return result
-}
-
-// ReadAt implements io.ReaderAt
-func (m *MockBlockDevice) ReadAt(p []byte, off int64) (n int, err error) {
-	m.readCallCount++
-
-	if m.readError != nil {
-		return 0, m.readError
+	if m.closed {
+		return 0, errors.New("device is closed")
 	}
 
-	if m.IsClosed() {
-		return 0, fmt.Errorf("device %q is closed", m.path)
+	if m.failRead {
+		return 0, errors.New("mock read failure")
 	}
 
-	m.dataMutex.RLock()
-	defer m.dataMutex.RUnlock()
-
-	for i := range p {
-		if data, exists := m.data[off+int64(i)]; exists && len(data) > 0 {
-			p[i] = data[0]
-		} else {
-			p[i] = 0
-		}
+	if off < 0 || off >= int64(len(m.data)) {
+		return 0, errors.New("offset out of range")
 	}
 
-	return len(p), nil
+	n := copy(p, m.data[off:])
+	return n, nil
 }
 
-// WriteAt implements io.WriterAt
-func (m *MockBlockDevice) WriteAt(p []byte, off int64) (n int, err error) {
-	m.writeCallCount++
+func (m *MockBlockDevice) WriteAt(p []byte, off int64) (int, error) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
 
-	if m.writeError != nil {
-		return 0, m.writeError
+	if m.closed {
+		return 0, errors.New("device is closed")
 	}
 
-	if m.IsClosed() {
-		return 0, fmt.Errorf("device %q is closed", m.path)
+	if m.failWrite {
+		return 0, errors.New("mock write failure")
 	}
 
-	m.dataMutex.Lock()
-	defer m.dataMutex.Unlock()
-
-	for i, b := range p {
-		m.data[off+int64(i)] = []byte{b}
+	if off < 0 || off >= int64(len(m.data)) {
+		return 0, errors.New("offset out of range")
 	}
 
-	return len(p), nil
+	// Ensure we don't write beyond the buffer
+	end := off + int64(len(p))
+	if end > int64(len(m.data)) {
+		end = int64(len(m.data))
+	}
+
+	n := copy(m.data[off:end], p)
+	return n, nil
 }
 
-// Sync implements the Sync method
 func (m *MockBlockDevice) Sync() error {
-	m.syncCallCount++
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
 
-	if m.syncError != nil {
-		return m.syncError
+	if m.closed {
+		return errors.New("device is closed")
 	}
 
-	if m.IsClosed() {
-		return fmt.Errorf("device %q is closed", m.path)
+	if m.failSync {
+		return errors.New("mock sync failure")
 	}
 
 	return nil
 }
 
-// Close implements the Close method
 func (m *MockBlockDevice) Close() error {
-	m.closedMutex.Lock()
-	defer m.closedMutex.Unlock()
-
-	if m.closed {
-		return nil // Already closed, no-op
-	}
-
-	if m.closeError != nil {
-		return m.closeError
-	}
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
 
 	m.closed = true
 	return nil
 }
 
-// Path returns the device path
 func (m *MockBlockDevice) Path() string {
 	return m.path
 }
 
-// IsClosed returns true if the device is closed
 func (m *MockBlockDevice) IsClosed() bool {
-	m.closedMutex.RLock()
-	defer m.closedMutex.RUnlock()
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
 	return m.closed
 }
 
-// MockWatchdog implements a mock watchdog for testing
+// SetFailRead configures the mock to fail read operations
+func (m *MockBlockDevice) SetFailRead(fail bool) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.failRead = fail
+}
+
+// SetFailWrite configures the mock to fail write operations
+func (m *MockBlockDevice) SetFailWrite(fail bool) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.failWrite = fail
+}
+
+// SetFailSync configures the mock to fail sync operations
+func (m *MockBlockDevice) SetFailSync(fail bool) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.failSync = fail
+}
+
+// GetData returns a copy of the current data buffer
+func (m *MockBlockDevice) GetData() []byte {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	result := make([]byte, len(m.data))
+	copy(result, m.data)
+	return result
+}
+
+// WritePeerHeartbeat writes a heartbeat message to a specific peer slot for testing
+func (m *MockBlockDevice) WritePeerHeartbeat(nodeID uint16, timestamp uint64, sequence uint64) error {
+	// Create heartbeat message
+	header := sbdprotocol.NewHeartbeat(nodeID, sequence)
+	header.Timestamp = timestamp
+	heartbeatMsg := sbdprotocol.SBDHeartbeatMessage{Header: header}
+
+	// Marshal the message
+	msgBytes, err := sbdprotocol.MarshalHeartbeat(heartbeatMsg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal heartbeat message: %w", err)
+	}
+
+	// Calculate slot offset for this node
+	slotOffset := int64(nodeID) * sbdprotocol.SBD_SLOT_SIZE
+
+	// Write heartbeat message to the designated slot
+	_, err = m.WriteAt(msgBytes, slotOffset)
+	return err
+}
+
+// MockWatchdog is a mock implementation of WatchdogInterface for testing
 type MockWatchdog struct {
-	path       string
-	petCount   int
-	petError   error
-	closed     bool
-	closeError error
+	path      string
+	petCount  int
+	closed    bool
+	failPet   bool
+	failClose bool
+	mutex     sync.RWMutex
 }
 
 // NewMockWatchdog creates a new mock watchdog
 func NewMockWatchdog(path string) *MockWatchdog {
-	return &MockWatchdog{path: path}
-}
-
-// SetPetError sets an error to be returned by Pet()
-func (m *MockWatchdog) SetPetError(err error) {
-	m.petError = err
-}
-
-// SetCloseError sets an error to be returned by Close()
-func (m *MockWatchdog) SetCloseError(err error) {
-	m.closeError = err
-}
-
-// GetPetCount returns the number of times Pet was called
-func (m *MockWatchdog) GetPetCount() int {
-	return m.petCount
-}
-
-// Pet implements the Pet method
-func (m *MockWatchdog) Pet() error {
-	if m.petError != nil {
-		return m.petError
+	return &MockWatchdog{
+		path: path,
 	}
+}
+
+func (m *MockWatchdog) Pet() error {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	if m.closed {
+		return errors.New("watchdog is closed")
+	}
+
+	if m.failPet {
+		return errors.New("mock pet failure")
+	}
+
 	m.petCount++
 	return nil
 }
 
-// Close implements the Close method
 func (m *MockWatchdog) Close() error {
-	if m.closeError != nil {
-		return m.closeError
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	if m.failClose {
+		return errors.New("mock close failure")
 	}
+
 	m.closed = true
 	return nil
 }
 
-// Path implements the Path method
 func (m *MockWatchdog) Path() string {
 	return m.path
 }
 
-func TestNewSBDAgent(t *testing.T) {
-	tests := []struct {
-		name                string
-		watchdogPath        string
-		sbdDevicePath       string
-		nodeName            string
-		nodeID              uint16
-		petInterval         time.Duration
-		sbdUpdateInterval   time.Duration
-		heartbeatInterval   time.Duration
-		expectError         bool
-		expectedNodeName    string
-		expectedNodeID      uint16
-		expectedPetInterval time.Duration
-	}{
-		{
-			name:                "successful creation with all parameters",
-			watchdogPath:        "/dev/watchdog",
-			sbdDevicePath:       "/dev/sbd",
-			nodeName:            "test-node",
-			nodeID:              1,
-			petInterval:         30 * time.Second,
-			sbdUpdateInterval:   5 * time.Second,
-			heartbeatInterval:   15 * time.Second,
-			expectError:         false,
-			expectedNodeName:    "test-node",
-			expectedNodeID:      1,
-			expectedPetInterval: 30 * time.Second,
-		},
-		{
-			name:                "creation with minimal parameters",
-			watchdogPath:        "/dev/watchdog",
-			sbdDevicePath:       "",
-			nodeName:            "minimal-node",
-			nodeID:              2,
-			petInterval:         10 * time.Second,
-			sbdUpdateInterval:   2 * time.Second,
-			heartbeatInterval:   5 * time.Second,
-			expectError:         false,
-			expectedNodeName:    "minimal-node",
-			expectedNodeID:      2,
-			expectedPetInterval: 10 * time.Second,
-		},
-		{
-			name:                "creation with maximum node ID",
-			watchdogPath:        "/dev/watchdog",
-			sbdDevicePath:       "/dev/sbd",
-			nodeName:            "max-node",
-			nodeID:              sbdprotocol.SBD_MAX_NODES,
-			petInterval:         60 * time.Second,
-			sbdUpdateInterval:   10 * time.Second,
-			heartbeatInterval:   30 * time.Second,
-			expectError:         false,
-			expectedNodeName:    "max-node",
-			expectedNodeID:      sbdprotocol.SBD_MAX_NODES,
-			expectedPetInterval: 60 * time.Second,
-		},
+// GetPetCount returns the number of times Pet() was called
+func (m *MockWatchdog) GetPetCount() int {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	return m.petCount
+}
+
+// SetFailPet configures the mock to fail pet operations
+func (m *MockWatchdog) SetFailPet(fail bool) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.failPet = fail
+}
+
+// TestPeerMonitor tests the peer monitoring functionality
+func TestPeerMonitor(t *testing.T) {
+	monitor := NewPeerMonitor(30, 1)
+
+	// Initially no peers
+	if count := monitor.GetHealthyPeerCount(); count != 0 {
+		t.Errorf("Expected 0 healthy peers initially, got %d", count)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Create mock watchdog for testing
-			mockWatchdog := NewMockWatchdog(tt.watchdogPath)
+	// Update a peer
+	monitor.UpdatePeer(2, 1000, 1)
 
-			agent, err := NewSBDAgentWithWatchdog(mockWatchdog, tt.sbdDevicePath, tt.nodeName, tt.nodeID, tt.petInterval, tt.sbdUpdateInterval, tt.heartbeatInterval)
+	// Should have one healthy peer
+	if count := monitor.GetHealthyPeerCount(); count != 1 {
+		t.Errorf("Expected 1 healthy peer, got %d", count)
+	}
 
-			if tt.expectError {
-				if err == nil {
-					t.Errorf("Expected error, but got none")
-				}
-				return
-			}
+	// Get peer status
+	peers := monitor.GetPeerStatus()
+	if len(peers) != 1 {
+		t.Errorf("Expected 1 peer in status map, got %d", len(peers))
+	}
 
-			if err != nil {
-				t.Fatalf("Unexpected error: %v", err)
-			}
+	peer, exists := peers[2]
+	if !exists {
+		t.Error("Expected peer 2 to exist in status map")
+	}
 
-			if agent.nodeName != tt.expectedNodeName {
-				t.Errorf("Expected nodeName %q, got %q", tt.expectedNodeName, agent.nodeName)
-			}
+	if peer.NodeID != 2 {
+		t.Errorf("Expected peer NodeID 2, got %d", peer.NodeID)
+	}
 
-			if agent.nodeID != tt.expectedNodeID {
-				t.Errorf("Expected nodeID %d, got %d", tt.expectedNodeID, agent.nodeID)
-			}
+	if peer.LastTimestamp != 1000 {
+		t.Errorf("Expected peer timestamp 1000, got %d", peer.LastTimestamp)
+	}
 
-			if agent.petInterval != tt.expectedPetInterval {
-				t.Errorf("Expected petInterval %v, got %v", tt.expectedPetInterval, agent.petInterval)
-			}
+	if peer.LastSequence != 1 {
+		t.Errorf("Expected peer sequence 1, got %d", peer.LastSequence)
+	}
 
-			if agent.heartbeatInterval != tt.heartbeatInterval {
-				t.Errorf("Expected heartbeatInterval %v, got %v", tt.heartbeatInterval, agent.heartbeatInterval)
-			}
-
-			// Clean up
-			agent.Stop()
-		})
+	if !peer.IsHealthy {
+		t.Error("Expected peer to be healthy")
 	}
 }
 
-func TestSBDAgent_WriteNodeIDToSBD(t *testing.T) {
-	tests := []struct {
-		name          string
-		nodeName      string
-		nodeID        uint16
-		writeError    error
-		syncError     error
-		expectError   bool
-		expectedBytes int
-	}{
-		{
-			name:          "successful write",
-			nodeName:      "test-node",
-			nodeID:        1,
-			writeError:    nil,
-			syncError:     nil,
-			expectError:   false,
-			expectedBytes: MaxNodeNameLength,
-		},
-		{
-			name:        "write error",
-			nodeName:    "test-node",
-			nodeID:      1,
-			writeError:  errors.New("write failed"),
-			syncError:   nil,
-			expectError: true,
-		},
-		{
-			name:        "sync error",
-			nodeName:    "test-node",
-			nodeID:      1,
-			writeError:  nil,
-			syncError:   errors.New("sync failed"),
-			expectError: true,
-		},
-		{
-			name:          "long node name",
-			nodeName:      "very-long-node-name-that-should-be-truncated",
-			nodeID:        2,
-			writeError:    nil,
-			syncError:     nil,
-			expectError:   false,
-			expectedBytes: MaxNodeNameLength,
-		},
+func TestPeerMonitor_Liveness(t *testing.T) {
+	monitor := NewPeerMonitor(1, 1) // 1 second timeout
+
+	// Update a peer
+	monitor.UpdatePeer(2, 1000, 1)
+
+	// Should be healthy initially
+	if count := monitor.GetHealthyPeerCount(); count != 1 {
+		t.Errorf("Expected 1 healthy peer initially, got %d", count)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			mockDevice := NewMockBlockDevice("/dev/mock-sbd")
-			if tt.writeError != nil {
-				mockDevice.SetWriteError(tt.writeError)
-			}
-			if tt.syncError != nil {
-				mockDevice.SetSyncError(tt.syncError)
-			}
+	// Wait for timeout
+	time.Sleep(1100 * time.Millisecond)
 
-			mockWatchdog := NewMockWatchdog("/dev/watchdog")
-			agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "/dev/mock-sbd", tt.nodeName, tt.nodeID, 30*time.Second, 5*time.Second, 15*time.Second)
-			if err != nil {
-				t.Fatalf("Failed to create agent: %v", err)
-			}
+	// Check liveness
+	monitor.CheckPeerLiveness()
 
-			// Set the mock device
-			agent.setSBDDevice(mockDevice)
+	// Should now be unhealthy
+	if count := monitor.GetHealthyPeerCount(); count != 0 {
+		t.Errorf("Expected 0 healthy peers after timeout, got %d", count)
+	}
 
-			err = agent.writeNodeIDToSBD()
+	// Update peer again
+	monitor.UpdatePeer(2, 2000, 2)
 
-			if tt.expectError {
-				if err == nil {
-					t.Errorf("Expected error, but got none")
-				}
-			} else {
-				if err != nil {
-					t.Errorf("Unexpected error: %v", err)
-				}
-
-				// Check that data was written
-				if mockDevice.GetWriteCallCount() != 1 {
-					t.Errorf("Expected 1 write call, got %d", mockDevice.GetWriteCallCount())
-				}
-
-				// Verify sync was called
-				if mockDevice.GetSyncCallCount() != 1 {
-					t.Errorf("Expected 1 sync call, got %d", mockDevice.GetSyncCallCount())
-				}
-
-				// Verify data content
-				writtenData := mockDevice.GetDataAt(SBDNodeIDOffset, tt.expectedBytes)
-				expectedNodeName := []byte(tt.nodeName)
-				if len(expectedNodeName) > tt.expectedBytes {
-					expectedNodeName = expectedNodeName[:tt.expectedBytes]
-				}
-
-				for i, expectedByte := range expectedNodeName {
-					if writtenData[i] != expectedByte {
-						t.Errorf("Data mismatch at position %d: expected %d, got %d", i, expectedByte, writtenData[i])
-						break
-					}
-				}
-			}
-
-			agent.Stop()
-		})
+	// Should be healthy again
+	if count := monitor.GetHealthyPeerCount(); count != 1 {
+		t.Errorf("Expected 1 healthy peer after update, got %d", count)
 	}
 }
 
-func TestSBDAgent_WriteHeartbeatToSBD(t *testing.T) {
-	tests := []struct {
-		name        string
-		nodeID      uint16
-		writeError  error
-		syncError   error
-		expectError bool
-	}{
-		{
-			name:        "successful heartbeat write",
-			nodeID:      1,
-			writeError:  nil,
-			syncError:   nil,
-			expectError: false,
-		},
-		{
-			name:        "heartbeat write error",
-			nodeID:      2,
-			writeError:  errors.New("write failed"),
-			syncError:   nil,
-			expectError: true,
-		},
-		{
-			name:        "heartbeat sync error",
-			nodeID:      3,
-			writeError:  nil,
-			syncError:   errors.New("sync failed"),
-			expectError: true,
-		},
-		{
-			name:        "heartbeat write with max node ID",
-			nodeID:      sbdprotocol.SBD_MAX_NODES,
-			writeError:  nil,
-			syncError:   nil,
-			expectError: false,
-		},
+func TestPeerMonitor_SequenceValidation(t *testing.T) {
+	monitor := NewPeerMonitor(30, 1)
+
+	// Update a peer with sequence 5
+	monitor.UpdatePeer(2, 1000, 5)
+
+	peers := monitor.GetPeerStatus()
+	peer := peers[2]
+	if peer.LastSequence != 5 {
+		t.Errorf("Expected sequence 5, got %d", peer.LastSequence)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			mockDevice := NewMockBlockDevice("/dev/mock-sbd")
-			if tt.writeError != nil {
-				mockDevice.SetWriteError(tt.writeError)
-			}
-			if tt.syncError != nil {
-				mockDevice.SetSyncError(tt.syncError)
-			}
+	// Update with older sequence (should be ignored)
+	monitor.UpdatePeer(2, 1000, 3)
 
-			mockWatchdog := NewMockWatchdog("/dev/watchdog")
-			agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "/dev/mock-sbd", "test-node", tt.nodeID, 30*time.Second, 5*time.Second, 15*time.Second)
-			if err != nil {
-				t.Fatalf("Failed to create agent: %v", err)
-			}
+	peers = monitor.GetPeerStatus()
+	peer = peers[2]
+	if peer.LastSequence != 5 {
+		t.Errorf("Expected sequence to remain 5, got %d", peer.LastSequence)
+	}
 
-			// Set the mock device
-			agent.setSBDDevice(mockDevice)
+	// Update with newer sequence (should be accepted)
+	monitor.UpdatePeer(2, 1000, 7)
 
-			err = agent.writeHeartbeatToSBD()
-
-			if tt.expectError {
-				if err == nil {
-					t.Errorf("Expected error, but got none")
-				}
-			} else {
-				if err != nil {
-					t.Errorf("Unexpected error: %v", err)
-				}
-
-				// Check that data was written
-				if mockDevice.GetWriteCallCount() != 1 {
-					t.Errorf("Expected 1 write call, got %d", mockDevice.GetWriteCallCount())
-				}
-
-				// Verify sync was called
-				if mockDevice.GetSyncCallCount() != 1 {
-					t.Errorf("Expected 1 sync call, got %d", mockDevice.GetSyncCallCount())
-				}
-
-				// Verify the heartbeat was written to the correct slot
-				expectedOffset := int64(tt.nodeID) * sbdprotocol.SBD_SLOT_SIZE
-				heartbeatData := mockDevice.GetDataAt(expectedOffset, sbdprotocol.SBD_HEADER_SIZE)
-
-				// Verify the magic string is present
-				magic := string(heartbeatData[:8])
-				if magic != sbdprotocol.SBD_MAGIC {
-					t.Errorf("Expected magic %q, got %q", sbdprotocol.SBD_MAGIC, magic)
-				}
-
-				// Verify sequence number incremented
-				seq1 := agent.getNextHeartbeatSequence()
-				if seq1 != 2 { // Should be 2 since writeHeartbeatToSBD incremented it to 1
-					t.Errorf("Expected sequence 2, got %d", seq1)
-				}
-			}
-
-			agent.Stop()
-		})
+	peers = monitor.GetPeerStatus()
+	peer = peers[2]
+	if peer.LastSequence != 7 {
+		t.Errorf("Expected sequence 7, got %d", peer.LastSequence)
 	}
 }
 
-func TestSBDAgent_HeartbeatSequence(t *testing.T) {
+func TestSBDAgent_ReadPeerHeartbeat(t *testing.T) {
 	mockWatchdog := NewMockWatchdog("/dev/watchdog")
-	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "/dev/mock-sbd", "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second)
+	mockDevice := NewMockBlockDevice("/dev/mock-sbd", int(sbdprotocol.SBD_MAX_NODES*sbdprotocol.SBD_SLOT_SIZE))
+
+	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second, 5*time.Second, 30)
 	if err != nil {
 		t.Fatalf("Failed to create agent: %v", err)
 	}
 	defer agent.Stop()
 
-	// Test sequence number increment
-	seq1 := agent.getNextHeartbeatSequence()
-	seq2 := agent.getNextHeartbeatSequence()
-	seq3 := agent.getNextHeartbeatSequence()
+	// Set the mock device
+	agent.setSBDDevice(mockDevice)
 
-	if seq1 != 1 {
-		t.Errorf("Expected first sequence to be 1, got %d", seq1)
+	// Write a peer heartbeat to slot 2
+	err = mockDevice.WritePeerHeartbeat(2, 12345, 1)
+	if err != nil {
+		t.Fatalf("Failed to write peer heartbeat: %v", err)
 	}
 
-	if seq2 != 2 {
-		t.Errorf("Expected second sequence to be 2, got %d", seq2)
+	// Read the peer heartbeat
+	err = agent.readPeerHeartbeat(2)
+	if err != nil {
+		t.Errorf("Failed to read peer heartbeat: %v", err)
 	}
 
-	if seq3 != 3 {
-		t.Errorf("Expected third sequence to be 3, got %d", seq3)
+	// Check that peer was added to monitor
+	peers := agent.peerMonitor.GetPeerStatus()
+	if len(peers) != 1 {
+		t.Errorf("Expected 1 peer, got %d", len(peers))
+	}
+
+	peer, exists := peers[2]
+	if !exists {
+		t.Error("Expected peer 2 to exist")
+	}
+
+	if peer.LastTimestamp != 12345 {
+		t.Errorf("Expected timestamp 12345, got %d", peer.LastTimestamp)
+	}
+
+	if peer.LastSequence != 1 {
+		t.Errorf("Expected sequence 1, got %d", peer.LastSequence)
+	}
+}
+
+func TestSBDAgent_ReadPeerHeartbeat_InvalidMessage(t *testing.T) {
+	mockWatchdog := NewMockWatchdog("/dev/watchdog")
+	mockDevice := NewMockBlockDevice("/dev/mock-sbd", int(sbdprotocol.SBD_MAX_NODES*sbdprotocol.SBD_SLOT_SIZE))
+
+	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second, 5*time.Second, 30)
+	if err != nil {
+		t.Fatalf("Failed to create agent: %v", err)
+	}
+	defer agent.Stop()
+
+	// Set the mock device
+	agent.setSBDDevice(mockDevice)
+
+	// Write invalid data to slot 2
+	slotOffset := int64(2) * sbdprotocol.SBD_SLOT_SIZE
+	invalidData := []byte("invalid heartbeat data")
+	_, err = mockDevice.WriteAt(invalidData, slotOffset)
+	if err != nil {
+		t.Fatalf("Failed to write invalid data: %v", err)
+	}
+
+	// Try to read the peer heartbeat (should not fail, but should not add peer)
+	err = agent.readPeerHeartbeat(2)
+	if err != nil {
+		t.Errorf("Reading invalid heartbeat should not fail: %v", err)
+	}
+
+	// Check that no peer was added
+	peers := agent.peerMonitor.GetPeerStatus()
+	if len(peers) != 0 {
+		t.Errorf("Expected 0 peers with invalid data, got %d", len(peers))
+	}
+}
+
+func TestSBDAgent_ReadPeerHeartbeat_DeviceError(t *testing.T) {
+	mockWatchdog := NewMockWatchdog("/dev/watchdog")
+	mockDevice := NewMockBlockDevice("/dev/mock-sbd", int(sbdprotocol.SBD_MAX_NODES*sbdprotocol.SBD_SLOT_SIZE))
+
+	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second, 5*time.Second, 30)
+	if err != nil {
+		t.Fatalf("Failed to create agent: %v", err)
+	}
+	defer agent.Stop()
+
+	// Set the mock device
+	agent.setSBDDevice(mockDevice)
+
+	// Configure device to fail reads
+	mockDevice.SetFailRead(true)
+
+	// Try to read peer heartbeat (should fail)
+	err = agent.readPeerHeartbeat(2)
+	if err == nil {
+		t.Error("Expected read to fail with device error")
+	}
+
+	// Check that no peer was added
+	peers := agent.peerMonitor.GetPeerStatus()
+	if len(peers) != 0 {
+		t.Errorf("Expected 0 peers with device error, got %d", len(peers))
+	}
+}
+
+func TestSBDAgent_ReadPeerHeartbeat_NodeIDMismatch(t *testing.T) {
+	mockWatchdog := NewMockWatchdog("/dev/watchdog")
+	mockDevice := NewMockBlockDevice("/dev/mock-sbd", int(sbdprotocol.SBD_MAX_NODES*sbdprotocol.SBD_SLOT_SIZE))
+
+	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second, 5*time.Second, 30)
+	if err != nil {
+		t.Fatalf("Failed to create agent: %v", err)
+	}
+	defer agent.Stop()
+
+	// Set the mock device
+	agent.setSBDDevice(mockDevice)
+
+	// Write a heartbeat with NodeID 3 to slot 2 (mismatch)
+	err = mockDevice.WritePeerHeartbeat(3, 12345, 1)
+	if err != nil {
+		t.Fatalf("Failed to write peer heartbeat: %v", err)
+	}
+
+	// Read from slot 2 (should detect mismatch and not add peer)
+	err = agent.readPeerHeartbeat(2)
+	if err != nil {
+		t.Errorf("Reading mismatched heartbeat should not fail: %v", err)
+	}
+
+	// Check that no peer was added due to mismatch
+	peers := agent.peerMonitor.GetPeerStatus()
+	if len(peers) != 0 {
+		t.Errorf("Expected 0 peers with NodeID mismatch, got %d", len(peers))
+	}
+}
+
+func TestSBDAgent_PeerMonitorLoop_Integration(t *testing.T) {
+	mockWatchdog := NewMockWatchdog("/dev/watchdog")
+	mockDevice := NewMockBlockDevice("/dev/mock-sbd", int(sbdprotocol.SBD_MAX_NODES*sbdprotocol.SBD_SLOT_SIZE))
+
+	// Create agent with short check interval for testing
+	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second, 100*time.Millisecond, 1)
+	if err != nil {
+		t.Fatalf("Failed to create agent: %v", err)
+	}
+	defer agent.Stop()
+
+	// Set the mock device
+	agent.setSBDDevice(mockDevice)
+
+	// Write heartbeats for multiple peers
+	err = mockDevice.WritePeerHeartbeat(2, 12345, 1)
+	if err != nil {
+		t.Fatalf("Failed to write peer 2 heartbeat: %v", err)
+	}
+
+	err = mockDevice.WritePeerHeartbeat(3, 12346, 1)
+	if err != nil {
+		t.Fatalf("Failed to write peer 3 heartbeat: %v", err)
+	}
+
+	// Start the peer monitor loop
+	go agent.peerMonitorLoop()
+
+	// Wait for a few check cycles
+	time.Sleep(300 * time.Millisecond)
+
+	// Check that peers were discovered
+	peers := agent.peerMonitor.GetPeerStatus()
+	if len(peers) != 2 {
+		t.Errorf("Expected 2 peers, got %d", len(peers))
+	}
+
+	if _, exists := peers[2]; !exists {
+		t.Error("Expected peer 2 to be discovered")
+	}
+
+	if _, exists := peers[3]; !exists {
+		t.Error("Expected peer 3 to be discovered")
+	}
+
+	// Check healthy peer count
+	if count := agent.peerMonitor.GetHealthyPeerCount(); count != 2 {
+		t.Errorf("Expected 2 healthy peers, got %d", count)
+	}
+
+	// Wait for peers to become unhealthy (1 second timeout + check interval)
+	time.Sleep(1200 * time.Millisecond)
+
+	// Should now have 0 healthy peers
+	if count := agent.peerMonitor.GetHealthyPeerCount(); count != 0 {
+		t.Errorf("Expected 0 healthy peers after timeout, got %d", count)
+	}
+}
+
+func TestSBDAgent_NewSBDAgent(t *testing.T) {
+	// Create a temporary directory for testing
+	tempDir, err := os.MkdirTemp("", "sbd-agent-test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	watchdogPath := filepath.Join(tempDir, "watchdog")
+	sbdPath := filepath.Join(tempDir, "sbd")
+
+	// Create mock device files
+	if err := os.WriteFile(watchdogPath, []byte{}, 0644); err != nil {
+		t.Fatalf("Failed to create mock watchdog: %v", err)
+	}
+	if err := os.WriteFile(sbdPath, []byte{}, 0644); err != nil {
+		t.Fatalf("Failed to create mock SBD device: %v", err)
+	}
+
+	agent, err := NewSBDAgent(watchdogPath, sbdPath, "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second, 5*time.Second, 30)
+	if err != nil {
+		t.Fatalf("Failed to create agent: %v", err)
+	}
+	defer agent.Stop()
+
+	if agent.nodeName != "test-node" {
+		t.Errorf("Expected node name 'test-node', got '%s'", agent.nodeName)
+	}
+
+	if agent.nodeID != 1 {
+		t.Errorf("Expected node ID 1, got %d", agent.nodeID)
+	}
+
+	if agent.petInterval != 30*time.Second {
+		t.Errorf("Expected pet interval 30s, got %s", agent.petInterval)
+	}
+
+	if agent.peerCheckInterval != 5*time.Second {
+		t.Errorf("Expected peer check interval 5s, got %s", agent.peerCheckInterval)
+	}
+}
+
+func TestSBDAgent_WriteHeartbeatToSBD(t *testing.T) {
+	mockWatchdog := NewMockWatchdog("/dev/watchdog")
+	mockDevice := NewMockBlockDevice("/dev/mock-sbd", int(sbdprotocol.SBD_MAX_NODES*sbdprotocol.SBD_SLOT_SIZE))
+
+	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 2, 30*time.Second, 5*time.Second, 15*time.Second, 5*time.Second, 30)
+	if err != nil {
+		t.Fatalf("Failed to create agent: %v", err)
+	}
+	defer agent.Stop()
+
+	// Set the mock device
+	agent.setSBDDevice(mockDevice)
+
+	// Write a heartbeat
+	err = agent.writeHeartbeatToSBD()
+	if err != nil {
+		t.Errorf("Failed to write heartbeat: %v", err)
+	}
+
+	// Verify the heartbeat was written to the correct slot
+	slotOffset := int64(2) * sbdprotocol.SBD_SLOT_SIZE
+	slotData := make([]byte, sbdprotocol.SBD_HEADER_SIZE)
+	n, err := mockDevice.ReadAt(slotData, slotOffset)
+	if err != nil {
+		t.Fatalf("Failed to read written heartbeat: %v", err)
+	}
+	if n != sbdprotocol.SBD_HEADER_SIZE {
+		t.Errorf("Expected to read %d bytes, got %d", sbdprotocol.SBD_HEADER_SIZE, n)
+	}
+
+	// Unmarshal and verify the message
+	header, err := sbdprotocol.Unmarshal(slotData)
+	if err != nil {
+		t.Fatalf("Failed to unmarshal written heartbeat: %v", err)
+	}
+
+	if header.NodeID != 2 {
+		t.Errorf("Expected NodeID 2, got %d", header.NodeID)
+	}
+
+	if header.Type != sbdprotocol.SBD_MSG_TYPE_HEARTBEAT {
+		t.Errorf("Expected heartbeat type, got %d", header.Type)
+	}
+
+	if header.Sequence != 1 {
+		t.Errorf("Expected sequence 1, got %d", header.Sequence)
+	}
+}
+
+func TestSBDAgent_WriteHeartbeatToSBD_DeviceError(t *testing.T) {
+	mockWatchdog := NewMockWatchdog("/dev/watchdog")
+	mockDevice := NewMockBlockDevice("/dev/mock-sbd", int(sbdprotocol.SBD_MAX_NODES*sbdprotocol.SBD_SLOT_SIZE))
+
+	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second, 5*time.Second, 30)
+	if err != nil {
+		t.Fatalf("Failed to create agent: %v", err)
+	}
+	defer agent.Stop()
+
+	// Set the mock device
+	agent.setSBDDevice(mockDevice)
+
+	// Configure device to fail writes
+	mockDevice.SetFailWrite(true)
+
+	// Try to write heartbeat (should fail)
+	err = agent.writeHeartbeatToSBD()
+	if err == nil {
+		t.Error("Expected heartbeat write to fail with device error")
+	}
+}
+
+func TestSBDAgent_WriteHeartbeatToSBD_SyncError(t *testing.T) {
+	mockWatchdog := NewMockWatchdog("/dev/watchdog")
+	mockDevice := NewMockBlockDevice("/dev/mock-sbd", int(sbdprotocol.SBD_MAX_NODES*sbdprotocol.SBD_SLOT_SIZE))
+
+	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second, 5*time.Second, 30)
+	if err != nil {
+		t.Fatalf("Failed to create agent: %v", err)
+	}
+	defer agent.Stop()
+
+	// Set the mock device
+	agent.setSBDDevice(mockDevice)
+
+	// Configure device to fail sync
+	mockDevice.SetFailSync(true)
+
+	// Try to write heartbeat (should fail at sync)
+	err = agent.writeHeartbeatToSBD()
+	if err == nil {
+		t.Error("Expected heartbeat write to fail with sync error")
+	}
+
+	if !strings.Contains(err.Error(), "sync") {
+		t.Errorf("Expected sync error message, got: %v", err)
 	}
 }
 
 func TestSBDAgent_SBDHealthStatus(t *testing.T) {
 	mockWatchdog := NewMockWatchdog("/dev/watchdog")
 	// Use empty SBD device path so initialization doesn't fail
-	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second)
+	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second, 5*time.Second, 30)
 	if err != nil {
 		t.Fatalf("Failed to create agent: %v", err)
 	}
@@ -586,358 +699,105 @@ func TestSBDAgent_SBDHealthStatus(t *testing.T) {
 
 	// Initial state should be healthy when no SBD device is configured
 	if !agent.isSBDHealthy() {
-		t.Error("Expected SBD to be initially healthy")
+		t.Error("Expected SBD to be initially healthy with no device")
 	}
 
-	// Set unhealthy
+	// Mark as unhealthy
 	agent.setSBDHealthy(false)
 	if agent.isSBDHealthy() {
 		t.Error("Expected SBD to be unhealthy after setting to false")
 	}
 
-	// Set healthy again
+	// Mark as healthy again
 	agent.setSBDHealthy(true)
 	if !agent.isSBDHealthy() {
 		t.Error("Expected SBD to be healthy after setting to true")
 	}
 }
 
-func TestSBDAgent_WatchdogIntegration(t *testing.T) {
+func TestSBDAgent_HeartbeatSequence(t *testing.T) {
 	mockWatchdog := NewMockWatchdog("/dev/watchdog")
-	mockDevice := NewMockBlockDevice("/dev/mock-sbd")
-
-	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "/dev/mock-sbd", "test-node", 1, 50*time.Millisecond, 25*time.Millisecond, 25*time.Millisecond)
+	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second, 5*time.Second, 30)
 	if err != nil {
 		t.Fatalf("Failed to create agent: %v", err)
 	}
-
-	agent.setSBDDevice(mockDevice)
-
-	// Start the agent
-	if err := agent.Start(); err != nil {
-		t.Fatalf("Failed to start agent: %v", err)
-	}
-
-	// Let it run for a short time
-	time.Sleep(150 * time.Millisecond)
-
-	// Stop the agent
-	agent.Stop()
-
-	// Check that the watchdog was petted (should be healthy by default)
-	if mockWatchdog.GetPetCount() == 0 {
-		t.Error("Expected watchdog to be petted at least once")
-	}
-
-	// Test with SBD unhealthy
-	agent2, err := NewSBDAgentWithWatchdog(NewMockWatchdog("/dev/watchdog"), "/dev/mock-sbd", "test-node", 1, 50*time.Millisecond, 25*time.Millisecond, 25*time.Millisecond)
-	if err != nil {
-		t.Fatalf("Failed to create second agent: %v", err)
-	}
-
-	mockDevice2 := NewMockBlockDevice("/dev/mock-sbd")
-	mockDevice2.SetWriteError(errors.New("device failure"))
-	agent2.setSBDDevice(mockDevice2)
-
-	// Start the agent - this should make SBD unhealthy
-	if err := agent2.Start(); err != nil {
-		t.Fatalf("Failed to start second agent: %v", err)
-	}
-
-	// Wait a bit for the SBD device to fail
-	time.Sleep(50 * time.Millisecond)
-
-	// Check that SBD is now unhealthy
-	if agent2.isSBDHealthy() {
-		t.Error("Expected SBD to be unhealthy due to write failure")
-	}
-
-	agent2.Stop()
-}
-
-func TestValidateSBDDevice(t *testing.T) {
-	tests := []struct {
-		name        string
-		devicePath  string
-		setupFile   bool
-		expectError bool
-	}{
-		{
-			name:        "empty device path",
-			devicePath:  "",
-			setupFile:   false,
-			expectError: true,
-		},
-		{
-			name:        "non-existent device",
-			devicePath:  "/dev/non-existent",
-			setupFile:   false,
-			expectError: true,
-		},
-		{
-			name:        "valid file device",
-			devicePath:  "",
-			setupFile:   true,
-			expectError: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var devicePath string
-			if tt.setupFile {
-				tmpFile, err := os.CreateTemp("", "test-device-")
-				if err != nil {
-					t.Fatalf("Failed to create temp file: %v", err)
-				}
-				defer os.Remove(tmpFile.Name())
-				defer tmpFile.Close()
-				devicePath = tmpFile.Name()
-			} else {
-				devicePath = tt.devicePath
-			}
-
-			err := validateSBDDevice(devicePath)
-
-			if tt.expectError {
-				if err == nil {
-					t.Error("Expected error, but got none")
-				}
-			} else {
-				if err != nil {
-					t.Errorf("Unexpected error: %v", err)
-				}
-			}
-		})
-	}
-}
-
-func TestGetNodeNameFromEnv(t *testing.T) {
-	tests := []struct {
-		name         string
-		envVars      map[string]string
-		expectedName string
-	}{
-		{
-			name:         "NODE_NAME set",
-			envVars:      map[string]string{"NODE_NAME": "test-node"},
-			expectedName: "test-node",
-		},
-		{
-			name:         "HOSTNAME set",
-			envVars:      map[string]string{"HOSTNAME": "hostname-node"},
-			expectedName: "hostname-node",
-		},
-		{
-			name:         "NODENAME set",
-			envVars:      map[string]string{"NODENAME": "nodename-node"},
-			expectedName: "nodename-node",
-		},
-		{
-			name: "multiple env vars - NODE_NAME takes precedence",
-			envVars: map[string]string{
-				"NODE_NAME": "primary-node",
-				"HOSTNAME":  "secondary-node",
-			},
-			expectedName: "primary-node",
-		},
-		{
-			name:         "no env vars set",
-			envVars:      map[string]string{},
-			expectedName: "", // Will fall back to os.Hostname() in real scenario
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Clear relevant environment variables
-			for _, envVar := range []string{"NODE_NAME", "HOSTNAME", "NODENAME"} {
-				os.Unsetenv(envVar)
-			}
-
-			// Set test environment variables
-			for key, value := range tt.envVars {
-				os.Setenv(key, value)
-				defer os.Unsetenv(key)
-			}
-
-			nodeName := getNodeNameFromEnv()
-
-			if tt.expectedName == "" {
-				// For the "no env vars" case, expect either empty string or system hostname
-				if nodeName == "" {
-					// Empty is acceptable if hostname lookup fails in test environment
-				} else {
-					// Non-empty is acceptable if hostname lookup succeeds
-					if len(nodeName) == 0 {
-						t.Error("Expected non-empty node name from hostname fallback")
-					}
-				}
-			} else {
-				if nodeName != tt.expectedName {
-					t.Errorf("Expected node name %q, got %q", tt.expectedName, nodeName)
-				}
-			}
-		})
-	}
-}
-
-func TestGetNodeIDFromEnv(t *testing.T) {
-	tests := []struct {
-		name           string
-		envVars        map[string]string
-		expectedNodeID uint16
-	}{
-		{
-			name:           "SBD_NODE_ID set",
-			envVars:        map[string]string{"SBD_NODE_ID": "42"},
-			expectedNodeID: 42,
-		},
-		{
-			name:           "NODE_ID set",
-			envVars:        map[string]string{"NODE_ID": "123"},
-			expectedNodeID: 123,
-		},
-		{
-			name: "multiple env vars - SBD_NODE_ID takes precedence",
-			envVars: map[string]string{
-				"SBD_NODE_ID": "100",
-				"NODE_ID":     "200",
-			},
-			expectedNodeID: 100,
-		},
-		{
-			name:           "invalid node ID - too high",
-			envVars:        map[string]string{"SBD_NODE_ID": "300"},
-			expectedNodeID: DefaultNodeID,
-		},
-		{
-			name:           "invalid node ID - zero",
-			envVars:        map[string]string{"SBD_NODE_ID": "0"},
-			expectedNodeID: DefaultNodeID,
-		},
-		{
-			name:           "invalid node ID - non-numeric",
-			envVars:        map[string]string{"SBD_NODE_ID": "abc"},
-			expectedNodeID: DefaultNodeID,
-		},
-		{
-			name:           "no env vars set",
-			envVars:        map[string]string{},
-			expectedNodeID: DefaultNodeID,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Clear relevant environment variables
-			for _, envVar := range []string{"SBD_NODE_ID", "NODE_ID"} {
-				os.Unsetenv(envVar)
-			}
-
-			// Set test environment variables
-			for key, value := range tt.envVars {
-				os.Setenv(key, value)
-				defer os.Unsetenv(key)
-			}
-
-			nodeID := getNodeIDFromEnv()
-
-			if nodeID != tt.expectedNodeID {
-				t.Errorf("Expected node ID %d, got %d", tt.expectedNodeID, nodeID)
-			}
-		})
-	}
-}
-
-func TestGetSBDTimeoutFromEnv(t *testing.T) {
-	tests := []struct {
-		name            string
-		envVars         map[string]string
-		expectedTimeout uint
-	}{
-		{
-			name:            "SBD_TIMEOUT_SECONDS set",
-			envVars:         map[string]string{"SBD_TIMEOUT_SECONDS": "60"},
-			expectedTimeout: 60,
-		},
-		{
-			name:            "SBD_TIMEOUT set",
-			envVars:         map[string]string{"SBD_TIMEOUT": "45"},
-			expectedTimeout: 45,
-		},
-		{
-			name: "multiple env vars - SBD_TIMEOUT_SECONDS takes precedence",
-			envVars: map[string]string{
-				"SBD_TIMEOUT_SECONDS": "90",
-				"SBD_TIMEOUT":         "120",
-			},
-			expectedTimeout: 90,
-		},
-		{
-			name:            "invalid timeout - zero",
-			envVars:         map[string]string{"SBD_TIMEOUT_SECONDS": "0"},
-			expectedTimeout: 30,
-		},
-		{
-			name:            "invalid timeout - non-numeric",
-			envVars:         map[string]string{"SBD_TIMEOUT_SECONDS": "abc"},
-			expectedTimeout: 30,
-		},
-		{
-			name:            "no env vars set",
-			envVars:         map[string]string{},
-			expectedTimeout: 30,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Clear relevant environment variables
-			for _, envVar := range []string{"SBD_TIMEOUT_SECONDS", "SBD_TIMEOUT"} {
-				os.Unsetenv(envVar)
-			}
-
-			// Set test environment variables
-			for key, value := range tt.envVars {
-				os.Setenv(key, value)
-				defer os.Unsetenv(key)
-			}
-
-			timeout := getSBDTimeoutFromEnv()
-
-			if timeout != tt.expectedTimeout {
-				t.Errorf("Expected timeout %d, got %d", tt.expectedTimeout, timeout)
-			}
-		})
-	}
-}
-
-func BenchmarkSBDAgent_WriteNodeIDToSBD(b *testing.B) {
-	mockDevice := NewMockBlockDevice("/dev/mock-sbd")
-	mockWatchdog := NewMockWatchdog("/dev/watchdog")
-
-	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "/dev/mock-sbd", "benchmark-node", 1, 30*time.Second, 5*time.Second, 15*time.Second)
-	if err != nil {
-		b.Fatalf("Failed to create agent: %v", err)
-	}
 	defer agent.Stop()
 
-	agent.setSBDDevice(mockDevice)
+	// First sequence number should be 1
+	seq1 := agent.getNextHeartbeatSequence()
+	if seq1 != 1 {
+		t.Errorf("Expected first sequence to be 1, got %d", seq1)
+	}
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if err := agent.writeNodeIDToSBD(); err != nil {
-			b.Fatalf("Write failed: %v", err)
-		}
+	// Second sequence number should be 2
+	seq2 := agent.getNextHeartbeatSequence()
+	if seq2 != 2 {
+		t.Errorf("Expected second sequence to be 2, got %d", seq2)
+	}
+
+	// Sequences should be incrementing
+	if seq2 <= seq1 {
+		t.Errorf("Expected sequence to increment: %d -> %d", seq1, seq2)
 	}
 }
 
-func BenchmarkSBDAgent_WriteHeartbeatToSBD(b *testing.B) {
-	mockDevice := NewMockBlockDevice("/dev/mock-sbd")
-	mockWatchdog := NewMockWatchdog("/dev/watchdog")
+func TestEnvironmentVariables(t *testing.T) {
+	// Test getNodeNameFromEnv
+	t.Run("getNodeNameFromEnv", func(t *testing.T) {
+		// Clear environment
+		os.Unsetenv("NODE_NAME")
+		os.Unsetenv("HOSTNAME")
+		os.Unsetenv("NODENAME")
 
-	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "/dev/mock-sbd", "benchmark-node", 1, 30*time.Second, 5*time.Second, 15*time.Second)
+		// Set NODE_NAME
+		os.Setenv("NODE_NAME", "test-env-node")
+		defer os.Unsetenv("NODE_NAME")
+
+		nodeName := getNodeNameFromEnv()
+		if nodeName != "test-env-node" {
+			t.Errorf("Expected 'test-env-node', got '%s'", nodeName)
+		}
+	})
+
+	// Test getNodeIDFromEnv
+	t.Run("getNodeIDFromEnv", func(t *testing.T) {
+		// Clear environment
+		os.Unsetenv("SBD_NODE_ID")
+		os.Unsetenv("NODE_ID")
+
+		// Set SBD_NODE_ID
+		os.Setenv("SBD_NODE_ID", "5")
+		defer os.Unsetenv("SBD_NODE_ID")
+
+		nodeID := getNodeIDFromEnv()
+		if nodeID != 5 {
+			t.Errorf("Expected 5, got %d", nodeID)
+		}
+	})
+
+	// Test getSBDTimeoutFromEnv
+	t.Run("getSBDTimeoutFromEnv", func(t *testing.T) {
+		// Clear environment
+		os.Unsetenv("SBD_TIMEOUT_SECONDS")
+		os.Unsetenv("SBD_TIMEOUT")
+
+		// Set SBD_TIMEOUT_SECONDS
+		os.Setenv("SBD_TIMEOUT_SECONDS", "60")
+		defer os.Unsetenv("SBD_TIMEOUT_SECONDS")
+
+		timeout := getSBDTimeoutFromEnv()
+		if timeout != 60 {
+			t.Errorf("Expected 60, got %d", timeout)
+		}
+	})
+}
+
+// Benchmark tests
+func BenchmarkSBDAgent_WriteHeartbeat(b *testing.B) {
+	mockWatchdog := NewMockWatchdog("/dev/watchdog")
+	mockDevice := NewMockBlockDevice("/dev/mock-sbd", int(sbdprotocol.SBD_MAX_NODES*sbdprotocol.SBD_SLOT_SIZE))
+
+	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second, 5*time.Second, 30)
 	if err != nil {
 		b.Fatalf("Failed to create agent: %v", err)
 	}
@@ -948,22 +808,42 @@ func BenchmarkSBDAgent_WriteHeartbeatToSBD(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if err := agent.writeHeartbeatToSBD(); err != nil {
-			b.Fatalf("Heartbeat write failed: %v", err)
+			b.Fatalf("Failed to write heartbeat: %v", err)
 		}
 	}
 }
 
-func TestNewSBDAgentWithMockWatchdog(t *testing.T) {
-	// Test creating agent with mock watchdog directly
-	mockWatchdog := NewMockWatchdog("/dev/mock-watchdog")
-	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second)
+func BenchmarkSBDAgent_ReadPeerHeartbeat(b *testing.B) {
+	mockWatchdog := NewMockWatchdog("/dev/watchdog")
+	mockDevice := NewMockBlockDevice("/dev/mock-sbd", int(sbdprotocol.SBD_MAX_NODES*sbdprotocol.SBD_SLOT_SIZE))
+
+	agent, err := NewSBDAgentWithWatchdog(mockWatchdog, "", "test-node", 1, 30*time.Second, 5*time.Second, 15*time.Second, 5*time.Second, 30)
 	if err != nil {
-		t.Fatalf("Failed to create agent with mock watchdog: %v", err)
+		b.Fatalf("Failed to create agent: %v", err)
+	}
+	defer agent.Stop()
+
+	agent.setSBDDevice(mockDevice)
+
+	// Write a peer heartbeat
+	err = mockDevice.WritePeerHeartbeat(2, 12345, 1)
+	if err != nil {
+		b.Fatalf("Failed to write peer heartbeat: %v", err)
 	}
 
-	if agent.watchdog.Path() != "/dev/mock-watchdog" {
-		t.Errorf("Expected watchdog path /dev/mock-watchdog, got %s", agent.watchdog.Path())
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := agent.readPeerHeartbeat(2); err != nil {
+			b.Fatalf("Failed to read peer heartbeat: %v", err)
+		}
 	}
+}
 
-	agent.Stop()
+func BenchmarkPeerMonitor_UpdatePeer(b *testing.B) {
+	monitor := NewPeerMonitor(30, 1)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		monitor.UpdatePeer(2, uint64(i), uint64(i))
+	}
 }

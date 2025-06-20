@@ -52,7 +52,18 @@ var _ = Describe("Manager", Ordered, func() {
 		By("creating manager namespace")
 		cmd := exec.Command("kubectl", "create", "ns", namespace)
 		_, err := utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
+		if err != nil {
+			// Check if namespace already exists
+			cmd = exec.Command("kubectl", "get", "ns", namespace)
+			_, getErr := utils.Run(cmd)
+			if getErr != nil {
+				Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
+			}
+			// If namespace exists, clean it up first
+			By("cleaning up existing namespace")
+			cmd = exec.Command("kubectl", "delete", "all", "--all", "-n", namespace)
+			_, _ = utils.Run(cmd)
+		}
 
 		// Check if we're running on OpenShift (CRC)
 		isOpenShift := utils.IsCRCEnvironment() || os.Getenv("USE_CRC") == "true"

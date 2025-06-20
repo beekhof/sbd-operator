@@ -131,6 +131,10 @@ crc console --credentials
 - `USE_CRC=true`: Force using CRC OpenShift cluster
 - `USE_CRC=false`: Force using Kind Kubernetes cluster  
 - `CERT_MANAGER_INSTALL_SKIP=true`: Skip CertManager installation
+- `TEST_IMG`: Complete override for the test image name (e.g., `quay.io/myorg/sbd-operator:dev`)
+- `QUAY_REGISTRY`: Registry URL (defaults to `localhost:5000` for tests, `quay.io` for builds)
+- `QUAY_ORG`: Organization/namespace (defaults to `sbd-operator` for tests, `medik8s` for builds)
+- `VERSION`: Image version tag (defaults to `e2e-test` for tests, `latest` for builds)
 
 ### OpenShift vs Kubernetes Differences
 

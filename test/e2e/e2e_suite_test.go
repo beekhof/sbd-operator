@@ -39,8 +39,35 @@ var (
 
 	// projectImage is the name of the image which will be build and loaded
 	// with the code source changes to be tested.
-	projectImage = "example.com/sbd-operator:v0.0.1"
+	// It uses environment variables that match the Makefile QUAY_* variables.
+	projectImage = getProjectImage()
 )
+
+// getProjectImage returns the project image name based on environment variables.
+// It uses the same pattern as the Makefile QUAY_* variables, with sensible defaults for local testing.
+func getProjectImage() string {
+	registry := os.Getenv("QUAY_REGISTRY")
+	if registry == "" {
+		registry = "localhost:5000" // Local registry for testing
+	}
+
+	org := os.Getenv("QUAY_ORG")
+	if org == "" {
+		org = "sbd-operator"
+	}
+
+	version := os.Getenv("VERSION")
+	if version == "" {
+		version = "e2e-test"
+	}
+
+	// Allow complete override via TEST_IMG environment variable
+	if testImg := os.Getenv("TEST_IMG"); testImg != "" {
+		return testImg
+	}
+
+	return fmt.Sprintf("%s/%s/sbd-operator:%s", registry, org, version)
+}
 
 // TestE2E runs the end-to-end (e2e) test suite for the project. These tests execute in an isolated,
 // temporary environment to validate project changes with the purposed to be used in CI jobs.

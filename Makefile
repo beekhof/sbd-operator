@@ -97,7 +97,9 @@ setup-test-e2e: ## Set up a CRC OpenShift cluster for e2e tests if it is not run
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests on CRC OpenShift cluster.
 	@echo "Running e2e tests on CRC OpenShift cluster..."
-	@eval $$(crc oc-env) && go test ./test/e2e/ -v -ginkgo.v
+	@eval $$(crc oc-env) && \
+	QUAY_REGISTRY=$(QUAY_REGISTRY) QUAY_ORG=$(QUAY_ORG) VERSION=$(VERSION) \
+	go test ./test/e2e/ -v -ginkgo.v
 
 .PHONY: test-e2e-crc
 test-e2e-crc: ## Run e2e tests specifically on CRC OpenShift cluster
@@ -115,7 +117,9 @@ test-e2e-kind: ## Run e2e tests on Kind Kubernetes cluster (legacy support)
 	if ! kind get clusters | grep -q "$(CRC_CLUSTER)"; then \
 		kind create cluster --name $(CRC_CLUSTER); \
 	fi && \
-	KIND_CLUSTER=$(CRC_CLUSTER) go test ./test/e2e/ -v -ginkgo.v && \
+	KIND_CLUSTER=$(CRC_CLUSTER) \
+	QUAY_REGISTRY=$(QUAY_REGISTRY) QUAY_ORG=$(QUAY_ORG) VERSION=$(VERSION) \
+	go test ./test/e2e/ -v -ginkgo.v && \
 	kind delete cluster --name $(CRC_CLUSTER)
 
 .PHONY: cleanup-test-e2e
@@ -154,7 +158,7 @@ run: manifests generate fmt vet ## Run a controller from your host.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
-	$(CONTAINER_TOOL) build -t ${IMG} .
+	$(CONTAINER_TOOL) build -t ${IMG} . --load
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.

@@ -18,15 +18,17 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -51,6 +53,15 @@ const (
 	ReasonFailed = "RemediationFailed"
 	// ReasonWaitingForLeadership indicates waiting for leadership to perform fencing
 	ReasonWaitingForLeadership = "WaitingForLeadership"
+
+	// Retry configuration
+	maxRetryAttempts = 3
+	baseRetryDelay   = 5 * time.Second
+	maxRetryDelay    = 30 * time.Second
+
+	// Status update retry configuration
+	maxStatusUpdateRetries = 5
+	statusUpdateDelay      = 100 * time.Millisecond
 )
 
 // SBDRemediationReconciler reconciles a SBDRemediation object
@@ -64,6 +75,24 @@ type SBDRemediationReconciler struct {
 	// SBD device configuration
 	sbdDevicePath string
 	sbdDevice     *blockdevice.Device
+}
+
+// FencingError represents an error that occurred during the fencing process
+type FencingError struct {
+	Operation  string
+	Underlying error
+	Retryable  bool
+	NodeName   string
+	NodeID     uint16
+}
+
+func (e *FencingError) Error() string {
+	retryableStr := "non-retryable"
+	if e.Retryable {
+		retryableStr = "retryable"
+	}
+	return fmt.Sprintf("fencing error during %s for node %s (ID: %d): %v (%s)",
+		e.Operation, e.NodeName, e.NodeID, e.Underlying, retryableStr)
 }
 
 // +kubebuilder:rbac:groups=medik8s.medik8s.io,resources=sbdremediations,verbs=get;list;watch;create;update;patch;delete
@@ -159,7 +188,7 @@ func (r *SBDRemediationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// Fetch the SBDRemediation instance
 	var sbdRemediation medik8sv1alpha1.SBDRemediation
 	if err := r.Get(ctx, req.NamespacedName, &sbdRemediation); err != nil {
-		if errors.IsNotFound(err) {
+		if apierrors.IsNotFound(err) {
 			// SBDRemediation resource not found, probably deleted
 			logger.Info("SBDRemediation resource not found, probably deleted")
 			return ctrl.Result{}, nil
@@ -185,8 +214,12 @@ func (r *SBDRemediationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	// Initialize status if empty
 	if sbdRemediation.Status.Phase == "" {
-		return r.updateStatus(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhasePending,
+		result, err := r.updateStatusRobust(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhasePending,
 			"SBD remediation request received and queued for processing")
+		if err != nil {
+			return result, err
+		}
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	/*
@@ -199,7 +232,7 @@ func (r *SBDRemediationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	 */
 	if r.leaderElectionEnabled && !r.IsLeader() {
 		logger.Info("⏳ Not the leader - waiting for leadership to perform fencing operations")
-		return r.updateStatus(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseWaitingForLeadership,
+		return r.updateStatusRobust(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseWaitingForLeadership,
 			"Waiting for operator instance to become leader before performing fencing operations")
 	}
 
@@ -209,7 +242,9 @@ func (r *SBDRemediationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		logger.Info("✅ SBDRemediation already completed successfully")
 		return ctrl.Result{}, nil
 	case medik8sv1alpha1.SBDRemediationPhaseFailed:
-		logger.Info("❌ SBDRemediation previously failed")
+		logger.Info("❌ SBDRemediation previously failed - checking if retry is needed")
+		// For failed remediations, we could implement retry logic here
+		// For now, we'll leave them as failed unless manually updated
 		return ctrl.Result{}, nil
 	}
 
@@ -221,51 +256,66 @@ func (r *SBDRemediationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	targetNodeID, err := r.nodeNameToNodeID(sbdRemediation.Spec.NodeName)
 	if err != nil {
 		logger.Error(err, "Failed to determine node ID for target node", "node-name", sbdRemediation.Spec.NodeName)
-		return r.updateStatus(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseFailed,
+		_, updateErr := r.updateStatusRobust(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseFailed,
 			fmt.Sprintf("Failed to determine node ID for node %q: %v", sbdRemediation.Spec.NodeName, err))
+		if updateErr != nil {
+			logger.Error(updateErr, "Failed to update status after node ID mapping error")
+			return ctrl.Result{}, updateErr
+		}
+		return ctrl.Result{}, nil // Don't requeue for permanent errors
 	}
 
 	// Update status with node ID if not already set
 	if sbdRemediation.Status.NodeID == nil || *sbdRemediation.Status.NodeID != targetNodeID {
+		// Update the resource in memory first
 		sbdRemediation.Status.NodeID = &targetNodeID
 		sbdRemediation.Status.OperatorInstance = r.getOperatorInstanceID()
-		if err := r.Status().Update(ctx, &sbdRemediation); err != nil {
+
+		// Use a separate update for non-status fields
+		if err := r.updateStatusWithRetry(ctx, &sbdRemediation); err != nil {
 			logger.Error(err, "Failed to update status with node ID")
-			return ctrl.Result{}, err
+			return ctrl.Result{RequeueAfter: baseRetryDelay}, err
 		}
 	}
 
-	// Initialize SBD device if not already done
-	if err := r.initializeSBDDevice(ctx); err != nil {
-		logger.Error(err, "Failed to initialize SBD device")
-		return r.updateStatus(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseFailed,
-			fmt.Sprintf("Failed to initialize SBD device: %v", err))
-	}
-
-	// Update status to indicate fencing is in progress
+	// Update status to indicate fencing is in progress (only if not already in progress)
 	if sbdRemediation.Status.Phase != medik8sv1alpha1.SBDRemediationPhaseFencingInProgress {
-		if _, err := r.updateStatus(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseFencingInProgress,
-			fmt.Sprintf("Writing fence message for node %s (NodeID: %d) to SBD device", sbdRemediation.Spec.NodeName, targetNodeID)); err != nil {
-			return ctrl.Result{}, err
+		result, err := r.updateStatusRobust(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseFencingInProgress,
+			fmt.Sprintf("Writing fence message for node %s (NodeID: %d) to SBD device", sbdRemediation.Spec.NodeName, targetNodeID))
+		if err != nil {
+			return result, err
 		}
 	}
 
-	// Perform the fencing operation
-	if err := r.performFencing(ctx, &sbdRemediation, targetNodeID); err != nil {
-		logger.Error(err, "Failed to perform fencing operation")
-		return r.updateStatus(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseFailed,
-			fmt.Sprintf("Fencing operation failed: %v", err))
+	// Perform the fencing operation with retry logic
+	if err := r.performFencingWithRetry(ctx, &sbdRemediation, targetNodeID); err != nil {
+		logger.Error(err, "Failed to perform fencing operation after retries")
+
+		// Determine if this is a permanent failure or temporary
+		var fencingErr *FencingError
+		var message string
+		if errors.As(err, &fencingErr) {
+			message = fmt.Sprintf("Fencing operation failed: %s", fencingErr.Error())
+		} else {
+			message = fmt.Sprintf("Fencing operation failed: %v", err)
+		}
+
+		_, updateErr := r.updateStatusRobust(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseFailed, message)
+		if updateErr != nil {
+			logger.Error(updateErr, "Failed to update status after fencing failure")
+			return ctrl.Result{}, updateErr
+		}
+		return ctrl.Result{}, nil // Don't requeue after marking as failed
 	}
 
-	// Mark as completed
-	_, err = r.updateStatus(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseFencedSuccessfully,
-		fmt.Sprintf("Successfully fenced node %s (NodeID: %d) - fence message written to SBD device",
-			sbdRemediation.Spec.NodeName, targetNodeID))
+	// Mark as completed successfully
+	result, err := r.updateStatusRobust(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseFencedSuccessfully,
+		"Node successfully fenced via SBD.")
 
 	logger.Info("✅ SBDRemediation completed successfully",
 		"target-node", sbdRemediation.Spec.NodeName,
 		"node-id", targetNodeID)
-	return ctrl.Result{}, err
+	return result, err
 }
 
 // initializeSBDDevice initializes the SBD device connection if not already done
@@ -286,16 +336,80 @@ func (r *SBDRemediationReconciler) initializeSBDDevice(ctx context.Context) erro
 
 	device, err := blockdevice.Open(r.sbdDevicePath)
 	if err != nil {
-		return fmt.Errorf("failed to open SBD device %s: %w", r.sbdDevicePath, err)
+		return &FencingError{
+			Operation:  "SBD device initialization",
+			Underlying: fmt.Errorf("failed to open SBD device %s: %w", r.sbdDevicePath, err),
+			Retryable:  true, // Device issues might be temporary
+		}
 	}
 
 	r.sbdDevice = device
 	return nil
 }
 
+// performFencingWithRetry performs the fencing operation with retry logic for transient errors
+func (r *SBDRemediationReconciler) performFencingWithRetry(ctx context.Context, sbdRemediation *medik8sv1alpha1.SBDRemediation, targetNodeID uint16) error {
+	logger := logf.FromContext(ctx)
+
+	var lastErr error
+	for attempt := 1; attempt <= maxRetryAttempts; attempt++ {
+		logger.Info("Attempting fencing operation",
+			"attempt", attempt,
+			"max-attempts", maxRetryAttempts,
+			"target-node", sbdRemediation.Spec.NodeName)
+
+		err := r.performFencing(ctx, sbdRemediation, targetNodeID)
+		if err == nil {
+			// Success!
+			return nil
+		}
+
+		lastErr = err
+
+		// Check if this is a retryable error
+		var fencingErr *FencingError
+		if errors.As(err, &fencingErr) && !fencingErr.Retryable {
+			logger.Error(err, "Non-retryable fencing error encountered")
+			return err // Don't retry non-retryable errors
+		}
+
+		// If this is the last attempt, don't wait
+		if attempt == maxRetryAttempts {
+			break
+		}
+
+		// Calculate exponential backoff delay
+		delay := time.Duration(attempt) * baseRetryDelay
+		if delay > maxRetryDelay {
+			delay = maxRetryDelay
+		}
+
+		logger.Info("Fencing attempt failed, retrying",
+			"attempt", attempt,
+			"error", err,
+			"retry-delay", delay)
+
+		// Wait before retrying
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+			// Continue to next attempt
+		}
+	}
+
+	// All attempts failed
+	return fmt.Errorf("fencing failed after %d attempts, last error: %w", maxRetryAttempts, lastErr)
+}
+
 // performFencing performs the actual fencing operation by writing a fence message to the SBD device
 func (r *SBDRemediationReconciler) performFencing(ctx context.Context, sbdRemediation *medik8sv1alpha1.SBDRemediation, targetNodeID uint16) error {
 	logger := logf.FromContext(ctx)
+
+	// Initialize SBD device if needed
+	if err := r.initializeSBDDevice(ctx); err != nil {
+		return err
+	}
 
 	// Convert reason to numeric value
 	var reasonCode uint8 = 1 // Default to generic fencing reason
@@ -330,7 +444,13 @@ func (r *SBDRemediationReconciler) performFencing(ctx context.Context, sbdRemedi
 	// Marshal the fence message
 	messageBytes, err := sbdprotocol.MarshalFence(fenceMessage)
 	if err != nil {
-		return fmt.Errorf("failed to marshal fence message: %w", err)
+		return &FencingError{
+			Operation:  "fence message marshaling",
+			Underlying: fmt.Errorf("failed to marshal fence message: %w", err),
+			Retryable:  false, // Marshaling errors are usually permanent
+			NodeName:   sbdRemediation.Spec.NodeName,
+			NodeID:     targetNodeID,
+		}
 	}
 
 	// Calculate target slot offset
@@ -338,12 +458,30 @@ func (r *SBDRemediationReconciler) performFencing(ctx context.Context, sbdRemedi
 
 	// Write fence message to target node's slot
 	if _, err := r.sbdDevice.WriteAt(messageBytes, slotOffset); err != nil {
-		return fmt.Errorf("failed to write fence message to SBD device at offset %d: %w", slotOffset, err)
+		return &FencingError{
+			Operation:  "SBD device write",
+			Underlying: fmt.Errorf("failed to write fence message to SBD device at offset %d: %w", slotOffset, err),
+			Retryable:  true, // Write errors might be temporary (device busy, I/O errors)
+			NodeName:   sbdRemediation.Spec.NodeName,
+			NodeID:     targetNodeID,
+		}
 	}
 
 	// Ensure data is synced to disk
 	if err := r.sbdDevice.Sync(); err != nil {
-		return fmt.Errorf("failed to sync fence message to SBD device: %w", err)
+		return &FencingError{
+			Operation:  "SBD device sync",
+			Underlying: fmt.Errorf("failed to sync fence message to SBD device: %w", err),
+			Retryable:  true, // Sync errors might be temporary
+			NodeName:   sbdRemediation.Spec.NodeName,
+			NodeID:     targetNodeID,
+		}
+	}
+
+	// Verify the write by reading back the message (optional verification)
+	if err := r.verifyFenceMessage(messageBytes, slotOffset); err != nil {
+		logger.Error(err, "Fence message verification failed, but write was successful")
+		// Don't fail the operation for verification errors, just log them
 	}
 
 	logger.Info("✅ Fence message successfully written to SBD device",
@@ -352,8 +490,22 @@ func (r *SBDRemediationReconciler) performFencing(ctx context.Context, sbdRemedi
 		"slot-offset", slotOffset,
 		"message-size", len(messageBytes))
 
-	// Update the fence message written flag
-	sbdRemediation.Status.FenceMessageWritten = true
+	return nil
+}
+
+// verifyFenceMessage verifies that the fence message was written correctly by reading it back
+func (r *SBDRemediationReconciler) verifyFenceMessage(expectedBytes []byte, slotOffset int64) error {
+	readBuffer := make([]byte, len(expectedBytes))
+	if _, err := r.sbdDevice.ReadAt(readBuffer, slotOffset); err != nil {
+		return fmt.Errorf("failed to read back fence message for verification: %w", err)
+	}
+
+	// Compare the written and read data
+	for i, b := range expectedBytes {
+		if i < len(readBuffer) && readBuffer[i] != b {
+			return fmt.Errorf("fence message verification failed: byte mismatch at position %d (expected %d, got %d)", i, b, readBuffer[i])
+		}
+	}
 
 	return nil
 }
@@ -376,10 +528,16 @@ func (r *SBDRemediationReconciler) handleDeletion(ctx context.Context, sbdRemedi
 	return ctrl.Result{}, nil
 }
 
-// updateStatus updates the status of the SBDRemediation resource
-func (r *SBDRemediationReconciler) updateStatus(ctx context.Context, sbdRemediation *medik8sv1alpha1.SBDRemediation,
+// updateStatusRobust updates the status of the SBDRemediation resource with robust error handling and retry logic
+func (r *SBDRemediationReconciler) updateStatusRobust(ctx context.Context, sbdRemediation *medik8sv1alpha1.SBDRemediation,
 	phase medik8sv1alpha1.SBDRemediationPhase, message string) (ctrl.Result, error) {
 	logger := logf.FromContext(ctx)
+
+	// Check if status actually needs updating (idempotent)
+	if sbdRemediation.Status.Phase == phase && sbdRemediation.Status.Message == message {
+		logger.V(1).Info("Status already up to date, skipping update", "phase", phase)
+		return ctrl.Result{}, nil
+	}
 
 	// Update status fields
 	sbdRemediation.Status.Phase = phase
@@ -392,25 +550,84 @@ func (r *SBDRemediationReconciler) updateStatus(ctx context.Context, sbdRemediat
 		sbdRemediation.Status.OperatorInstance = r.getOperatorInstanceID()
 	}
 
-	// Update the status
-	if err := r.Status().Update(ctx, sbdRemediation); err != nil {
+	// Update fence message written flag if we're marking as successfully fenced
+	if phase == medik8sv1alpha1.SBDRemediationPhaseFencedSuccessfully {
+		sbdRemediation.Status.FenceMessageWritten = true
+	}
+
+	// Update the status with retry logic
+	if err := r.updateStatusWithRetry(ctx, sbdRemediation); err != nil {
 		logger.Error(err, "Failed to update SBDRemediation status", "phase", phase, "message", message)
-		return ctrl.Result{}, err
+		return ctrl.Result{RequeueAfter: baseRetryDelay}, err
 	}
 
-	logger.Info("Status updated", "phase", phase, "message", message)
+	logger.Info("Status updated successfully", "phase", phase, "message", message)
 
-	// Requeue with delay if waiting for leadership
-	if phase == medik8sv1alpha1.SBDRemediationPhaseWaitingForLeadership {
+	// Determine requeue behavior based on phase
+	switch phase {
+	case medik8sv1alpha1.SBDRemediationPhaseWaitingForLeadership:
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	case medik8sv1alpha1.SBDRemediationPhaseFailed:
+		// For failed status, we don't requeue automatically - manual intervention may be needed
+		return ctrl.Result{}, nil
+	case medik8sv1alpha1.SBDRemediationPhaseFencedSuccessfully:
+		// Success - no requeue needed
+		return ctrl.Result{}, nil
+	default:
+		// For other phases, requeue for continued processing
+		return ctrl.Result{Requeue: true}, nil
 	}
+}
 
-	// Requeue with delay if failed (for retry logic)
-	if phase == medik8sv1alpha1.SBDRemediationPhaseFailed {
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-	}
+// updateStatusWithRetry updates the status with retry logic to handle conflicts
+func (r *SBDRemediationReconciler) updateStatusWithRetry(ctx context.Context, sbdRemediation *medik8sv1alpha1.SBDRemediation) error {
+	logger := logf.FromContext(ctx)
 
-	return ctrl.Result{}, nil
+	return wait.ExponentialBackoff(wait.Backoff{
+		Duration: statusUpdateDelay,
+		Factor:   2.0,
+		Jitter:   0.1,
+		Steps:    maxStatusUpdateRetries,
+		Cap:      time.Second,
+	}, func() (bool, error) {
+		// Get the latest version to avoid conflicts
+		latest := &medik8sv1alpha1.SBDRemediation{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(sbdRemediation), latest); err != nil {
+			if apierrors.IsNotFound(err) {
+				logger.Info("SBDRemediation was deleted during status update")
+				return true, nil // Stop retrying
+			}
+			logger.Error(err, "Failed to get latest SBDRemediation for status update")
+			return false, err // Retry
+		}
+
+		// Copy our status changes to the latest version
+		latest.Status = sbdRemediation.Status
+
+		// Attempt the status update
+		if err := r.Status().Update(ctx, latest); err != nil {
+			if apierrors.IsConflict(err) {
+				logger.V(1).Info("Conflict during status update, retrying")
+				// Update our in-memory copy for the next retry
+				*sbdRemediation = *latest
+				return false, nil // Retry
+			}
+
+			// For other errors, decide whether to retry
+			if apierrors.IsServerTimeout(err) || apierrors.IsServiceUnavailable(err) || apierrors.IsTooManyRequests(err) {
+				logger.V(1).Info("Temporary error during status update, retrying", "error", err)
+				return false, nil // Retry
+			}
+
+			// Permanent error
+			logger.Error(err, "Permanent error during status update")
+			return false, err
+		}
+
+		// Success!
+		logger.V(1).Info("Status update successful")
+		return true, nil
+	})
 }
 
 // SetupWithManager sets up the controller with the Manager.

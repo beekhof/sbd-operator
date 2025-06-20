@@ -58,11 +58,11 @@ deploy_resources() {
     
     # Wait for namespace to be ready
     log_info "Waiting for namespace to be ready..."
-    kubectl wait --for=condition=Active namespace/${NAMESPACE} --timeout=30s
+    sleep 2  # Brief pause to ensure namespace is fully created
     
     # Deploy the DaemonSet and related resources
     log_info "Deploying SBD Agent DaemonSet..."
-    kubectl apply -f deploy/sbd-agent-daemonset-v2.yaml
+    kubectl apply -f deploy/sbd-agent-daemonset-simple.yaml
     
     log_success "Resources deployed successfully"
 }
@@ -132,8 +132,8 @@ delete_resources() {
     log_info "Deleting SBD Agent resources..."
     
     # Delete DaemonSet and related resources
-    if kubectl get -f deploy/sbd-agent-daemonset-v2.yaml &> /dev/null; then
-        kubectl delete -f deploy/sbd-agent-daemonset-v2.yaml
+    if kubectl get -f deploy/sbd-agent-daemonset-simple.yaml &> /dev/null; then
+        kubectl delete -f deploy/sbd-agent-daemonset-simple.yaml
         log_success "DaemonSet and RBAC resources deleted"
     else
         log_warning "DaemonSet resources not found"

@@ -58,9 +58,16 @@ type BlockDevice interface {
 	IsClosed() bool
 }
 
+// WatchdogInterface defines the interface for watchdog operations
+type WatchdogInterface interface {
+	Pet() error
+	Close() error
+	Path() string
+}
+
 // SBDAgent represents the main SBD agent application
 type SBDAgent struct {
-	watchdog          *watchdog.Watchdog
+	watchdog          WatchdogInterface
 	sbdDevice         BlockDevice
 	sbdDevicePath     string
 	nodeName          string
@@ -80,6 +87,11 @@ func NewSBDAgent(watchdogPath, sbdDevicePath, nodeName string, petInterval, sbdU
 		return nil, fmt.Errorf("failed to initialize watchdog: %w", err)
 	}
 
+	return NewSBDAgentWithWatchdog(wd, sbdDevicePath, nodeName, petInterval, sbdUpdateInterval)
+}
+
+// NewSBDAgentWithWatchdog creates a new SBD agent instance with a custom watchdog (for testing)
+func NewSBDAgentWithWatchdog(wd WatchdogInterface, sbdDevicePath, nodeName string, petInterval, sbdUpdateInterval time.Duration) (*SBDAgent, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	agent := &SBDAgent{

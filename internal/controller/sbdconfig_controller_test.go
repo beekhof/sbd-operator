@@ -18,21 +18,29 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	medik8sv1alpha1 "github.com/medik8s/sbd-operator/api/v1alpha1"
 )
 
 var _ = Describe("SBDConfig Controller", func() {
 	Context("When reconciling a resource", func() {
-		const resourceName = "test-sbdconfig"
+		const (
+			resourceName = "test-sbdconfig"
+			namespace    = "test-sbd-system"
+			timeout      = time.Second * 10
+			interval     = time.Millisecond * 250
+		)
 
 		ctx := context.Background()
 
@@ -49,21 +57,6 @@ var _ = Describe("SBDConfig Controller", func() {
 				Client: k8sClient,
 				Scheme: k8sClient.Scheme(),
 			}
-
-			By("creating the custom resource for the Kind SBDConfig")
-			sbdconfig := &medik8sv1alpha1.SBDConfig{}
-			err := k8sClient.Get(ctx, typeNamespacedName, sbdconfig)
-			if err != nil && errors.IsNotFound(err) {
-				resource := &medik8sv1alpha1.SBDConfig{
-					ObjectMeta: metav1.ObjectMeta{
-						Name: resourceName,
-					},
-					Spec: medik8sv1alpha1.SBDConfigSpec{
-						// Add basic spec if needed
-					},
-				}
-				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
-			}
 		})
 
 		AfterEach(func() {
@@ -73,9 +66,29 @@ var _ = Describe("SBDConfig Controller", func() {
 			if err == nil {
 				Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
 			}
+
+			By("cleaning up the test namespace")
+			testNamespace := &corev1.Namespace{}
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: namespace}, testNamespace)
+			if err == nil {
+				Expect(k8sClient.Delete(ctx, testNamespace)).To(Succeed())
+			}
 		})
 
 		It("should successfully reconcile an existing resource", func() {
+			By("creating the custom resource for the Kind SBDConfig")
+			resource := &medik8sv1alpha1.SBDConfig{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: resourceName,
+				},
+				Spec: medik8sv1alpha1.SBDConfigSpec{
+					SbdWatchdogPath: "/dev/watchdog",
+					Image:           "test-sbd-agent:latest",
+					Namespace:       namespace,
+				},
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
 			By("reconciling the created resource")
 			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
@@ -106,8 +119,20 @@ var _ = Describe("SBDConfig Controller", func() {
 		})
 
 		It("should successfully reconcile after resource deletion", func() {
+			By("creating the custom resource for the Kind SBDConfig")
+			resource := &medik8sv1alpha1.SBDConfig{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: resourceName,
+				},
+				Spec: medik8sv1alpha1.SBDConfigSpec{
+					SbdWatchdogPath: "/dev/watchdog",
+					Image:           "test-sbd-agent:latest",
+					Namespace:       namespace,
+				},
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
 			By("deleting the resource first")
-			resource := &medik8sv1alpha1.SBDConfig{}
 			err := k8sClient.Get(ctx, typeNamespacedName, resource)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
@@ -119,6 +144,284 @@ var _ = Describe("SBDConfig Controller", func() {
 
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result).To(Equal(reconcile.Result{}))
+		})
+	})
+
+	Context("When testing DaemonSet management", func() {
+		const (
+			resourceName = "test-daemonset-sbdconfig"
+			namespace    = "test-daemonset-system"
+			timeout      = time.Second * 30
+			interval     = time.Millisecond * 250
+		)
+
+		ctx := context.Background()
+
+		typeNamespacedName := types.NamespacedName{
+			Name: resourceName,
+		}
+
+		var controllerReconciler *SBDConfigReconciler
+
+		BeforeEach(func() {
+			By("initializing controller reconciler")
+			controllerReconciler = &SBDConfigReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+		})
+
+		AfterEach(func() {
+			By("cleaning up the specific resource instance SBDConfig")
+			resource := &medik8sv1alpha1.SBDConfig{}
+			err := k8sClient.Get(ctx, typeNamespacedName, resource)
+			if err == nil {
+				Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+			}
+
+			By("cleaning up the test namespace")
+			testNamespace := &corev1.Namespace{}
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: namespace}, testNamespace)
+			if err == nil {
+				Expect(k8sClient.Delete(ctx, testNamespace)).To(Succeed())
+			}
+		})
+
+		It("should create a DaemonSet when SBDConfig is applied", func() {
+			By("creating the SBDConfig resource")
+			sbdConfig := &medik8sv1alpha1.SBDConfig{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: resourceName,
+				},
+				Spec: medik8sv1alpha1.SBDConfigSpec{
+					SbdWatchdogPath: "/dev/watchdog",
+					Image:           "test-sbd-agent:latest",
+					Namespace:       namespace,
+				},
+			}
+			Expect(k8sClient.Create(ctx, sbdConfig)).To(Succeed())
+
+			By("reconciling the SBDConfig")
+			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(reconcile.Result{}))
+
+			By("verifying the namespace was created")
+			testNamespace := &corev1.Namespace{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{Name: namespace}, testNamespace)
+			}, timeout, interval).Should(Succeed())
+
+			By("verifying the DaemonSet was created")
+			expectedDaemonSetName := fmt.Sprintf("sbd-agent-%s", resourceName)
+			daemonSet := &appsv1.DaemonSet{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      expectedDaemonSetName,
+					Namespace: namespace,
+				}, daemonSet)
+			}, timeout, interval).Should(Succeed())
+
+			By("verifying the DaemonSet has correct configuration")
+			Expect(daemonSet.Name).To(Equal(expectedDaemonSetName))
+			Expect(daemonSet.Namespace).To(Equal(namespace))
+			Expect(daemonSet.Labels["app"]).To(Equal("sbd-agent"))
+			Expect(daemonSet.Labels["sbdconfig"]).To(Equal(resourceName))
+			Expect(daemonSet.Labels["managed-by"]).To(Equal("sbd-operator"))
+
+			By("verifying the DaemonSet has the correct owner reference")
+			Expect(daemonSet.OwnerReferences).To(HaveLen(1))
+			Expect(daemonSet.OwnerReferences[0].Name).To(Equal(resourceName))
+			Expect(daemonSet.OwnerReferences[0].Kind).To(Equal("SBDConfig"))
+			Expect(*daemonSet.OwnerReferences[0].Controller).To(BeTrue())
+
+			By("verifying the DaemonSet pod template has correct configuration")
+			container := daemonSet.Spec.Template.Spec.Containers[0]
+			Expect(container.Name).To(Equal("sbd-agent"))
+			Expect(container.Image).To(Equal("test-sbd-agent:latest"))
+			Expect(container.Args).To(ContainElement("--watchdog-path=/dev/watchdog"))
+
+			By("verifying the DaemonSet has correct volume mounts")
+			Expect(container.VolumeMounts).To(HaveLen(3))
+			volumeMountNames := make([]string, len(container.VolumeMounts))
+			for i, vm := range container.VolumeMounts {
+				volumeMountNames[i] = vm.Name
+			}
+			Expect(volumeMountNames).To(ContainElements("dev", "sys", "proc"))
+
+			By("verifying the DaemonSet has correct volumes")
+			Expect(daemonSet.Spec.Template.Spec.Volumes).To(HaveLen(3))
+			volumeNames := make([]string, len(daemonSet.Spec.Template.Spec.Volumes))
+			for i, v := range daemonSet.Spec.Template.Spec.Volumes {
+				volumeNames[i] = v.Name
+			}
+			Expect(volumeNames).To(ContainElements("dev", "sys", "proc"))
+
+			By("verifying the DaemonSet has correct security context")
+			Expect(*container.SecurityContext.Privileged).To(BeTrue())
+			Expect(*container.SecurityContext.RunAsUser).To(BeEquivalentTo(0))
+		})
+
+		It("should update DaemonSet when SBDConfig is modified", func() {
+			By("creating the SBDConfig resource")
+			sbdConfig := &medik8sv1alpha1.SBDConfig{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: resourceName,
+				},
+				Spec: medik8sv1alpha1.SBDConfigSpec{
+					SbdWatchdogPath: "/dev/watchdog",
+					Image:           "test-sbd-agent:v1.0.0",
+					Namespace:       namespace,
+				},
+			}
+			Expect(k8sClient.Create(ctx, sbdConfig)).To(Succeed())
+
+			By("reconciling the SBDConfig")
+			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(reconcile.Result{}))
+
+			By("verifying the DaemonSet was created with initial image")
+			expectedDaemonSetName := fmt.Sprintf("sbd-agent-%s", resourceName)
+			daemonSet := &appsv1.DaemonSet{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      expectedDaemonSetName,
+					Namespace: namespace,
+				}, daemonSet)
+			}, timeout, interval).Should(Succeed())
+			Expect(daemonSet.Spec.Template.Spec.Containers[0].Image).To(Equal("test-sbd-agent:v1.0.0"))
+
+			By("updating the SBDConfig image")
+			// Fetch the latest version to avoid conflicts
+			err = k8sClient.Get(ctx, typeNamespacedName, sbdConfig)
+			Expect(err).NotTo(HaveOccurred())
+			sbdConfig.Spec.Image = "test-sbd-agent:v2.0.0"
+			sbdConfig.Spec.SbdWatchdogPath = "/dev/watchdog1"
+			Expect(k8sClient.Update(ctx, sbdConfig)).To(Succeed())
+
+			By("reconciling the updated SBDConfig")
+			result, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(reconcile.Result{}))
+
+			By("verifying the DaemonSet was updated with new image and watchdog path")
+			Eventually(func() string {
+				err := k8sClient.Get(ctx, types.NamespacedName{
+					Name:      expectedDaemonSetName,
+					Namespace: namespace,
+				}, daemonSet)
+				if err != nil {
+					return ""
+				}
+				return daemonSet.Spec.Template.Spec.Containers[0].Image
+			}, timeout, interval).Should(Equal("test-sbd-agent:v2.0.0"))
+
+			Eventually(func() []string {
+				err := k8sClient.Get(ctx, types.NamespacedName{
+					Name:      expectedDaemonSetName,
+					Namespace: namespace,
+				}, daemonSet)
+				if err != nil {
+					return nil
+				}
+				return daemonSet.Spec.Template.Spec.Containers[0].Args
+			}, timeout, interval).Should(ContainElement("--watchdog-path=/dev/watchdog1"))
+		})
+
+		It("should set correct owner reference for garbage collection", func() {
+			By("creating the SBDConfig resource")
+			sbdConfig := &medik8sv1alpha1.SBDConfig{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: resourceName,
+				},
+				Spec: medik8sv1alpha1.SBDConfigSpec{
+					SbdWatchdogPath: "/dev/watchdog",
+					Image:           "test-sbd-agent:latest",
+					Namespace:       namespace,
+				},
+			}
+			Expect(k8sClient.Create(ctx, sbdConfig)).To(Succeed())
+
+			By("reconciling the SBDConfig")
+			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(reconcile.Result{}))
+
+			By("verifying the DaemonSet was created")
+			expectedDaemonSetName := fmt.Sprintf("sbd-agent-%s", resourceName)
+			daemonSet := &appsv1.DaemonSet{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      expectedDaemonSetName,
+					Namespace: namespace,
+				}, daemonSet)
+			}, timeout, interval).Should(Succeed())
+
+			By("verifying the DaemonSet has correct owner reference before deletion")
+			err = k8sClient.Get(ctx, types.NamespacedName{
+				Name:      expectedDaemonSetName,
+				Namespace: namespace,
+			}, daemonSet)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(daemonSet.OwnerReferences).To(HaveLen(1))
+			Expect(daemonSet.OwnerReferences[0].Name).To(Equal(resourceName))
+			Expect(daemonSet.OwnerReferences[0].Kind).To(Equal("SBDConfig"))
+			Expect(*daemonSet.OwnerReferences[0].Controller).To(BeTrue())
+
+			By("deleting the SBDConfig")
+			Expect(k8sClient.Delete(ctx, sbdConfig)).To(Succeed())
+
+			By("verifying the SBDConfig is deleted")
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, typeNamespacedName, sbdConfig)
+				return errors.IsNotFound(err)
+			}, timeout, interval).Should(BeTrue())
+
+			// Note: In test environments, garbage collection may not run automatically
+			// The important verification is that the owner reference was correctly set above
+		})
+
+		It("should handle default values correctly", func() {
+			By("creating the SBDConfig resource with minimal spec")
+			sbdConfig := &medik8sv1alpha1.SBDConfig{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: resourceName,
+				},
+				Spec: medik8sv1alpha1.SBDConfigSpec{
+					SbdWatchdogPath: "/dev/watchdog",
+					// No image or namespace specified - should use defaults
+				},
+			}
+			Expect(k8sClient.Create(ctx, sbdConfig)).To(Succeed())
+
+			By("reconciling the SBDConfig")
+			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(reconcile.Result{}))
+
+			By("verifying the DaemonSet was created with default values")
+			expectedDaemonSetName := fmt.Sprintf("sbd-agent-%s", resourceName)
+			daemonSet := &appsv1.DaemonSet{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      expectedDaemonSetName,
+					Namespace: "sbd-system", // default namespace
+				}, daemonSet)
+			}, timeout, interval).Should(Succeed())
+
+			Expect(daemonSet.Spec.Template.Spec.Containers[0].Image).To(Equal("sbd-agent:latest"))
+			Expect(daemonSet.Namespace).To(Equal("sbd-system"))
 		})
 	})
 

@@ -28,14 +28,33 @@ type SBDConfigSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 
-	// Foo is an example field of SBDConfig. Edit sbdconfig_types.go to remove/update
-	Foo string `json:"foo,omitempty"`
+	// SbdWatchdogPath is the path to the watchdog device on the host
+	// +kubebuilder:validation:Required
+	// +kubebuilder:default="/dev/watchdog"
+	SbdWatchdogPath string `json:"sbdWatchdogPath"`
+
+	// Image is the container image for the SBD agent DaemonSet
+	// +kubebuilder:default="sbd-agent:latest"
+	Image string `json:"image,omitempty"`
+
+	// Namespace is the namespace where the SBD agent DaemonSet will be deployed
+	// +kubebuilder:default="sbd-system"
+	Namespace string `json:"namespace,omitempty"`
 }
 
 // SBDConfigStatus defines the observed state of SBDConfig.
 type SBDConfigStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
+
+	// DaemonSetReady indicates whether the SBD agent DaemonSet is ready
+	DaemonSetReady bool `json:"daemonSetReady,omitempty"`
+
+	// ReadyNodes is the number of nodes where the SBD agent is ready
+	ReadyNodes int32 `json:"readyNodes,omitempty"`
+
+	// TotalNodes is the total number of nodes where the SBD agent should be deployed
+	TotalNodes int32 `json:"totalNodes,omitempty"`
 }
 
 // +kubebuilder:object:root=true

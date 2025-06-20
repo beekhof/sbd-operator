@@ -39,13 +39,40 @@ spec:
           spec:
             description: SBDConfigSpec defines the desired state of SBDConfig.
             properties:
-              foo:
-                description: Foo is an example field of SBDConfig. Edit sbdconfig_types.go
-                  to remove/update
+              image:
+                default: sbd-agent:latest
+                description: Image is the container image for the SBD agent DaemonSet
                 type: string
+              namespace:
+                default: sbd-system
+                description: Namespace is the namespace where the SBD agent DaemonSet
+                  will be deployed
+                type: string
+              sbdWatchdogPath:
+                default: /dev/watchdog
+                description: SbdWatchdogPath is the path to the watchdog device on
+                  the host
+                type: string
+            required:
+            - sbdWatchdogPath
             type: object
           status:
             description: SBDConfigStatus defines the observed state of SBDConfig.
+            properties:
+              daemonSetReady:
+                description: DaemonSetReady indicates whether the SBD agent DaemonSet
+                  is ready
+                type: boolean
+              readyNodes:
+                description: ReadyNodes is the number of nodes where the SBD agent
+                  is ready
+                format: int32
+                type: integer
+              totalNodes:
+                description: TotalNodes is the total number of nodes where the SBD
+                  agent should be deployed
+                format: int32
+                type: integer
             type: object
         type: object
     served: true

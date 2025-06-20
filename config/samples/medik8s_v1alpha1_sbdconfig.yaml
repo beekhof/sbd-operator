@@ -6,4 +6,11 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: sbdconfig-sample
 spec:
-  # TODO(user): Add fields here
+  # Path to the watchdog device on the host nodes
+  sbdWatchdogPath: "/dev/watchdog"
+  
+  # Container image for the SBD Agent DaemonSet
+  image: "sbd-agent:latest"
+  
+  # Namespace where the SBD Agent DaemonSet will be deployed
+  namespace: "sbd-system"

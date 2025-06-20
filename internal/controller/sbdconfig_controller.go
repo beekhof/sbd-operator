@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/go-logr/logr"
 	medik8sv1alpha1 "github.com/medik8s/sbd-operator/api/v1alpha1"
 )
 
@@ -86,35 +87,60 @@ func (r *SBDConfigReconciler) emitEventf(object client.Object, eventType, reason
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.21.0/pkg/reconcile
 func (r *SBDConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
+	logger := log.FromContext(ctx).WithName("sbdconfig-controller").WithValues(
+		"request", req.NamespacedName,
+		"controller", "SBDConfig",
+	)
 
 	// Retrieve the SBDConfig object
 	var sbdConfig medik8sv1alpha1.SBDConfig
 	if err := r.Get(ctx, req.NamespacedName, &sbdConfig); err != nil {
 		if errors.IsNotFound(err) {
 			// The SBDConfig resource was deleted
-			logger.Info("SBDConfig resource not found. It may have been deleted", "name", req.Name)
+			logger.Info("SBDConfig resource not found, it may have been deleted",
+				"name", req.Name,
+				"namespace", req.Namespace)
 			return ctrl.Result{}, nil
 		}
 		// Error reading the object - requeue the request
-		logger.Error(err, "Failed to get SBDConfig", "name", req.Name)
+		logger.Error(err, "Failed to get SBDConfig",
+			"name", req.Name,
+			"namespace", req.Namespace)
 		return ctrl.Result{}, err
 	}
+
+	// Add resource-specific context to logger
+	logger = logger.WithValues(
+		"sbdconfig.name", sbdConfig.Name,
+		"sbdconfig.namespace", sbdConfig.Namespace,
+		"sbdconfig.generation", sbdConfig.Generation,
+		"sbdconfig.resourceVersion", sbdConfig.ResourceVersion,
+	)
+
+	logger.V(1).Info("Starting SBDConfig reconciliation",
+		"spec.image", sbdConfig.Spec.Image,
+		"spec.namespace", sbdConfig.Spec.Namespace,
+		"spec.sbdWatchdogPath", sbdConfig.Spec.SbdWatchdogPath)
 
 	// Set default values if not specified
 	if sbdConfig.Spec.Image == "" {
 		sbdConfig.Spec.Image = "sbd-agent:latest"
+		logger.V(1).Info("Set default image", "image", sbdConfig.Spec.Image)
 	}
 	if sbdConfig.Spec.Namespace == "" {
 		sbdConfig.Spec.Namespace = "sbd-system"
+		logger.V(1).Info("Set default namespace", "namespace", sbdConfig.Spec.Namespace)
 	}
 	if sbdConfig.Spec.SbdWatchdogPath == "" {
 		sbdConfig.Spec.SbdWatchdogPath = "/dev/watchdog"
+		logger.V(1).Info("Set default watchdog path", "watchdogPath", sbdConfig.Spec.SbdWatchdogPath)
 	}
 
 	// Ensure the namespace exists
-	if err := r.ensureNamespace(ctx, &sbdConfig, sbdConfig.Spec.Namespace); err != nil {
-		logger.Error(err, "Failed to ensure namespace exists", "namespace", sbdConfig.Spec.Namespace)
+	if err := r.ensureNamespace(ctx, &sbdConfig, sbdConfig.Spec.Namespace, logger); err != nil {
+		logger.Error(err, "Failed to ensure namespace exists",
+			"namespace", sbdConfig.Spec.Namespace,
+			"operation", "namespace-creation")
 		r.emitEventf(&sbdConfig, EventTypeWarning, ReasonNamespaceError,
 			"Failed to ensure namespace '%s' exists: %v", sbdConfig.Spec.Namespace, err)
 		return ctrl.Result{}, err
@@ -122,6 +148,10 @@ func (r *SBDConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	// Define the desired DaemonSet
 	desiredDaemonSet := r.buildDaemonSet(&sbdConfig)
+	daemonSetLogger := logger.WithValues(
+		"daemonset.name", desiredDaemonSet.Name,
+		"daemonset.namespace", desiredDaemonSet.Namespace,
+	)
 
 	// Use CreateOrUpdate to manage the DaemonSet
 	actualDaemonSet := &appsv1.DaemonSet{
@@ -141,35 +171,48 @@ func (r *SBDConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return controllerutil.SetControllerReference(&sbdConfig, actualDaemonSet, r.Scheme)
 	})
 	if err != nil {
-		logger.Error(err, "Failed to create or update DaemonSet", "DaemonSet", desiredDaemonSet.Name)
+		daemonSetLogger.Error(err, "Failed to create or update DaemonSet",
+			"operation", "daemonset-create-or-update",
+			"desired.replicas", desiredDaemonSet.Spec.Template.Spec.Containers[0].Image)
 		r.emitEventf(&sbdConfig, EventTypeWarning, ReasonDaemonSetError,
 			"Failed to create or update DaemonSet '%s': %v", desiredDaemonSet.Name, err)
 		return ctrl.Result{}, err
 	}
 
-	logger.Info("DaemonSet operation completed", "DaemonSet", actualDaemonSet.Name, "operation", result)
+	daemonSetLogger.Info("DaemonSet operation completed",
+		"operation", result,
+		"daemonset.generation", actualDaemonSet.Generation,
+		"daemonset.resourceVersion", actualDaemonSet.ResourceVersion)
 
 	// Emit event for DaemonSet management
 	if result == controllerutil.OperationResultCreated {
 		r.emitEventf(&sbdConfig, EventTypeNormal, ReasonDaemonSetManaged,
 			"DaemonSet '%s' for SBD Agent created successfully", actualDaemonSet.Name)
+		daemonSetLogger.Info("DaemonSet created successfully")
 	} else if result == controllerutil.OperationResultUpdated {
 		r.emitEventf(&sbdConfig, EventTypeNormal, ReasonDaemonSetManaged,
 			"DaemonSet '%s' for SBD Agent updated successfully", actualDaemonSet.Name)
+		daemonSetLogger.Info("DaemonSet updated successfully")
 	} else {
 		r.emitEventf(&sbdConfig, EventTypeNormal, ReasonDaemonSetManaged,
 			"DaemonSet '%s' for SBD Agent managed", actualDaemonSet.Name)
+		daemonSetLogger.V(1).Info("DaemonSet unchanged")
 	}
 
 	// Update the SBDConfig status
-	if err := r.updateStatus(ctx, &sbdConfig, actualDaemonSet); err != nil {
-		logger.Error(err, "Failed to update SBDConfig status")
+	if err := r.updateStatus(ctx, &sbdConfig, actualDaemonSet, logger); err != nil {
+		logger.Error(err, "Failed to update SBDConfig status",
+			"operation", "status-update",
+			"daemonset.name", actualDaemonSet.Name)
 		r.emitEventf(&sbdConfig, EventTypeWarning, ReasonReconcileError,
 			"Failed to update SBDConfig status: %v", err)
 		return ctrl.Result{}, err
 	}
 
-	logger.Info("Successfully reconciled SBDConfig", "name", sbdConfig.Name, "namespace", sbdConfig.Namespace)
+	logger.Info("Successfully reconciled SBDConfig",
+		"operation", "reconcile-complete",
+		"daemonset.name", actualDaemonSet.Name,
+		"result", result)
 
 	// Emit success event for SBDConfig reconciliation
 	r.emitEventf(&sbdConfig, EventTypeNormal, ReasonSBDConfigReconciled,
@@ -179,7 +222,7 @@ func (r *SBDConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 }
 
 // ensureNamespace creates the namespace if it doesn't exist
-func (r *SBDConfigReconciler) ensureNamespace(ctx context.Context, sbdConfig *medik8sv1alpha1.SBDConfig, namespaceName string) error {
+func (r *SBDConfigReconciler) ensureNamespace(ctx context.Context, sbdConfig *medik8sv1alpha1.SBDConfig, namespaceName string, logger logr.Logger) error {
 	namespace := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: namespaceName,
@@ -193,6 +236,7 @@ func (r *SBDConfigReconciler) ensureNamespace(ctx context.Context, sbdConfig *me
 
 	if err == nil && result == controllerutil.OperationResultCreated {
 		// Emit event for namespace creation
+		logger.Info("Namespace created for SBD system", "namespace", namespaceName)
 		r.emitEventf(sbdConfig, EventTypeNormal, ReasonNamespaceCreated,
 			"Namespace '%s' created for SBD system", namespaceName)
 	}
@@ -403,7 +447,7 @@ func (r *SBDConfigReconciler) buildDaemonSet(sbdConfig *medik8sv1alpha1.SBDConfi
 }
 
 // updateStatus updates the SBDConfig status based on the DaemonSet state
-func (r *SBDConfigReconciler) updateStatus(ctx context.Context, sbdConfig *medik8sv1alpha1.SBDConfig, daemonSet *appsv1.DaemonSet) error {
+func (r *SBDConfigReconciler) updateStatus(ctx context.Context, sbdConfig *medik8sv1alpha1.SBDConfig, daemonSet *appsv1.DaemonSet, logger logr.Logger) error {
 	// Check if we need to fetch the latest DaemonSet status
 	latestDaemonSet := &appsv1.DaemonSet{}
 	err := r.Get(ctx, types.NamespacedName{
@@ -434,9 +478,21 @@ func mustParseQuantity(s string) resource.Quantity {
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *SBDConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	logger := mgr.GetLogger().WithName("setup").WithValues("controller", "SBDConfig")
+
+	logger.Info("Setting up SBDConfig controller")
+
+	err := ctrl.NewControllerManagedBy(mgr).
 		For(&medik8sv1alpha1.SBDConfig{}).
 		Owns(&appsv1.DaemonSet{}).
 		Named("sbdconfig").
 		Complete(r)
+
+	if err != nil {
+		logger.Error(err, "Failed to setup SBDConfig controller")
+		return err
+	}
+
+	logger.Info("SBDConfig controller setup completed successfully")
+	return nil
 }

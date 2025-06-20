@@ -21,7 +21,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -31,8 +30,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/go-logr/logr"
+	"github.com/go-logr/zapr"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 
 	"github.com/medik8s/sbd-operator/pkg/blockdevice"
 	"github.com/medik8s/sbd-operator/pkg/sbdprotocol"
@@ -61,6 +64,52 @@ const (
 	// DefaultNodeID is the placeholder node ID used when none is specified
 	DefaultNodeID = 1
 )
+
+// Global logger instance
+var logger logr.Logger
+
+// initializeLogger initializes the structured logger with the specified log level
+func initializeLogger(level string) error {
+	// Parse log level
+	var zapLevel zapcore.Level
+	switch level {
+	case "debug":
+		zapLevel = zapcore.DebugLevel
+	case "info":
+		zapLevel = zapcore.InfoLevel
+	case "warn", "warning":
+		zapLevel = zapcore.WarnLevel
+	case "error":
+		zapLevel = zapcore.ErrorLevel
+	default:
+		return fmt.Errorf("invalid log level: %s (valid: debug, info, warn, error)", level)
+	}
+
+	// Create zap config
+	config := zap.NewProductionConfig()
+	config.Level = zap.NewAtomicLevelAt(zapLevel)
+	config.Development = false
+	config.Encoding = "json"
+	config.EncoderConfig.TimeKey = "timestamp"
+	config.EncoderConfig.LevelKey = "level"
+	config.EncoderConfig.MessageKey = "message"
+	config.EncoderConfig.CallerKey = "caller"
+	config.EncoderConfig.StacktraceKey = "stacktrace"
+	config.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+	config.EncoderConfig.EncodeLevel = zapcore.LowercaseLevelEncoder
+	config.EncoderConfig.EncodeCaller = zapcore.ShortCallerEncoder
+
+	// Build the logger
+	zapLogger, err := config.Build()
+	if err != nil {
+		return fmt.Errorf("failed to build logger: %w", err)
+	}
+
+	// Create logr logger from zap
+	logger = zapr.NewLogger(zapLogger)
+
+	return nil
+}
 
 // Prometheus metrics definitions
 var (
@@ -132,14 +181,16 @@ type PeerMonitor struct {
 	peersMutex        sync.RWMutex
 	sbdTimeoutSeconds uint
 	ownNodeID         uint16
+	logger            logr.Logger
 }
 
 // NewPeerMonitor creates a new peer monitor instance
-func NewPeerMonitor(sbdTimeoutSeconds uint, ownNodeID uint16) *PeerMonitor {
+func NewPeerMonitor(sbdTimeoutSeconds uint, ownNodeID uint16, logger logr.Logger) *PeerMonitor {
 	return &PeerMonitor{
 		peers:             make(map[uint16]*PeerStatus),
 		sbdTimeoutSeconds: sbdTimeoutSeconds,
 		ownNodeID:         ownNodeID,
+		logger:            logger.WithName("peer-monitor"),
 	}
 }
 
@@ -158,7 +209,10 @@ func (pm *PeerMonitor) UpdatePeer(nodeID uint16, timestamp, sequence uint64) {
 			IsHealthy: true,
 		}
 		pm.peers[nodeID] = peer
-		log.Printf("INFO: Discovered new peer node %d", nodeID)
+		pm.logger.Info("Discovered new peer node",
+			"nodeID", nodeID,
+			"timestamp", timestamp,
+			"sequence", sequence)
 	}
 
 	// Check if this is a newer heartbeat
@@ -182,9 +236,17 @@ func (pm *PeerMonitor) UpdatePeer(nodeID uint16, timestamp, sequence uint64) {
 
 		// Log status change
 		if !wasHealthy {
-			log.Printf("INFO: Peer node %d is now healthy (timestamp=%d, sequence=%d)", nodeID, timestamp, sequence)
+			pm.logger.Info("Peer node recovered to healthy status",
+				"nodeID", nodeID,
+				"timestamp", timestamp,
+				"sequence", sequence,
+				"lastSeen", peer.LastSeen)
 		} else {
-			log.Printf("DEBUG: Updated peer node %d heartbeat (timestamp=%d, sequence=%d)", nodeID, timestamp, sequence)
+			pm.logger.V(1).Info("Updated peer node heartbeat",
+				"nodeID", nodeID,
+				"timestamp", timestamp,
+				"sequence", sequence,
+				"lastSeen", peer.LastSeen)
 		}
 	}
 }
@@ -211,11 +273,18 @@ func (pm *PeerMonitor) CheckPeerLiveness() {
 
 		// Log status change
 		if wasHealthy && !peer.IsHealthy {
-			log.Printf("WARNING: Peer node %d is now unhealthy (last seen %v ago, timeout %v)",
-				nodeID, timeSinceLastSeen, timeout)
+			pm.logger.Error(nil, "Peer node became unhealthy",
+				"nodeID", nodeID,
+				"timeSinceLastSeen", timeSinceLastSeen,
+				"timeout", timeout,
+				"lastTimestamp", peer.LastTimestamp,
+				"lastSequence", peer.LastSequence)
 		} else if !wasHealthy && peer.IsHealthy {
-			log.Printf("INFO: Peer node %d is now healthy (last seen %v ago)",
-				nodeID, timeSinceLastSeen)
+			pm.logger.Info("Peer node recovered to healthy status",
+				"nodeID", nodeID,
+				"timeSinceLastSeen", timeSinceLastSeen,
+				"lastTimestamp", peer.LastTimestamp,
+				"lastSequence", peer.LastSequence)
 		}
 	}
 }
@@ -321,14 +390,14 @@ func NewSBDAgentWithWatchdog(wd WatchdogInterface, sbdDevicePath, nodeName strin
 		cancel:            cancel,
 		sbdHealthy:        false,
 		heartbeatSequence: 0,
-		peerMonitor:       NewPeerMonitor(sbdTimeoutSeconds, nodeID),
+		peerMonitor:       NewPeerMonitor(sbdTimeoutSeconds, nodeID, logger),
 		selfFenceDetected: false,
 		metricsPort:       metricsPort,
 	}
 
 	// Initialize Prometheus metrics
 	if err := agent.initMetrics(); err != nil {
-		log.Printf("WARNING: Failed to initialize metrics: %v", err)
+		logger.Error(err, "Failed to initialize metrics")
 	}
 
 	// Initialize SBD device if provided
@@ -365,9 +434,9 @@ func (s *SBDAgent) initMetrics() error {
 
 	// Start the metrics server in a goroutine
 	go func() {
-		log.Printf("Starting Prometheus metrics server on port %d", s.metricsPort)
+		logger.Info("Starting Prometheus metrics server", "port", s.metricsPort)
 		if err := s.metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("ERROR: Metrics server failed: %v", err)
+			logger.Error(err, "Metrics server failed", "port", s.metricsPort)
 		}
 	}()
 
@@ -386,7 +455,7 @@ func (s *SBDAgent) initializeSBDDevice() error {
 	}
 
 	s.sbdDevice = device
-	log.Printf("Successfully opened SBD device: %s", s.sbdDevicePath)
+	logger.Info("Successfully opened SBD device", "devicePath", s.sbdDevicePath)
 	return nil
 }
 
@@ -486,7 +555,10 @@ func (s *SBDAgent) writeHeartbeatToSBD() error {
 		return fmt.Errorf("failed to sync SBD device after heartbeat write: %w", err)
 	}
 
-	log.Printf("DEBUG: Successfully wrote heartbeat message (seq=%d) to slot %d", sequence, s.nodeID)
+	logger.V(1).Info("Successfully wrote heartbeat message",
+		"sequence", sequence,
+		"nodeID", s.nodeID,
+		"slotOffset", slotOffset)
 	return nil
 }
 
@@ -516,23 +588,32 @@ func (s *SBDAgent) readPeerHeartbeat(peerNodeID uint16) error {
 	header, err := sbdprotocol.Unmarshal(slotData[:sbdprotocol.SBD_HEADER_SIZE])
 	if err != nil {
 		// Don't log as error since empty slots are expected
-		log.Printf("DEBUG: Failed to unmarshal peer %d heartbeat: %v", peerNodeID, err)
+		logger.V(1).Info("Failed to unmarshal peer heartbeat",
+			"peerNodeID", peerNodeID,
+			"error", err)
 		return nil
 	}
 
 	// Validate the message
 	if !sbdprotocol.IsValidMessageType(header.Type) {
-		log.Printf("DEBUG: Invalid message type from peer %d: %d", peerNodeID, header.Type)
+		logger.V(1).Info("Invalid message type from peer",
+			"peerNodeID", peerNodeID,
+			"messageType", header.Type)
 		return nil
 	}
 
 	if header.Type != sbdprotocol.SBD_MSG_TYPE_HEARTBEAT {
-		log.Printf("DEBUG: Non-heartbeat message from peer %d: type %d", peerNodeID, header.Type)
+		logger.V(1).Info("Non-heartbeat message from peer",
+			"peerNodeID", peerNodeID,
+			"messageType", header.Type)
 		return nil
 	}
 
 	if header.NodeID != peerNodeID {
-		log.Printf("WARNING: NodeID mismatch in peer %d slot: expected %d, got %d", peerNodeID, peerNodeID, header.NodeID)
+		logger.Error(nil, "NodeID mismatch in peer slot",
+			"peerNodeID", peerNodeID,
+			"expected", peerNodeID,
+			"actual", header.NodeID)
 		return nil
 	}
 
@@ -543,15 +624,15 @@ func (s *SBDAgent) readPeerHeartbeat(peerNodeID uint16) error {
 
 // Start begins the SBD agent operations
 func (s *SBDAgent) Start() error {
-	log.Printf("Starting SBD Agent...")
-	log.Printf("Watchdog device: %s", s.watchdog.Path())
-	log.Printf("SBD device: %s", s.sbdDevicePath)
-	log.Printf("Node name: %s", s.nodeName)
-	log.Printf("Node ID: %d", s.nodeID)
-	log.Printf("Pet interval: %s", s.petInterval)
-	log.Printf("SBD update interval: %s", s.sbdUpdateInterval)
-	log.Printf("Heartbeat interval: %s", s.heartbeatInterval)
-	log.Printf("Peer check interval: %s", s.peerCheckInterval)
+	logger.Info("Starting SBD Agent",
+		"watchdogDevice", s.watchdog.Path(),
+		"sbdDevice", s.sbdDevicePath,
+		"nodeName", s.nodeName,
+		"nodeID", s.nodeID,
+		"petInterval", s.petInterval,
+		"sbdUpdateInterval", s.sbdUpdateInterval,
+		"heartbeatInterval", s.heartbeatInterval,
+		"peerCheckInterval", s.peerCheckInterval)
 
 	// Start the watchdog monitoring goroutine
 	go s.watchdogLoop()
@@ -563,13 +644,13 @@ func (s *SBDAgent) Start() error {
 		go s.peerMonitorLoop()
 	}
 
-	log.Printf("SBD Agent started successfully")
+	logger.Info("SBD Agent started successfully")
 	return nil
 }
 
 // Stop gracefully shuts down the SBD agent
 func (s *SBDAgent) Stop() error {
-	log.Printf("Stopping SBD Agent...")
+	logger.Info("Stopping SBD Agent")
 
 	// Cancel context to stop all goroutines
 	s.cancel()
@@ -579,25 +660,25 @@ func (s *SBDAgent) Stop() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := s.metricsServer.Shutdown(ctx); err != nil {
-			log.Printf("Error shutting down metrics server: %v", err)
+			logger.Error(err, "Error shutting down metrics server")
 		}
 	}
 
 	// Close SBD device
 	if s.sbdDevice != nil && !s.sbdDevice.IsClosed() {
 		if err := s.sbdDevice.Close(); err != nil {
-			log.Printf("Error closing SBD device: %v", err)
+			logger.Error(err, "Error closing SBD device", "devicePath", s.sbdDevicePath)
 		}
 	}
 
 	// Close watchdog device
 	if s.watchdog != nil {
 		if err := s.watchdog.Close(); err != nil {
-			log.Printf("Error closing watchdog: %v", err)
+			logger.Error(err, "Error closing watchdog", "watchdogPath", s.watchdog.Path())
 		}
 	}
 
-	log.Printf("SBD Agent stopped")
+	logger.Info("SBD Agent stopped")
 	return nil
 }
 
@@ -606,29 +687,29 @@ func (s *SBDAgent) watchdogLoop() {
 	ticker := time.NewTicker(s.petInterval)
 	defer ticker.Stop()
 
-	log.Printf("Starting watchdog loop with interval %s", s.petInterval)
+	logger.Info("Starting watchdog loop", "interval", s.petInterval)
 
 	for {
 		select {
 		case <-s.ctx.Done():
-			log.Printf("Watchdog loop stopping...")
+			logger.Info("Watchdog loop stopping")
 			return
 		case <-ticker.C:
 			// Never pet the watchdog if self-fence has been detected
 			if s.isSelfFenceDetected() {
-				log.Printf("CRITICAL: Self-fence detected - STOPPING watchdog petting to allow system reboot")
+				logger.Error(nil, "Self-fence detected - STOPPING watchdog petting to allow system reboot")
 				return
 			}
 
 			// Only pet the watchdog if SBD device is healthy (or not configured)
 			if s.sbdDevicePath == "" || s.isSBDHealthy() {
 				if err := s.watchdog.Pet(); err != nil {
-					log.Printf("ERROR: Failed to pet watchdog: %v", err)
+					logger.Error(err, "Failed to pet watchdog", "watchdogPath", s.watchdog.Path())
 					// Mark agent as unhealthy on watchdog failures
 					agentHealthyGauge.Set(0)
 					// Continue trying - don't exit on pet failure
 				} else {
-					log.Printf("DEBUG: Watchdog pet successful")
+					logger.V(1).Info("Watchdog pet successful", "watchdogPath", s.watchdog.Path())
 					// Increment successful watchdog pets counter
 					watchdogPetsCounter.Inc()
 					// Update agent health status based on SBD health
@@ -637,7 +718,9 @@ func (s *SBDAgent) watchdogLoop() {
 					}
 				}
 			} else {
-				log.Printf("WARNING: Skipping watchdog pet - SBD device is unhealthy")
+				logger.Error(nil, "Skipping watchdog pet - SBD device is unhealthy",
+					"sbdDevicePath", s.sbdDevicePath,
+					"sbdHealthy", s.isSBDHealthy())
 				// Mark agent as unhealthy when SBD device is unhealthy
 				agentHealthyGauge.Set(0)
 				// This will cause the system to reboot via watchdog timeout
@@ -652,16 +735,18 @@ func (s *SBDAgent) sbdDeviceLoop() {
 	ticker := time.NewTicker(s.sbdUpdateInterval)
 	defer ticker.Stop()
 
-	log.Printf("Starting SBD device loop with interval %s", s.sbdUpdateInterval)
+	logger.Info("Starting SBD device loop", "interval", s.sbdUpdateInterval)
 
 	for {
 		select {
 		case <-s.ctx.Done():
-			log.Printf("SBD device loop stopping...")
+			logger.Info("SBD device loop stopping")
 			return
 		case <-ticker.C:
 			if err := s.writeNodeIDToSBD(); err != nil {
-				log.Printf("ERROR: Failed to write node ID to SBD device: %v", err)
+				logger.Error(err, "Failed to write node ID to SBD device",
+					"devicePath", s.sbdDevicePath,
+					"nodeID", s.nodeID)
 				s.setSBDHealthy(false)
 				// Increment SBD I/O errors counter
 				sbdIOErrorsCounter.Inc()
@@ -671,11 +756,13 @@ func (s *SBDAgent) sbdDeviceLoop() {
 				// Try to reinitialize the device on next iteration
 				if s.sbdDevice != nil && !s.sbdDevice.IsClosed() {
 					if closeErr := s.sbdDevice.Close(); closeErr != nil {
-						log.Printf("ERROR: Failed to close SBD device: %v", closeErr)
+						logger.Error(closeErr, "Failed to close SBD device", "devicePath", s.sbdDevicePath)
 					}
 				}
 			} else {
-				log.Printf("DEBUG: Successfully updated SBD device with node ID")
+				logger.V(1).Info("Successfully updated SBD device with node ID",
+					"devicePath", s.sbdDevicePath,
+					"nodeID", s.nodeID)
 				s.setSBDHealthy(true)
 				// Update agent health status
 				agentHealthyGauge.Set(1)
@@ -689,16 +776,18 @@ func (s *SBDAgent) heartbeatLoop() {
 	ticker := time.NewTicker(s.heartbeatInterval)
 	defer ticker.Stop()
 
-	log.Printf("Starting SBD heartbeat loop with interval %s", s.heartbeatInterval)
+	logger.Info("Starting SBD heartbeat loop", "interval", s.heartbeatInterval)
 
 	for {
 		select {
 		case <-s.ctx.Done():
-			log.Printf("SBD heartbeat loop stopping...")
+			logger.Info("SBD heartbeat loop stopping")
 			return
 		case <-ticker.C:
 			if err := s.writeHeartbeatToSBD(); err != nil {
-				log.Printf("ERROR: Failed to write heartbeat to SBD device: %v", err)
+				logger.Error(err, "Failed to write heartbeat to SBD device",
+					"devicePath", s.sbdDevicePath,
+					"nodeID", s.nodeID)
 				s.setSBDHealthy(false)
 				// Increment SBD I/O errors counter
 				sbdIOErrorsCounter.Inc()
@@ -708,14 +797,15 @@ func (s *SBDAgent) heartbeatLoop() {
 				// Try to reinitialize the device on next iteration
 				if s.sbdDevice != nil && !s.sbdDevice.IsClosed() {
 					if closeErr := s.sbdDevice.Close(); closeErr != nil {
-						log.Printf("ERROR: Failed to close SBD device during heartbeat error: %v", closeErr)
+						logger.Error(closeErr, "Failed to close SBD device during heartbeat error",
+							"devicePath", s.sbdDevicePath)
 					}
 				}
 			} else {
 				// Only mark as healthy if it was previously unhealthy
 				// The regular SBD device loop will also update this
 				if !s.isSBDHealthy() {
-					log.Printf("DEBUG: SBD device recovered during heartbeat write")
+					logger.Info("SBD device recovered during heartbeat write", "devicePath", s.sbdDevicePath)
 					s.setSBDHealthy(true)
 					// Update agent health status
 					agentHealthyGauge.Set(1)
@@ -730,22 +820,22 @@ func (s *SBDAgent) peerMonitorLoop() {
 	ticker := time.NewTicker(s.peerCheckInterval)
 	defer ticker.Stop()
 
-	log.Printf("Starting peer monitor loop with interval %s", s.peerCheckInterval)
+	logger.Info("Starting peer monitor loop", "interval", s.peerCheckInterval)
 
 	for {
 		select {
 		case <-s.ctx.Done():
-			log.Printf("Peer monitor loop stopping...")
+			logger.Info("Peer monitor loop stopping")
 			return
 		case <-ticker.C:
 			// First, check our own slot for fence messages directed at us
 			if err := s.readOwnSlotForFenceMessage(); err != nil {
-				log.Printf("DEBUG: Error reading own slot for fence messages: %v", err)
+				logger.Info("Error reading own slot for fence messages", "error", err)
 			}
 
 			// If self-fence was detected, stop all operations
 			if s.isSelfFenceDetected() {
-				log.Printf("CRITICAL: Self-fence detected in peer monitor loop - stopping all operations")
+				logger.Error(nil, "Self-fence detected in peer monitor loop - stopping all operations")
 				return
 			}
 
@@ -757,7 +847,7 @@ func (s *SBDAgent) peerMonitorLoop() {
 				}
 
 				if err := s.readPeerHeartbeat(peerNodeID); err != nil {
-					log.Printf("DEBUG: Error reading peer %d heartbeat: %v", peerNodeID, err)
+					logger.Info("Error reading peer heartbeat", "peerNodeID", peerNodeID, "error", err)
 					// Continue with other peers even if one fails
 				}
 			}
@@ -767,7 +857,7 @@ func (s *SBDAgent) peerMonitorLoop() {
 
 			// Log cluster status periodically
 			healthyPeers := s.peerMonitor.GetHealthyPeerCount()
-			log.Printf("DEBUG: Cluster status: %d healthy peers", healthyPeers)
+			logger.Info("Cluster status", "healthyPeers", healthyPeers)
 		}
 	}
 }
@@ -786,7 +876,7 @@ func validateSBDDevice(devicePath string) error {
 
 	// Check if it's a block device
 	if info.Mode()&os.ModeDevice == 0 {
-		log.Printf("WARNING: %s is not a device file", devicePath)
+		logger.Info("WARNING: SBD device is not a device file", "devicePath", devicePath)
 	}
 
 	return nil
@@ -873,8 +963,11 @@ func (s *SBDAgent) setSelfFenceDetected(detected bool) {
 
 // executeSelfFencing performs the self-fencing action based on the configured method
 func (s *SBDAgent) executeSelfFencing(reason string) {
-	log.Printf("CRITICAL: Self-fencing initiated! Reason: %s", reason)
-	log.Printf("CRITICAL: Reboot method: %s", s.rebootMethod)
+	logger.Error(nil, "Self-fencing initiated",
+		"reason", reason,
+		"rebootMethod", s.rebootMethod,
+		"nodeID", s.nodeID,
+		"nodeName", s.nodeName)
 
 	// Increment self-fenced counter
 	selfFencedCounter.Inc()
@@ -889,16 +982,22 @@ func (s *SBDAgent) executeSelfFencing(reason string) {
 
 	switch s.rebootMethod {
 	case "systemctl-reboot":
-		log.Printf("CRITICAL: Attempting systemctl reboot...")
+		logger.Error(nil, "Attempting systemctl reboot for self-fencing",
+			"reason", reason,
+			"nodeID", s.nodeID)
 		if err := exec.Command("sudo", "systemctl", "reboot").Run(); err != nil {
-			log.Printf("ERROR: Failed to execute systemctl reboot: %v", err)
-			log.Printf("CRITICAL: Falling back to panic method")
+			logger.Error(err, "Failed to execute systemctl reboot, falling back to panic",
+				"reason", reason,
+				"nodeID", s.nodeID)
 			panic(fmt.Sprintf("Self-fencing via systemctl failed: %v", err))
 		}
 	case "panic":
 		fallthrough
 	default:
-		log.Printf("CRITICAL: Initiating panic for immediate self-fencing")
+		logger.Error(nil, "Initiating panic for immediate self-fencing",
+			"reason", reason,
+			"nodeID", s.nodeID,
+			"nodeName", s.nodeName)
 		panic(fmt.Sprintf("Self-fencing: %s", reason))
 	}
 }
@@ -927,7 +1026,9 @@ func (s *SBDAgent) readOwnSlotForFenceMessage() error {
 	header, err := sbdprotocol.Unmarshal(slotData[:sbdprotocol.SBD_HEADER_SIZE])
 	if err != nil {
 		// Not a valid message, could be empty slot or heartbeat we wrote
-		log.Printf("DEBUG: Failed to unmarshal message from own slot: %v", err)
+		logger.V(1).Info("Failed to unmarshal message from own slot",
+			"nodeID", s.nodeID,
+			"error", err)
 		return nil
 	}
 
@@ -936,7 +1037,8 @@ func (s *SBDAgent) readOwnSlotForFenceMessage() error {
 		// Try to unmarshal as a fence message to get the target
 		fenceMsg, err := sbdprotocol.UnmarshalFence(slotData[:sbdprotocol.SBD_HEADER_SIZE+3])
 		if err != nil {
-			log.Printf("WARNING: Failed to unmarshal fence message from own slot: %v", err)
+			logger.Error(err, "Failed to unmarshal fence message from own slot",
+				"nodeID", s.nodeID)
 			return nil
 		}
 
@@ -944,13 +1046,19 @@ func (s *SBDAgent) readOwnSlotForFenceMessage() error {
 		if fenceMsg.TargetNodeID == s.nodeID {
 			reason := fmt.Sprintf("Fence message received from node %d, reason: %s",
 				fenceMsg.Header.NodeID, sbdprotocol.GetFenceReasonName(fenceMsg.Reason))
-			log.Printf("CRITICAL: Fence message detected in own slot! %s", reason)
+			logger.Error(nil, "Fence message detected in own slot",
+				"reason", reason,
+				"sourceNodeID", fenceMsg.Header.NodeID,
+				"targetNodeID", fenceMsg.TargetNodeID,
+				"fenceReason", sbdprotocol.GetFenceReasonName(fenceMsg.Reason))
 
 			// Execute self-fencing immediately
 			s.executeSelfFencing(reason)
 		} else {
-			log.Printf("DEBUG: Fence message in own slot not directed at us (target: %d, us: %d)",
-				fenceMsg.TargetNodeID, s.nodeID)
+			logger.V(1).Info("Fence message in own slot not directed at us",
+				"targetNodeID", fenceMsg.TargetNodeID,
+				"ourNodeID", s.nodeID,
+				"sourceNodeID", fenceMsg.Header.NodeID)
 		}
 	}
 
@@ -960,53 +1068,72 @@ func (s *SBDAgent) readOwnSlotForFenceMessage() error {
 func main() {
 	flag.Parse()
 
-	log.Printf("SBD Agent starting...")
-	log.Printf("Version: development")
+	// Initialize structured logger first
+	if err := initializeLogger(*logLevel); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialize logger: %v\n", err)
+		os.Exit(1)
+	}
+
+	logger.Info("SBD Agent starting", "version", "development")
 
 	// Determine node name
 	nodeNameValue := *nodeName
 	if nodeNameValue == "" {
 		nodeNameValue = getNodeNameFromEnv()
 		if nodeNameValue == "" {
-			log.Fatalf("Node name must be specified via --node-name flag or NODE_NAME environment variable")
+			logger.Error(nil, "Node name must be specified via --node-name flag or NODE_NAME environment variable")
+			os.Exit(1)
 		}
-		log.Printf("Using node name from environment: %s", nodeNameValue)
+		logger.Info("Using node name from environment", "nodeName", nodeNameValue)
 	}
 
 	// Validate node name length
 	if len(nodeNameValue) > MaxNodeNameLength {
-		log.Fatalf("Node name too long: %d bytes (max %d)", len(nodeNameValue), MaxNodeNameLength)
+		logger.Error(nil, "Node name too long",
+			"nodeNameLength", len(nodeNameValue),
+			"maxLength", MaxNodeNameLength,
+			"nodeName", nodeNameValue)
+		os.Exit(1)
 	}
 
 	// Determine node ID
 	nodeIDValue := uint16(*nodeID)
 	if nodeIDValue == 0 {
 		nodeIDValue = getNodeIDFromEnv()
-		log.Printf("Using node ID from environment or default: %d", nodeIDValue)
+		logger.Info("Using node ID from environment or default", "nodeID", nodeIDValue)
 	}
 
 	// Validate node ID
 	if nodeIDValue < 1 || nodeIDValue > sbdprotocol.SBD_MAX_NODES {
-		log.Fatalf("Node ID must be between 1 and %d, got: %d", sbdprotocol.SBD_MAX_NODES, nodeIDValue)
+		logger.Error(nil, "Invalid node ID",
+			"nodeID", nodeIDValue,
+			"minNodeID", 1,
+			"maxNodeID", sbdprotocol.SBD_MAX_NODES)
+		os.Exit(1)
 	}
 
 	// Determine SBD timeout
 	sbdTimeoutValue := *sbdTimeoutSeconds
 	if sbdTimeoutValue == 30 { // Check if it's still the default
 		sbdTimeoutValue = getSBDTimeoutFromEnv()
-		log.Printf("Using SBD timeout from environment or default: %d seconds", sbdTimeoutValue)
+		logger.Info("Using SBD timeout from environment or default",
+			"sbdTimeoutSeconds", sbdTimeoutValue)
 	}
 
 	// Determine reboot method
 	rebootMethodValue := *rebootMethod
 	if rebootMethodValue == "panic" { // Check if it's still the default
 		rebootMethodValue = getRebootMethodFromEnv()
-		log.Printf("Using reboot method from environment or default: %s", rebootMethodValue)
+		logger.Info("Using reboot method from environment or default",
+			"rebootMethod", rebootMethodValue)
 	}
 
 	// Validate reboot method
 	if rebootMethodValue != "panic" && rebootMethodValue != "systemctl-reboot" {
-		log.Fatalf("Invalid reboot method: %s (must be 'panic' or 'systemctl-reboot')", rebootMethodValue)
+		logger.Error(nil, "Invalid reboot method",
+			"rebootMethod", rebootMethodValue,
+			"validMethods", []string{"panic", "systemctl-reboot"})
+		os.Exit(1)
 	}
 
 	// Calculate heartbeat interval (sbdTimeoutSeconds / 2)
@@ -1017,17 +1144,23 @@ func main() {
 
 	// Validate required parameters
 	if *sbdDevice == "" {
-		log.Printf("WARNING: No SBD device specified, running in watchdog-only mode")
+		logger.Error(nil, "No SBD device specified, running in watchdog-only mode")
 	} else {
 		if err := validateSBDDevice(*sbdDevice); err != nil {
-			log.Fatalf("SBD device validation failed: %v", err)
+			logger.Error(err, "SBD device validation failed", "sbdDevice", *sbdDevice)
+			os.Exit(1)
 		}
 	}
 
 	// Create SBD agent
 	agent, err := NewSBDAgent(*watchdogPath, *sbdDevice, nodeNameValue, nodeIDValue, *watchdogTimeout, *sbdUpdateInterval, heartbeatInterval, *peerCheckInterval, sbdTimeoutValue, rebootMethodValue, *metricsPort)
 	if err != nil {
-		log.Fatalf("Failed to create SBD agent: %v", err)
+		logger.Error(err, "Failed to create SBD agent",
+			"watchdogPath", *watchdogPath,
+			"sbdDevice", *sbdDevice,
+			"nodeName", nodeNameValue,
+			"nodeID", nodeIDValue)
+		os.Exit(1)
 	}
 
 	// Set up signal handling for graceful shutdown
@@ -1036,17 +1169,18 @@ func main() {
 
 	// Start the agent
 	if err := agent.Start(); err != nil {
-		log.Fatalf("Failed to start SBD agent: %v", err)
+		logger.Error(err, "Failed to start SBD agent")
+		os.Exit(1)
 	}
 
 	// Wait for shutdown signal
 	sig := <-sigChan
-	log.Printf("Received signal %s, shutting down...", sig)
+	logger.Info("Received shutdown signal", "signal", sig.String())
 
 	// Stop the agent
 	if err := agent.Stop(); err != nil {
-		log.Printf("Error during shutdown: %v", err)
+		logger.Error(err, "Error during shutdown")
 	}
 
-	log.Printf("SBD Agent shutdown complete")
+	logger.Info("SBD Agent shutdown complete")
 }

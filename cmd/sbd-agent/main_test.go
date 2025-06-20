@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/medik8s/sbd-operator/pkg/sbdprotocol"
 )
 
@@ -268,7 +269,8 @@ func (m *MockWatchdog) SetFailPet(fail bool) {
 
 // TestPeerMonitor tests the peer monitoring functionality
 func TestPeerMonitor(t *testing.T) {
-	monitor := NewPeerMonitor(30, 1)
+	logger := logr.Discard()
+	monitor := NewPeerMonitor(30, 1, logger)
 
 	// Initially no peers
 	if count := monitor.GetHealthyPeerCount(); count != 0 {
@@ -312,7 +314,8 @@ func TestPeerMonitor(t *testing.T) {
 }
 
 func TestPeerMonitor_Liveness(t *testing.T) {
-	monitor := NewPeerMonitor(1, 1) // 1 second timeout
+	logger := logr.Discard()
+	monitor := NewPeerMonitor(1, 1, logger) // 1 second timeout
 
 	// Update a peer
 	monitor.UpdatePeer(2, 1000, 1)
@@ -343,7 +346,8 @@ func TestPeerMonitor_Liveness(t *testing.T) {
 }
 
 func TestPeerMonitor_SequenceValidation(t *testing.T) {
-	monitor := NewPeerMonitor(30, 1)
+	logger := logr.Discard()
+	monitor := NewPeerMonitor(30, 1, logger)
 
 	// Update a peer with sequence 5
 	monitor.UpdatePeer(2, 1000, 5)
@@ -892,7 +896,8 @@ func BenchmarkSBDAgent_ReadPeerHeartbeat(b *testing.B) {
 }
 
 func BenchmarkPeerMonitor_UpdatePeer(b *testing.B) {
-	monitor := NewPeerMonitor(30, 1)
+	logger := logr.Discard()
+	monitor := NewPeerMonitor(30, 1, logger)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

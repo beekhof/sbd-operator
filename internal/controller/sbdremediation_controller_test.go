@@ -34,6 +34,7 @@ import (
 	medik8sv1alpha1 "github.com/medik8s/sbd-operator/api/v1alpha1"
 	"github.com/medik8s/sbd-operator/pkg/blockdevice"
 	"github.com/medik8s/sbd-operator/pkg/sbdprotocol"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // testableReconciler wraps SBDRemediationReconciler to make IsLeader mockable for testing
@@ -317,11 +318,12 @@ var _ = Describe("SBDRemediation Controller", func() {
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 
 				By("Performing multiple status updates with the same values")
-				result1, err1 := reconciler.updateStatusRobust(ctx, resource, medik8sv1alpha1.SBDRemediationPhasePending, "Test message")
+				logger := logf.Log.WithName("test")
+				result1, err1 := reconciler.updateStatusRobust(ctx, resource, medik8sv1alpha1.SBDRemediationPhasePending, "Test message", logger)
 				Expect(err1).NotTo(HaveOccurred())
 
 				// Second update with same values should be idempotent
-				result2, err2 := reconciler.updateStatusRobust(ctx, resource, medik8sv1alpha1.SBDRemediationPhasePending, "Test message")
+				result2, err2 := reconciler.updateStatusRobust(ctx, resource, medik8sv1alpha1.SBDRemediationPhasePending, "Test message", logger)
 				Expect(err2).NotTo(HaveOccurred())
 
 				// The second call should skip the actual update (idempotent behavior)
@@ -511,7 +513,8 @@ var _ = Describe("SBDRemediation Controller", func() {
 			os.Chmod(mockDevice, 0000)
 
 			// This should fail after retries
-			err := reconciler.performFencingWithRetry(ctx, sbdRemediation, 1)
+			logger := logf.Log.WithName("test")
+			err := reconciler.performFencingWithRetry(ctx, sbdRemediation, 1, logger)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("fencing failed after"))
 
@@ -537,7 +540,8 @@ var _ = Describe("SBDRemediation Controller", func() {
 			}
 
 			// This should succeed because we have a valid setup
-			err = reconciler.performFencingWithRetry(ctx, sbdRemediation, 1)
+			logger := logf.Log.WithName("test")
+			err = reconciler.performFencingWithRetry(ctx, sbdRemediation, 1, logger)
 			Expect(err).NotTo(HaveOccurred())
 		})
 	})

@@ -23,7 +23,7 @@ The SBD Agent is a containerized application that manages hardware watchdog devi
 
 ### Build Requirements
 
-- Go 1.22 or later
+- Go 1.24 or later
 - Docker or compatible container runtime
 - Make (optional, for using Makefile targets)
 
@@ -50,7 +50,7 @@ docker build -f Dockerfile.sbd-agent -t sbd-agent:latest .
 
 # Build with build arguments
 docker build -f Dockerfile.sbd-agent \
-  --build-arg GO_VERSION=1.22 \
+  --build-arg GO_VERSION=1.24 \
   -t sbd-agent:latest .
 ```
 

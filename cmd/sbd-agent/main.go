@@ -24,11 +24,13 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/medik8s/sbd-operator/pkg/blockdevice"
+	"github.com/medik8s/sbd-operator/pkg/sbdprotocol"
 	"github.com/medik8s/sbd-operator/pkg/watchdog"
 )
 
@@ -37,6 +39,8 @@ var (
 	watchdogTimeout   = flag.Duration("watchdog-timeout", 30*time.Second, "Watchdog pet interval")
 	sbdDevice         = flag.String("sbd-device", "", "Path to the SBD block device")
 	nodeName          = flag.String("node-name", "", "Name of this Kubernetes node")
+	nodeID            = flag.Uint("node-id", 0, "Unique numeric ID for this node (1-255)")
+	sbdTimeoutSeconds = flag.Uint("sbd-timeout-seconds", 30, "SBD timeout in seconds (determines heartbeat interval)")
 	sbdUpdateInterval = flag.Duration("sbd-update-interval", 5*time.Second, "Interval for updating SBD device with node status")
 	logLevel          = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 )
@@ -46,6 +50,8 @@ const (
 	SBDNodeIDOffset = 0
 	// MaxNodeNameLength is the maximum length for a node name in SBD device
 	MaxNodeNameLength = 256
+	// DefaultNodeID is the placeholder node ID used when none is specified
+	DefaultNodeID = 1
 )
 
 // BlockDevice defines the interface for block device operations
@@ -71,38 +77,45 @@ type SBDAgent struct {
 	sbdDevice         BlockDevice
 	sbdDevicePath     string
 	nodeName          string
+	nodeID            uint16
 	petInterval       time.Duration
 	sbdUpdateInterval time.Duration
+	heartbeatInterval time.Duration
 	ctx               context.Context
 	cancel            context.CancelFunc
 	sbdHealthy        bool
 	sbdHealthyMutex   sync.RWMutex
+	heartbeatSequence uint64
+	heartbeatSeqMutex sync.Mutex
 }
 
 // NewSBDAgent creates a new SBD agent instance
-func NewSBDAgent(watchdogPath, sbdDevicePath, nodeName string, petInterval, sbdUpdateInterval time.Duration) (*SBDAgent, error) {
+func NewSBDAgent(watchdogPath, sbdDevicePath, nodeName string, nodeID uint16, petInterval, sbdUpdateInterval, heartbeatInterval time.Duration) (*SBDAgent, error) {
 	// Initialize watchdog
 	wd, err := watchdog.New(watchdogPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize watchdog: %w", err)
 	}
 
-	return NewSBDAgentWithWatchdog(wd, sbdDevicePath, nodeName, petInterval, sbdUpdateInterval)
+	return NewSBDAgentWithWatchdog(wd, sbdDevicePath, nodeName, nodeID, petInterval, sbdUpdateInterval, heartbeatInterval)
 }
 
 // NewSBDAgentWithWatchdog creates a new SBD agent instance with a custom watchdog (for testing)
-func NewSBDAgentWithWatchdog(wd WatchdogInterface, sbdDevicePath, nodeName string, petInterval, sbdUpdateInterval time.Duration) (*SBDAgent, error) {
+func NewSBDAgentWithWatchdog(wd WatchdogInterface, sbdDevicePath, nodeName string, nodeID uint16, petInterval, sbdUpdateInterval, heartbeatInterval time.Duration) (*SBDAgent, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	agent := &SBDAgent{
 		watchdog:          wd,
 		sbdDevicePath:     sbdDevicePath,
 		nodeName:          nodeName,
+		nodeID:            nodeID,
 		petInterval:       petInterval,
 		sbdUpdateInterval: sbdUpdateInterval,
+		heartbeatInterval: heartbeatInterval,
 		ctx:               ctx,
 		cancel:            cancel,
 		sbdHealthy:        true, // Start assuming healthy
+		heartbeatSequence: 0,
 	}
 
 	// Initialize SBD device if specified
@@ -151,6 +164,14 @@ func (s *SBDAgent) isSBDHealthy() bool {
 	return s.sbdHealthy
 }
 
+// getNextHeartbeatSequence safely increments and returns the next sequence number
+func (s *SBDAgent) getNextHeartbeatSequence() uint64 {
+	s.heartbeatSeqMutex.Lock()
+	defer s.heartbeatSeqMutex.Unlock()
+	s.heartbeatSequence++
+	return s.heartbeatSequence
+}
+
 // writeNodeIDToSBD writes the node name to the SBD device at the predefined offset
 func (s *SBDAgent) writeNodeIDToSBD() error {
 	if s.sbdDevice == nil || s.sbdDevice.IsClosed() {
@@ -182,14 +203,58 @@ func (s *SBDAgent) writeNodeIDToSBD() error {
 	return nil
 }
 
+// writeHeartbeatToSBD writes a heartbeat message to the node's designated slot
+func (s *SBDAgent) writeHeartbeatToSBD() error {
+	if s.sbdDevice == nil || s.sbdDevice.IsClosed() {
+		// Try to reinitialize the device
+		if err := s.initializeSBDDevice(); err != nil {
+			return fmt.Errorf("SBD device is closed and reinitialize failed: %w", err)
+		}
+	}
+
+	// Create heartbeat message
+	sequence := s.getNextHeartbeatSequence()
+	heartbeatHeader := sbdprotocol.NewHeartbeat(s.nodeID, sequence)
+	heartbeatMsg := sbdprotocol.SBDHeartbeatMessage{Header: heartbeatHeader}
+
+	// Marshal the message
+	msgBytes, err := sbdprotocol.MarshalHeartbeat(heartbeatMsg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal heartbeat message: %w", err)
+	}
+
+	// Calculate slot offset for this node (NodeID * SBD_SLOT_SIZE)
+	slotOffset := int64(s.nodeID) * sbdprotocol.SBD_SLOT_SIZE
+
+	// Write heartbeat message to the designated slot
+	n, err := s.sbdDevice.WriteAt(msgBytes, slotOffset)
+	if err != nil {
+		return fmt.Errorf("failed to write heartbeat to SBD device at offset %d: %w", slotOffset, err)
+	}
+
+	if n != len(msgBytes) {
+		return fmt.Errorf("partial write to SBD device: wrote %d bytes, expected %d", n, len(msgBytes))
+	}
+
+	// Ensure data is committed to storage
+	if err := s.sbdDevice.Sync(); err != nil {
+		return fmt.Errorf("failed to sync SBD device after heartbeat write: %w", err)
+	}
+
+	log.Printf("DEBUG: Successfully wrote heartbeat message (seq=%d) to slot %d", sequence, s.nodeID)
+	return nil
+}
+
 // Start begins the SBD agent operations
 func (s *SBDAgent) Start() error {
 	log.Printf("Starting SBD Agent...")
 	log.Printf("Watchdog device: %s", s.watchdog.Path())
 	log.Printf("SBD device: %s", s.sbdDevicePath)
 	log.Printf("Node name: %s", s.nodeName)
+	log.Printf("Node ID: %d", s.nodeID)
 	log.Printf("Pet interval: %s", s.petInterval)
 	log.Printf("SBD update interval: %s", s.sbdUpdateInterval)
+	log.Printf("Heartbeat interval: %s", s.heartbeatInterval)
 
 	// Start the watchdog monitoring goroutine
 	go s.watchdogLoop()
@@ -197,6 +262,7 @@ func (s *SBDAgent) Start() error {
 	// Start SBD device monitoring if available
 	if s.sbdDevicePath != "" {
 		go s.sbdDeviceLoop()
+		go s.heartbeatLoop()
 	}
 
 	log.Printf("SBD Agent started successfully")
@@ -289,6 +355,41 @@ func (s *SBDAgent) sbdDeviceLoop() {
 	}
 }
 
+// heartbeatLoop continuously writes heartbeat messages to the SBD device
+func (s *SBDAgent) heartbeatLoop() {
+	ticker := time.NewTicker(s.heartbeatInterval)
+	defer ticker.Stop()
+
+	log.Printf("Starting SBD heartbeat loop with interval %s", s.heartbeatInterval)
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			log.Printf("SBD heartbeat loop stopping...")
+			return
+		case <-ticker.C:
+			if err := s.writeHeartbeatToSBD(); err != nil {
+				log.Printf("ERROR: Failed to write heartbeat to SBD device: %v", err)
+				s.setSBDHealthy(false)
+
+				// Try to reinitialize the device on next iteration
+				if s.sbdDevice != nil && !s.sbdDevice.IsClosed() {
+					if closeErr := s.sbdDevice.Close(); closeErr != nil {
+						log.Printf("ERROR: Failed to close SBD device during heartbeat error: %v", closeErr)
+					}
+				}
+			} else {
+				// Only mark as healthy if it was previously unhealthy
+				// The regular SBD device loop will also update this
+				if !s.isSBDHealthy() {
+					log.Printf("DEBUG: SBD device recovered during heartbeat write")
+					s.setSBDHealthy(true)
+				}
+			}
+		}
+	}
+}
+
 // validateSBDDevice checks if the SBD device is accessible
 func validateSBDDevice(devicePath string) error {
 	if devicePath == "" {
@@ -328,6 +429,37 @@ func getNodeNameFromEnv() string {
 	return ""
 }
 
+// getNodeIDFromEnv gets the node ID from environment variables if not provided via flag
+func getNodeIDFromEnv() uint16 {
+	// Try various environment variable names
+	envVars := []string{"SBD_NODE_ID", "NODE_ID"}
+
+	for _, envVar := range envVars {
+		if value := os.Getenv(envVar); value != "" {
+			if id, err := strconv.ParseUint(value, 10, 16); err == nil && id >= 1 && id <= sbdprotocol.SBD_MAX_NODES {
+				return uint16(id)
+			}
+		}
+	}
+
+	return DefaultNodeID
+}
+
+// getSBDTimeoutFromEnv gets the SBD timeout from environment variables if not provided via flag
+func getSBDTimeoutFromEnv() uint {
+	envVars := []string{"SBD_TIMEOUT_SECONDS", "SBD_TIMEOUT"}
+
+	for _, envVar := range envVars {
+		if value := os.Getenv(envVar); value != "" {
+			if timeout, err := strconv.ParseUint(value, 10, 32); err == nil && timeout > 0 {
+				return uint(timeout)
+			}
+		}
+	}
+
+	return 30 // Default timeout
+}
+
 func main() {
 	flag.Parse()
 
@@ -349,6 +481,31 @@ func main() {
 		log.Fatalf("Node name too long: %d bytes (max %d)", len(nodeNameValue), MaxNodeNameLength)
 	}
 
+	// Determine node ID
+	nodeIDValue := uint16(*nodeID)
+	if nodeIDValue == 0 {
+		nodeIDValue = getNodeIDFromEnv()
+		log.Printf("Using node ID from environment or default: %d", nodeIDValue)
+	}
+
+	// Validate node ID
+	if nodeIDValue < 1 || nodeIDValue > sbdprotocol.SBD_MAX_NODES {
+		log.Fatalf("Node ID must be between 1 and %d, got: %d", sbdprotocol.SBD_MAX_NODES, nodeIDValue)
+	}
+
+	// Determine SBD timeout
+	sbdTimeoutValue := *sbdTimeoutSeconds
+	if sbdTimeoutValue == 30 { // Check if it's still the default
+		sbdTimeoutValue = getSBDTimeoutFromEnv()
+		log.Printf("Using SBD timeout from environment or default: %d seconds", sbdTimeoutValue)
+	}
+
+	// Calculate heartbeat interval (sbdTimeoutSeconds / 2)
+	heartbeatInterval := time.Duration(sbdTimeoutValue/2) * time.Second
+	if heartbeatInterval < time.Second {
+		heartbeatInterval = time.Second // Minimum 1 second interval
+	}
+
 	// Validate required parameters
 	if *sbdDevice == "" {
 		log.Printf("WARNING: No SBD device specified, running in watchdog-only mode")
@@ -359,7 +516,7 @@ func main() {
 	}
 
 	// Create SBD agent
-	agent, err := NewSBDAgent(*watchdogPath, *sbdDevice, nodeNameValue, *watchdogTimeout, *sbdUpdateInterval)
+	agent, err := NewSBDAgent(*watchdogPath, *sbdDevice, nodeNameValue, nodeIDValue, *watchdogTimeout, *sbdUpdateInterval, heartbeatInterval)
 	if err != nil {
 		log.Fatalf("Failed to create SBD agent: %v", err)
 	}

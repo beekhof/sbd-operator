@@ -20,26 +20,79 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
+// SBDRemediationPhase represents the current phase of the remediation process
+type SBDRemediationPhase string
+
+const (
+	// SBDRemediationPhasePending indicates the remediation is waiting to be processed
+	SBDRemediationPhasePending SBDRemediationPhase = "Pending"
+	// SBDRemediationPhaseWaitingForLeadership indicates waiting for operator leadership
+	SBDRemediationPhaseWaitingForLeadership SBDRemediationPhase = "WaitingForLeadership"
+	// SBDRemediationPhaseFencingInProgress indicates the fencing operation is in progress
+	SBDRemediationPhaseFencingInProgress SBDRemediationPhase = "FencingInProgress"
+	// SBDRemediationPhaseFencedSuccessfully indicates the node was successfully fenced
+	SBDRemediationPhaseFencedSuccessfully SBDRemediationPhase = "FencedSuccessfully"
+	// SBDRemediationPhaseFailed indicates the remediation failed
+	SBDRemediationPhaseFailed SBDRemediationPhase = "Failed"
+)
+
+// SBDRemediationReason represents the reason for the current remediation state
+type SBDRemediationReason string
+
+const (
+	// SBDRemediationReasonHeartbeatTimeout indicates the node stopped sending heartbeats
+	SBDRemediationReasonHeartbeatTimeout SBDRemediationReason = "HeartbeatTimeout"
+	// SBDRemediationReasonNodeUnresponsive indicates the node is unresponsive
+	SBDRemediationReasonNodeUnresponsive SBDRemediationReason = "NodeUnresponsive"
+	// SBDRemediationReasonManualFencing indicates manual fencing was requested
+	SBDRemediationReasonManualFencing SBDRemediationReason = "ManualFencing"
+)
 
 // SBDRemediationSpec defines the desired state of SBDRemediation.
 type SBDRemediationSpec struct {
-	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
+	// NodeName is the name of the Kubernetes node to be fenced
+	// +kubebuilder:validation:Required
+	NodeName string `json:"nodeName"`
 
-	// Foo is an example field of SBDRemediation. Edit sbdremediation_types.go to remove/update
-	Foo string `json:"foo,omitempty"`
+	// Reason specifies why this node needs to be fenced
+	// +kubebuilder:validation:Enum=HeartbeatTimeout;NodeUnresponsive;ManualFencing
+	// +kubebuilder:default=NodeUnresponsive
+	Reason SBDRemediationReason `json:"reason,omitempty"`
+
+	// TimeoutSeconds specifies how long to wait before considering the fencing failed
+	// +kubebuilder:validation:Minimum=30
+	// +kubebuilder:validation:Maximum=300
+	// +kubebuilder:default=60
+	TimeoutSeconds int32 `json:"timeoutSeconds,omitempty"`
 }
 
 // SBDRemediationStatus defines the observed state of SBDRemediation.
 type SBDRemediationStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
+	// Phase indicates the current phase of the remediation process
+	Phase SBDRemediationPhase `json:"phase,omitempty"`
+
+	// Message provides a human-readable description of the current state
+	Message string `json:"message,omitempty"`
+
+	// LastUpdateTime is the time when this status was last updated
+	LastUpdateTime *metav1.Time `json:"lastUpdateTime,omitempty"`
+
+	// NodeID is the numeric ID assigned to the target node for SBD operations
+	NodeID *uint16 `json:"nodeID,omitempty"`
+
+	// FenceMessageWritten indicates if the fence message was successfully written to the SBD device
+	FenceMessageWritten bool `json:"fenceMessageWritten,omitempty"`
+
+	// OperatorInstance identifies which operator instance is handling this remediation
+	OperatorInstance string `json:"operatorInstance,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Node",type="string",JSONPath=".spec.nodeName"
+// +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase"
+// +kubebuilder:printcolumn:name="NodeID",type="integer",JSONPath=".status.nodeID"
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // SBDRemediation is the Schema for the sbdremediations API.
 type SBDRemediation struct {

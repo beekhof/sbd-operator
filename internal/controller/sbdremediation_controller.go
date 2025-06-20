@@ -19,9 +19,13 @@ package controller
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -35,6 +39,10 @@ import (
 
 const (
 	SBDRemediationFinalizer = "medik8s.io/sbd-remediation-finalizer"
+	// DefaultSBDDevicePath is the default path where the SBD device is mounted in the operator pod
+	DefaultSBDDevicePath = "/mnt/sbd-operator-device"
+	// OperatorNodeID is the node ID used by the operator when writing fence messages
+	OperatorNodeID = uint16(255)
 	// ReasonCompleted indicates the remediation was completed successfully
 	ReasonCompleted = "RemediationCompleted"
 	// ReasonInProgress indicates the remediation is in progress
@@ -53,7 +61,7 @@ type SBDRemediationReconciler struct {
 	// Leadership tracking - simple approach using environment variable or config
 	leaderElectionEnabled bool
 
-	// SBD device configuration - these would typically come from SBDConfig
+	// SBD device configuration
 	sbdDevicePath string
 	sbdDevice     *blockdevice.Device
 }
@@ -94,6 +102,44 @@ func (r *SBDRemediationReconciler) IsLeader() bool {
 	// leader election lease status. For now, we'll use a simple placeholder
 	// that assumes we're the leader (since we're participating in leader election)
 	return true
+}
+
+// nodeNameToNodeID converts a Kubernetes node name to a numeric node ID for SBD operations
+// This implements a simple mapping strategy: extract the numeric suffix from node names like "node-1", "worker-2", etc.
+// In production, this would likely come from SBDConfig or a more sophisticated mapping mechanism
+func (r *SBDRemediationReconciler) nodeNameToNodeID(nodeName string) (uint16, error) {
+	// Try to extract numeric suffix from node names like "node-1", "worker-2", "k8s-node-3", etc.
+	parts := strings.Split(nodeName, "-")
+	if len(parts) < 2 {
+		return 0, fmt.Errorf("unable to determine node ID from node name %q: expected format like 'node-1' or 'worker-2'", nodeName)
+	}
+
+	// Try the last part first (most common case)
+	lastPart := parts[len(parts)-1]
+	if nodeID, err := strconv.ParseUint(lastPart, 10, 16); err == nil && nodeID > 0 && nodeID < 255 {
+		return uint16(nodeID), nil
+	}
+
+	// If that fails, try other parts
+	for i := len(parts) - 2; i >= 0; i-- {
+		if nodeID, err := strconv.ParseUint(parts[i], 10, 16); err == nil && nodeID > 0 && nodeID < 255 {
+			return uint16(nodeID), nil
+		}
+	}
+
+	return 0, fmt.Errorf("unable to extract valid node ID from node name %q: no numeric part found in range 1-254", nodeName)
+}
+
+// getOperatorInstanceID returns a unique identifier for this operator instance
+func (r *SBDRemediationReconciler) getOperatorInstanceID() string {
+	// Use pod name if available, otherwise hostname
+	if podName := os.Getenv("POD_NAME"); podName != "" {
+		return podName
+	}
+	if hostname, err := os.Hostname(); err == nil {
+		return hostname
+	}
+	return "unknown-operator-instance"
 }
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
@@ -137,6 +183,12 @@ func (r *SBDRemediationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{Requeue: true}, nil
 	}
 
+	// Initialize status if empty
+	if sbdRemediation.Status.Phase == "" {
+		return r.updateStatus(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhasePending,
+			"SBD remediation request received and queued for processing")
+	}
+
 	/*
 	 * LEADERSHIP CHECK - CRITICAL FOR FENCING SAFETY
 	 *
@@ -147,36 +199,73 @@ func (r *SBDRemediationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	 */
 	if r.leaderElectionEnabled && !r.IsLeader() {
 		logger.Info("⏳ Not the leader - waiting for leadership to perform fencing operations")
-		r.updateStatus(ctx, &sbdRemediation, "Waiting", ReasonWaitingForLeadership,
+		return r.updateStatus(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseWaitingForLeadership,
 			"Waiting for operator instance to become leader before performing fencing operations")
-		// Requeue after a short delay to check leadership status
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
-	logger.Info("🎯 Processing SBDRemediation as leader", "target", sbdRemediation.Spec.Foo)
+	// Check if remediation is already completed or failed
+	switch sbdRemediation.Status.Phase {
+	case medik8sv1alpha1.SBDRemediationPhaseFencedSuccessfully:
+		logger.Info("✅ SBDRemediation already completed successfully")
+		return ctrl.Result{}, nil
+	case medik8sv1alpha1.SBDRemediationPhaseFailed:
+		logger.Info("❌ SBDRemediation previously failed")
+		return ctrl.Result{}, nil
+	}
+
+	logger.Info("🎯 Processing SBDRemediation as leader",
+		"target-node", sbdRemediation.Spec.NodeName,
+		"reason", sbdRemediation.Spec.Reason)
+
+	// Determine target node ID
+	targetNodeID, err := r.nodeNameToNodeID(sbdRemediation.Spec.NodeName)
+	if err != nil {
+		logger.Error(err, "Failed to determine node ID for target node", "node-name", sbdRemediation.Spec.NodeName)
+		return r.updateStatus(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseFailed,
+			fmt.Sprintf("Failed to determine node ID for node %q: %v", sbdRemediation.Spec.NodeName, err))
+	}
+
+	// Update status with node ID if not already set
+	if sbdRemediation.Status.NodeID == nil || *sbdRemediation.Status.NodeID != targetNodeID {
+		sbdRemediation.Status.NodeID = &targetNodeID
+		sbdRemediation.Status.OperatorInstance = r.getOperatorInstanceID()
+		if err := r.Status().Update(ctx, &sbdRemediation); err != nil {
+			logger.Error(err, "Failed to update status with node ID")
+			return ctrl.Result{}, err
+		}
+	}
 
 	// Initialize SBD device if not already done
 	if err := r.initializeSBDDevice(ctx); err != nil {
 		logger.Error(err, "Failed to initialize SBD device")
-		r.updateStatus(ctx, &sbdRemediation, "Failed", ReasonFailed,
+		return r.updateStatus(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseFailed,
 			fmt.Sprintf("Failed to initialize SBD device: %v", err))
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+	}
+
+	// Update status to indicate fencing is in progress
+	if sbdRemediation.Status.Phase != medik8sv1alpha1.SBDRemediationPhaseFencingInProgress {
+		if _, err := r.updateStatus(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseFencingInProgress,
+			fmt.Sprintf("Writing fence message for node %s (NodeID: %d) to SBD device", sbdRemediation.Spec.NodeName, targetNodeID)); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	// Perform the fencing operation
-	if err := r.performFencing(ctx, &sbdRemediation); err != nil {
+	if err := r.performFencing(ctx, &sbdRemediation, targetNodeID); err != nil {
 		logger.Error(err, "Failed to perform fencing operation")
-		r.updateStatus(ctx, &sbdRemediation, "Failed", ReasonFailed,
+		return r.updateStatus(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseFailed,
 			fmt.Sprintf("Fencing operation failed: %v", err))
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
 	}
 
 	// Mark as completed
-	r.updateStatus(ctx, &sbdRemediation, "Completed", ReasonCompleted,
-		"Fencing operation completed successfully")
+	_, err = r.updateStatus(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseFencedSuccessfully,
+		fmt.Sprintf("Successfully fenced node %s (NodeID: %d) - fence message written to SBD device",
+			sbdRemediation.Spec.NodeName, targetNodeID))
 
-	logger.Info("✅ SBDRemediation completed successfully")
-	return ctrl.Result{}, nil
+	logger.Info("✅ SBDRemediation completed successfully",
+		"target-node", sbdRemediation.Spec.NodeName,
+		"node-id", targetNodeID)
+	return ctrl.Result{}, err
 }
 
 // initializeSBDDevice initializes the SBD device connection if not already done
@@ -185,12 +274,14 @@ func (r *SBDRemediationReconciler) initializeSBDDevice(ctx context.Context) erro
 		return nil // Already initialized
 	}
 
-	// Get SBD configuration from SBDConfig resource
-	// For now, we'll use a placeholder - in a real implementation,
-	// this would fetch the actual SBDConfig resource
+	// Determine SBD device path
 	if r.sbdDevicePath == "" {
-		// This would typically come from environment variables or SBDConfig
-		r.sbdDevicePath = "/dev/sbd-shared" // Placeholder
+		// Check environment variable first
+		if envPath := os.Getenv("SBD_DEVICE_PATH"); envPath != "" {
+			r.sbdDevicePath = envPath
+		} else {
+			r.sbdDevicePath = DefaultSBDDevicePath
+		}
 	}
 
 	device, err := blockdevice.Open(r.sbdDevicePath)
@@ -203,27 +294,37 @@ func (r *SBDRemediationReconciler) initializeSBDDevice(ctx context.Context) erro
 }
 
 // performFencing performs the actual fencing operation by writing a fence message to the SBD device
-func (r *SBDRemediationReconciler) performFencing(ctx context.Context, sbdRemediation *medik8sv1alpha1.SBDRemediation) error {
+func (r *SBDRemediationReconciler) performFencing(ctx context.Context, sbdRemediation *medik8sv1alpha1.SBDRemediation, targetNodeID uint16) error {
 	logger := logf.FromContext(ctx)
 
-	// TODO: Parse target node information from SBDRemediation spec
-	// For now, using placeholder values
-	targetNodeID := uint16(1)   // This would come from spec
-	senderNodeID := uint16(255) // Operator node ID
+	// Convert reason to numeric value
+	var reasonCode uint8 = 1 // Default to generic fencing reason
+	switch sbdRemediation.Spec.Reason {
+	case medik8sv1alpha1.SBDRemediationReasonHeartbeatTimeout:
+		reasonCode = 2
+	case medik8sv1alpha1.SBDRemediationReasonNodeUnresponsive:
+		reasonCode = 3
+	case medik8sv1alpha1.SBDRemediationReasonManualFencing:
+		reasonCode = 4
+	}
+
+	senderNodeID := OperatorNodeID
 	sequence := uint64(time.Now().Unix())
-	reason := uint8(1) // Generic fencing reason
 
 	logger.Info("🔥 Writing fence message to SBD device",
+		"target-node-name", sbdRemediation.Spec.NodeName,
 		"target-node-id", targetNodeID,
 		"sender-node-id", senderNodeID,
-		"sequence", sequence)
+		"sequence", sequence,
+		"reason", sbdRemediation.Spec.Reason,
+		"reason-code", reasonCode)
 
 	// Create fence message
-	header := sbdprotocol.NewFence(senderNodeID, targetNodeID, sequence, reason)
+	header := sbdprotocol.NewFence(senderNodeID, targetNodeID, sequence, reasonCode)
 	fenceMessage := sbdprotocol.SBDFenceMessage{
 		Header:       header,
 		TargetNodeID: targetNodeID,
-		Reason:       reason,
+		Reason:       reasonCode,
 	}
 
 	// Marshal the fence message
@@ -240,9 +341,19 @@ func (r *SBDRemediationReconciler) performFencing(ctx context.Context, sbdRemedi
 		return fmt.Errorf("failed to write fence message to SBD device at offset %d: %w", slotOffset, err)
 	}
 
+	// Ensure data is synced to disk
+	if err := r.sbdDevice.Sync(); err != nil {
+		return fmt.Errorf("failed to sync fence message to SBD device: %w", err)
+	}
+
 	logger.Info("✅ Fence message successfully written to SBD device",
+		"target-node-name", sbdRemediation.Spec.NodeName,
 		"target-node-id", targetNodeID,
-		"slot-offset", slotOffset)
+		"slot-offset", slotOffset,
+		"message-size", len(messageBytes))
+
+	// Update the fence message written flag
+	sbdRemediation.Status.FenceMessageWritten = true
 
 	return nil
 }
@@ -252,6 +363,7 @@ func (r *SBDRemediationReconciler) handleDeletion(ctx context.Context, sbdRemedi
 	logger := logf.FromContext(ctx)
 
 	// Perform any cleanup if needed
+	// Note: SBD fence messages are usually persistent and we don't clear them on deletion
 	logger.Info("🗑️  Cleaning up SBDRemediation resource")
 
 	// Remove finalizer
@@ -266,15 +378,39 @@ func (r *SBDRemediationReconciler) handleDeletion(ctx context.Context, sbdRemedi
 
 // updateStatus updates the status of the SBDRemediation resource
 func (r *SBDRemediationReconciler) updateStatus(ctx context.Context, sbdRemediation *medik8sv1alpha1.SBDRemediation,
-	phase, reason, message string) {
+	phase medik8sv1alpha1.SBDRemediationPhase, message string) (ctrl.Result, error) {
 	logger := logf.FromContext(ctx)
 
-	// TODO: Update actual status fields when they're defined in the API
-	// For now, just log the status change
-	logger.Info("Status update", "phase", phase, "reason", reason, "message", message)
+	// Update status fields
+	sbdRemediation.Status.Phase = phase
+	sbdRemediation.Status.Message = message
+	now := metav1.Now()
+	sbdRemediation.Status.LastUpdateTime = &now
 
-	// In a real implementation, this would update sbdRemediation.Status fields
-	// and call r.Status().Update(ctx, sbdRemediation)
+	// Set operator instance if not already set
+	if sbdRemediation.Status.OperatorInstance == "" {
+		sbdRemediation.Status.OperatorInstance = r.getOperatorInstanceID()
+	}
+
+	// Update the status
+	if err := r.Status().Update(ctx, sbdRemediation); err != nil {
+		logger.Error(err, "Failed to update SBDRemediation status", "phase", phase, "message", message)
+		return ctrl.Result{}, err
+	}
+
+	logger.Info("Status updated", "phase", phase, "message", message)
+
+	// Requeue with delay if waiting for leadership
+	if phase == medik8sv1alpha1.SBDRemediationPhaseWaitingForLeadership {
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	// Requeue with delay if failed (for retry logic)
+	if phase == medik8sv1alpha1.SBDRemediationPhaseFailed {
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	return ctrl.Result{}, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

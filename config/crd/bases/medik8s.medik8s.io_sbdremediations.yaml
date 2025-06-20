@@ -14,7 +14,20 @@ spec:
     singular: sbdremediation
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .spec.nodeName
+      name: Node
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.nodeID
+      name: NodeID
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: SBDRemediation is the Schema for the sbdremediations API.
@@ -39,13 +52,56 @@ spec:
           spec:
             description: SBDRemediationSpec defines the desired state of SBDRemediation.
             properties:
-              foo:
-                description: Foo is an example field of SBDRemediation. Edit sbdremediation_types.go
-                  to remove/update
+              nodeName:
+                description: NodeName is the name of the Kubernetes node to be fenced
                 type: string
+              reason:
+                default: NodeUnresponsive
+                description: Reason specifies why this node needs to be fenced
+                enum:
+                - HeartbeatTimeout
+                - NodeUnresponsive
+                - ManualFencing
+                type: string
+              timeoutSeconds:
+                default: 60
+                description: TimeoutSeconds specifies how long to wait before considering
+                  the fencing failed
+                format: int32
+                maximum: 300
+                minimum: 30
+                type: integer
+            required:
+            - nodeName
             type: object
           status:
             description: SBDRemediationStatus defines the observed state of SBDRemediation.
+            properties:
+              fenceMessageWritten:
+                description: FenceMessageWritten indicates if the fence message was
+                  successfully written to the SBD device
+                type: boolean
+              lastUpdateTime:
+                description: LastUpdateTime is the time when this status was last
+                  updated
+                format: date-time
+                type: string
+              message:
+                description: Message provides a human-readable description of the
+                  current state
+                type: string
+              nodeID:
+                description: NodeID is the numeric ID assigned to the target node
+                  for SBD operations
+                type: integer
+              operatorInstance:
+                description: OperatorInstance identifies which operator instance is
+                  handling this remediation
+                type: string
+              phase:
+                description: Phase indicates the current phase of the remediation
+                  process
+                type: string
             type: object
         type: object
     served: true

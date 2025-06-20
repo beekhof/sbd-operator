@@ -5,5 +5,13 @@ metadata:
     app.kubernetes.io/name: sbd-operator
     app.kubernetes.io/managed-by: kustomize
   name: sbdremediation-sample
+  namespace: default
 spec:
-  # TODO(user): Add fields here
+  # Name of the Kubernetes node to be fenced
+  nodeName: "worker-1"
+  
+  # Reason for fencing (optional, defaults to NodeUnresponsive)
+  reason: HeartbeatTimeout
+  
+  # Timeout in seconds (optional, defaults to 60)
+  timeoutSeconds: 120

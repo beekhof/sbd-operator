@@ -1,13 +1,13 @@
 # ==============================================================================
 # Build Stage - Compile the SBD Agent Go application
 # ==============================================================================
-FROM golang:1.24-alpine AS builder
+FROM registry.access.redhat.com/ubi9/go-toolset:1.21 AS builder
 
 # Install build dependencies and certificates for HTTPS connections
-RUN apk add --no-cache git ca-certificates tzdata
+RUN microdnf install -y git ca-certificates tzdata
 
 # Create a non-root user for the build process
-RUN adduser -D -g '' appuser
+RUN useradd -r -g '' appuser
 
 # Set the working directory inside the container
 WORKDIR /build
@@ -42,12 +42,12 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
 # ==============================================================================
 # Runtime Stage - Minimal container for running the SBD Agent
 # ==============================================================================
-FROM alpine:3.18
+FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
 
 # Install runtime dependencies
 # - ca-certificates: For HTTPS connections
 # - util-linux: Provides device utilities that might be needed
-RUN apk --no-cache add ca-certificates util-linux
+RUN microdnf install -y ca-certificates util-linux && microdnf clean all
 
 # Import the user and group files from the builder stage
 # This ensures we have a non-root user available

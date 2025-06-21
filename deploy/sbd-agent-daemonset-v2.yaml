@@ -69,7 +69,7 @@ spec:
       # Init containers (if needed for setup)
       initContainers:
       - name: watchdog-check
-        image: alpine:3.18
+        image: registry.access.redhat.com/ubi9/ubi-minimal:latest
         command:
         - /bin/sh
         - -c

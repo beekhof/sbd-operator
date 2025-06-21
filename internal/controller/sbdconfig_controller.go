@@ -24,6 +24,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -47,12 +48,14 @@ const (
 	EventTypeWarning = "Warning"
 
 	// Event reasons for SBDConfig operations
-	ReasonSBDConfigReconciled = "SBDConfigReconciled"
-	ReasonDaemonSetManaged    = "DaemonSetManaged"
-	ReasonNamespaceCreated    = "NamespaceCreated"
-	ReasonReconcileError      = "ReconcileError"
-	ReasonDaemonSetError      = "DaemonSetError"
-	ReasonNamespaceError      = "NamespaceError"
+	ReasonSBDConfigReconciled   = "SBDConfigReconciled"
+	ReasonDaemonSetManaged      = "DaemonSetManaged"
+	ReasonNamespaceCreated      = "NamespaceCreated"
+	ReasonServiceAccountCreated = "ServiceAccountCreated"
+	ReasonReconcileError        = "ReconcileError"
+	ReasonDaemonSetError        = "DaemonSetError"
+	ReasonNamespaceError        = "NamespaceError"
+	ReasonServiceAccountError   = "ServiceAccountError"
 
 	// Retry configuration constants for SBDConfig controller
 	// MaxSBDConfigRetries is the maximum number of retry attempts for SBDConfig operations
@@ -151,6 +154,9 @@ func (r *SBDConfigReconciler) emitEventf(object client.Object, eventType, reason
 // +kubebuilder:rbac:groups=medik8s.medik8s.io,resources=sbdconfigs/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=daemonsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
@@ -234,6 +240,25 @@ func (r *SBDConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			"operation", "namespace-creation")
 		r.emitEventf(&sbdConfig, EventTypeWarning, ReasonNamespaceError,
 			"Failed to ensure namespace '%s' exists: %v", sbdConfig.Spec.Namespace, err)
+
+		// Return requeue with backoff for transient errors
+		if r.isTransientKubernetesError(err) {
+			return ctrl.Result{RequeueAfter: InitialSBDConfigRetryDelay}, err
+		}
+		return ctrl.Result{}, err
+	}
+
+	// Ensure the service account and RBAC resources exist with retry logic
+	err = r.performKubernetesAPIOperationWithRetry(ctx, "ensure service account", func() error {
+		return r.ensureServiceAccount(ctx, &sbdConfig, sbdConfig.Spec.Namespace, logger)
+	}, logger)
+
+	if err != nil {
+		logger.Error(err, "Failed to ensure service account exists after retries",
+			"namespace", sbdConfig.Spec.Namespace,
+			"operation", "serviceaccount-creation")
+		r.emitEventf(&sbdConfig, EventTypeWarning, ReasonServiceAccountError,
+			"Failed to ensure service account 'sbd-agent' exists in namespace '%s': %v", sbdConfig.Spec.Namespace, err)
 
 		// Return requeue with backoff for transient errors
 		if r.isTransientKubernetesError(err) {
@@ -358,6 +383,118 @@ func (r *SBDConfigReconciler) ensureNamespace(ctx context.Context, sbdConfig *me
 	}
 
 	return err
+}
+
+// ensureServiceAccount creates the service account and RBAC resources if they don't exist
+func (r *SBDConfigReconciler) ensureServiceAccount(ctx context.Context, sbdConfig *medik8sv1alpha1.SBDConfig, namespaceName string, logger logr.Logger) error {
+	// Create the service account
+	serviceAccount := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "sbd-agent",
+			Namespace: namespaceName,
+			Labels: map[string]string{
+				"app":                          "sbd-agent",
+				"app.kubernetes.io/name":       "sbd-agent",
+				"app.kubernetes.io/component":  "agent",
+				"app.kubernetes.io/part-of":    "sbd-operator",
+				"app.kubernetes.io/managed-by": "sbd-operator",
+			},
+		},
+	}
+
+	result, err := controllerutil.CreateOrUpdate(ctx, r.Client, serviceAccount, func() error {
+		// Set the controller reference
+		return controllerutil.SetControllerReference(sbdConfig, serviceAccount, r.Scheme)
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to create or update service account: %w", err)
+	}
+
+	if result == controllerutil.OperationResultCreated {
+		logger.Info("Service account created for SBD agent", "serviceAccount", "sbd-agent", "namespace", namespaceName)
+		r.emitEventf(sbdConfig, EventTypeNormal, ReasonServiceAccountCreated,
+			"Service account 'sbd-agent' created in namespace '%s'", namespaceName)
+	}
+
+	// Create the ClusterRole (cluster-scoped resource)
+	clusterRole := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: fmt.Sprintf("sbd-agent-%s", sbdConfig.Name),
+			Labels: map[string]string{
+				"app":                          "sbd-agent",
+				"app.kubernetes.io/name":       "sbd-agent",
+				"app.kubernetes.io/component":  "agent",
+				"app.kubernetes.io/part-of":    "sbd-operator",
+				"app.kubernetes.io/managed-by": "sbd-operator",
+				"sbdconfig":                    sbdConfig.Name,
+			},
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{""},
+				Resources: []string{"nodes"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{""},
+				Resources: []string{"pods"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{""},
+				Resources: []string{"events"},
+				Verbs:     []string{"get", "list", "watch", "create", "patch"},
+			},
+		},
+	}
+
+	result, err = controllerutil.CreateOrUpdate(ctx, r.Client, clusterRole, func() error {
+		// Set the controller reference
+		return controllerutil.SetControllerReference(sbdConfig, clusterRole, r.Scheme)
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to create or update cluster role: %w", err)
+	}
+
+	// Create the ClusterRoleBinding (cluster-scoped resource)
+	clusterRoleBinding := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: fmt.Sprintf("sbd-agent-%s", sbdConfig.Name),
+			Labels: map[string]string{
+				"app":                          "sbd-agent",
+				"app.kubernetes.io/name":       "sbd-agent",
+				"app.kubernetes.io/component":  "agent",
+				"app.kubernetes.io/part-of":    "sbd-operator",
+				"app.kubernetes.io/managed-by": "sbd-operator",
+				"sbdconfig":                    sbdConfig.Name,
+			},
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      "sbd-agent",
+				Namespace: namespaceName,
+			},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     fmt.Sprintf("sbd-agent-%s", sbdConfig.Name),
+		},
+	}
+
+	result, err = controllerutil.CreateOrUpdate(ctx, r.Client, clusterRoleBinding, func() error {
+		// Set the controller reference
+		return controllerutil.SetControllerReference(sbdConfig, clusterRoleBinding, r.Scheme)
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to create or update cluster role binding: %w", err)
+	}
+
+	return nil
 }
 
 // buildDaemonSet constructs the desired DaemonSet based on the SBDConfig

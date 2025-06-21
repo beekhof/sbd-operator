@@ -553,7 +553,7 @@ Modify the `SBDRemediation` controller's `Reconcile` method (`controllers/sbdrem
 - In `SBDRemediation` `Reconcile`:
     1.  Retrieve the `SBDRemediation` object.
     2.  Check if this operator instance is the leader (using the leader election status from Prompt 16). If not, log and requeue.
-    3.  If a `SBDRemediation` is found and its `status.phase` is not `FencedSuccessfully` or `Failed`:
+    3.  If a `SBDRemediation` is found and it has not completed successfully (not Ready=True with FencingSucceeded=True):
         - Determine the `NodeID` of the `remediation.Spec.NodeName`.
         - Create an `SBDFenceMessage` using `sbdprotocol.NewFence`.
         - Use the `blockdevice` package to open the shared SBD device at `/mnt/sbd-operator-device`.
@@ -574,9 +574,12 @@ Modify the `SBDRemediation` controller's `Reconcile` method (`controllers/sbdrem
 Enhance the `SBDRemediation` controller (`controllers/sbdremediation_controller.go`) to robustly update the `SBDRemediation` CR's `status` field.
 
 **Requirements:**
-- After a successful write of a fence message to the shared SBD PV, update the `SBDRemediation` `status.phase` to `FencedSuccessfully` and `status.message` to "Node successfully fenced via SBD."
+- After a successful write of a fence message to the shared SBD PV, update the `SBDRemediation` conditions:
+  - Set `FencingSucceeded=True` with reason "FencingCompleted" and message "Node successfully fenced via SBD."
+  - Set `Ready=True` with reason "Succeeded" and message "Fencing completed successfully."
 - If an error occurs during the fencing process (e.g., cannot open device, write error, checksum error from previous read):
-    - Update `status.phase` to `Failed`.
+    - Set `FencingSucceeded=False` with reason "FencingFailed" and appropriate error message
+    - Set `Ready=True` with reason "Failed" and error details
     - Update `status.message` with a detailed error description.
     - Implement retry logic (e.g., requeue with backoff) for transient errors before marking as `Failed`.
 - Use `client.Status().Update()` to persist status changes.

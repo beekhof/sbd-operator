@@ -134,6 +134,13 @@ type FencingError struct {
 	NodeID     uint16
 }
 
+// conditionUpdate represents an update to a condition
+type conditionUpdate struct {
+	status  metav1.ConditionStatus
+	reason  string
+	message string
+}
+
 func (e *FencingError) Error() string {
 	retryableStr := "non-retryable"
 	if e.Retryable {
@@ -336,7 +343,8 @@ func (r *SBDRemediationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		"sbdremediation.generation", sbdRemediation.Generation,
 		"sbdremediation.resourceVersion", sbdRemediation.ResourceVersion,
 		"spec.nodeName", sbdRemediation.Spec.NodeName,
-		"status.phase", sbdRemediation.Status.Phase,
+		"status.ready", sbdRemediation.IsReady(),
+		"status.fencingSucceeded", sbdRemediation.IsFencingSucceeded(),
 	)
 
 	logger.V(1).Info("Starting SBDRemediation reconciliation",
@@ -368,15 +376,15 @@ func (r *SBDRemediationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	// Emit initial event for remediation initiation
-	if sbdRemediation.Status.Phase == "" {
+	if len(sbdRemediation.Status.Conditions) == 0 {
 		r.emitEventf(&sbdRemediation, EventTypeNormal, ReasonRemediationInitiated,
 			"SBD remediation initiated for node '%s'", sbdRemediation.Spec.NodeName)
 	}
 
 	// Check if we already completed this remediation
-	if sbdRemediation.Status.Phase == medik8sv1alpha1.SBDRemediationPhaseFencedSuccessfully {
+	if sbdRemediation.IsFencingSucceeded() {
 		logger.Info("SBDRemediation already completed successfully",
-			"finalPhase", medik8sv1alpha1.SBDRemediationPhaseFencedSuccessfully,
+			"fencingSucceeded", true,
 			"status.nodeID", sbdRemediation.Status.NodeID)
 		return ctrl.Result{}, nil
 	}
@@ -388,8 +396,24 @@ func (r *SBDRemediationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			"isLeader", r.IsLeader())
 		r.emitEventf(&sbdRemediation, EventTypeNormal, ReasonLeadershipWaiting,
 			"Waiting for leadership to perform fencing for node '%s'", sbdRemediation.Spec.NodeName)
-		return r.updateStatusRobust(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseWaitingForLeadership,
-			"Waiting for operator leadership to perform fencing operations", logger)
+		return r.updateStatusWithConditions(ctx, &sbdRemediation, map[medik8sv1alpha1.SBDRemediationConditionType]conditionUpdate{
+			medik8sv1alpha1.SBDRemediationConditionLeadershipAcquired: {
+				status:  metav1.ConditionFalse,
+				reason:  "WaitingForLeadership",
+				message: "Waiting for operator leadership to perform fencing operations",
+			},
+			medik8sv1alpha1.SBDRemediationConditionReady: {
+				status:  metav1.ConditionFalse,
+				reason:  "WaitingForLeadership",
+				message: "Waiting for operator leadership to perform fencing operations",
+			},
+		}, logger)
+	}
+
+	// Mark leadership acquired
+	if !sbdRemediation.HasLeadership() {
+		sbdRemediation.SetCondition(medik8sv1alpha1.SBDRemediationConditionLeadershipAcquired,
+			metav1.ConditionTrue, "LeadershipAcquired", "Operator leadership acquired for fencing operations")
 	}
 
 	logger.Info("Leader confirmed - proceeding with fencing operations",
@@ -405,8 +429,18 @@ func (r *SBDRemediationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			"operation", "node-name-to-id-mapping")
 		r.emitEventf(&sbdRemediation, EventTypeWarning, ReasonNodeIDMappingError,
 			"Failed to map node name '%s' to node ID: %v", sbdRemediation.Spec.NodeName, err)
-		return r.updateStatusRobust(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseFailed,
-			fmt.Sprintf("Failed to map node name to node ID: %v", err), logger)
+		return r.updateStatusWithConditions(ctx, &sbdRemediation, map[medik8sv1alpha1.SBDRemediationConditionType]conditionUpdate{
+			medik8sv1alpha1.SBDRemediationConditionFencingSucceeded: {
+				status:  metav1.ConditionFalse,
+				reason:  "NodeIDMappingFailed",
+				message: fmt.Sprintf("Failed to map node name to node ID: %v", err),
+			},
+			medik8sv1alpha1.SBDRemediationConditionReady: {
+				status:  metav1.ConditionTrue,
+				reason:  "Failed",
+				message: fmt.Sprintf("Failed to map node name to node ID: %v", err),
+			},
+		}, logger)
 	}
 
 	logger = logger.WithValues("target.nodeID", targetNodeID)
@@ -419,24 +453,44 @@ func (r *SBDRemediationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 				"operation", "sbd-device-initialization")
 			r.emitEventf(&sbdRemediation, EventTypeWarning, ReasonSBDDeviceError,
 				"Failed to initialize SBD device for fencing node '%s': %v", sbdRemediation.Spec.NodeName, err)
-			return r.updateStatusRobust(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseFailed,
-				fmt.Sprintf("Failed to initialize SBD device: %v", err), logger)
+			return r.updateStatusWithConditions(ctx, &sbdRemediation, map[medik8sv1alpha1.SBDRemediationConditionType]conditionUpdate{
+				medik8sv1alpha1.SBDRemediationConditionFencingSucceeded: {
+					status:  metav1.ConditionFalse,
+					reason:  "SBDDeviceInitializationFailed",
+					message: fmt.Sprintf("Failed to initialize SBD device: %v", err),
+				},
+				medik8sv1alpha1.SBDRemediationConditionReady: {
+					status:  metav1.ConditionTrue,
+					reason:  "Failed",
+					message: fmt.Sprintf("Failed to initialize SBD device: %v", err),
+				},
+			}, logger)
 		}
 	}
 
 	// Update status to indicate fencing is in progress
-	if sbdRemediation.Status.Phase != medik8sv1alpha1.SBDRemediationPhaseFencingInProgress {
+	if !sbdRemediation.IsFencingInProgress() {
 		// Set NodeID in status before updating
 		sbdRemediation.Status.NodeID = &targetNodeID
 		sbdRemediation.Status.OperatorInstance = r.getOperatorInstanceID()
 
 		logger.Info("Updating status to fencing in progress",
-			"previousPhase", sbdRemediation.Status.Phase,
-			"newPhase", medik8sv1alpha1.SBDRemediationPhaseFencingInProgress,
+			"previousFencingInProgress", sbdRemediation.IsFencingInProgress(),
+			"newFencingInProgress", true,
 			"operatorInstance", sbdRemediation.Status.OperatorInstance)
 
-		if result, err := r.updateStatusRobust(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseFencingInProgress,
-			fmt.Sprintf("Initiating fencing for node %s (ID: %d)", sbdRemediation.Spec.NodeName, targetNodeID), logger); err != nil {
+		if result, err := r.updateStatusWithConditions(ctx, &sbdRemediation, map[medik8sv1alpha1.SBDRemediationConditionType]conditionUpdate{
+			medik8sv1alpha1.SBDRemediationConditionFencingInProgress: {
+				status:  metav1.ConditionTrue,
+				reason:  "FencingInitiated",
+				message: fmt.Sprintf("Initiating fencing for node %s (ID: %d)", sbdRemediation.Spec.NodeName, targetNodeID),
+			},
+			medik8sv1alpha1.SBDRemediationConditionReady: {
+				status:  metav1.ConditionFalse,
+				reason:  "FencingInProgress",
+				message: fmt.Sprintf("Fencing in progress for node %s (ID: %d)", sbdRemediation.Spec.NodeName, targetNodeID),
+			},
+		}, logger); err != nil {
 			return result, err
 		}
 
@@ -456,8 +510,23 @@ func (r *SBDRemediationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		r.emitEventf(&sbdRemediation, EventTypeWarning, ReasonFencingFailed,
 			"Failed to fence node '%s' via SBD: %s", sbdRemediation.Spec.NodeName, err.Error())
 
-		return r.updateStatusRobust(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseFailed,
-			fmt.Sprintf("Fencing failed: %v", err), logger)
+		return r.updateStatusWithConditions(ctx, &sbdRemediation, map[medik8sv1alpha1.SBDRemediationConditionType]conditionUpdate{
+			medik8sv1alpha1.SBDRemediationConditionFencingInProgress: {
+				status:  metav1.ConditionFalse,
+				reason:  "FencingFailed",
+				message: fmt.Sprintf("Fencing failed: %v", err),
+			},
+			medik8sv1alpha1.SBDRemediationConditionFencingSucceeded: {
+				status:  metav1.ConditionFalse,
+				reason:  "FencingFailed",
+				message: fmt.Sprintf("Fencing failed: %v", err),
+			},
+			medik8sv1alpha1.SBDRemediationConditionReady: {
+				status:  metav1.ConditionTrue,
+				reason:  "Failed",
+				message: fmt.Sprintf("Fencing failed: %v", err),
+			},
+		}, logger)
 	}
 
 	logger.Info("Successfully fenced node",
@@ -470,8 +539,23 @@ func (r *SBDRemediationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		"Node '%s' successfully fenced via SBD", sbdRemediation.Spec.NodeName)
 
 	// Update status to indicate successful fencing
-	return r.updateStatusRobust(ctx, &sbdRemediation, medik8sv1alpha1.SBDRemediationPhaseFencedSuccessfully,
-		fmt.Sprintf("Node %s (ID: %d) successfully fenced via SBD device", sbdRemediation.Spec.NodeName, targetNodeID), logger)
+	return r.updateStatusWithConditions(ctx, &sbdRemediation, map[medik8sv1alpha1.SBDRemediationConditionType]conditionUpdate{
+		medik8sv1alpha1.SBDRemediationConditionFencingInProgress: {
+			status:  metav1.ConditionFalse,
+			reason:  "FencingCompleted",
+			message: fmt.Sprintf("Node %s (ID: %d) successfully fenced via SBD device", sbdRemediation.Spec.NodeName, targetNodeID),
+		},
+		medik8sv1alpha1.SBDRemediationConditionFencingSucceeded: {
+			status:  metav1.ConditionTrue,
+			reason:  "FencingCompleted",
+			message: fmt.Sprintf("Node %s (ID: %d) successfully fenced via SBD device", sbdRemediation.Spec.NodeName, targetNodeID),
+		},
+		medik8sv1alpha1.SBDRemediationConditionReady: {
+			status:  metav1.ConditionTrue,
+			reason:  "Succeeded",
+			message: fmt.Sprintf("Node %s (ID: %d) successfully fenced via SBD device", sbdRemediation.Spec.NodeName, targetNodeID),
+		},
+	}, logger)
 }
 
 // initializeSBDDevice initializes the SBD device connection if not already done
@@ -678,18 +762,14 @@ func (r *SBDRemediationReconciler) handleDeletion(ctx context.Context, sbdRemedi
 	return ctrl.Result{}, nil
 }
 
-// updateStatusRobust updates the status of the SBDRemediation resource with robust error handling and retry logic
-func (r *SBDRemediationReconciler) updateStatusRobust(ctx context.Context, sbdRemediation *medik8sv1alpha1.SBDRemediation,
-	phase medik8sv1alpha1.SBDRemediationPhase, message string, logger logr.Logger) (ctrl.Result, error) {
-	// Check if status actually needs updating (idempotent)
-	if sbdRemediation.Status.Phase == phase && sbdRemediation.Status.Message == message {
-		logger.V(1).Info("Status already up to date, skipping update", "phase", phase)
-		return ctrl.Result{}, nil
+// updateStatusWithConditions updates the status of the SBDRemediation resource with conditions
+func (r *SBDRemediationReconciler) updateStatusWithConditions(ctx context.Context, sbdRemediation *medik8sv1alpha1.SBDRemediation, conditions map[medik8sv1alpha1.SBDRemediationConditionType]conditionUpdate, logger logr.Logger) (ctrl.Result, error) {
+	// Update conditions
+	for conditionType, update := range conditions {
+		sbdRemediation.SetCondition(conditionType, update.status, update.reason, update.message)
 	}
 
-	// Update status fields
-	sbdRemediation.Status.Phase = phase
-	sbdRemediation.Status.Message = message
+	// Update LastUpdateTime
 	now := metav1.Now()
 	sbdRemediation.Status.LastUpdateTime = &now
 
@@ -699,30 +779,28 @@ func (r *SBDRemediationReconciler) updateStatusRobust(ctx context.Context, sbdRe
 	}
 
 	// Update fence message written flag if we're marking as successfully fenced
-	if phase == medik8sv1alpha1.SBDRemediationPhaseFencedSuccessfully {
+	if sbdRemediation.IsFencingSucceeded() {
 		sbdRemediation.Status.FenceMessageWritten = true
 	}
 
 	// Update the status with retry logic
 	if err := r.updateStatusWithRetry(ctx, sbdRemediation); err != nil {
-		logger.Error(err, "Failed to update SBDRemediation status", "phase", phase, "message", message)
+		logger.Error(err, "Failed to update SBDRemediation status")
 		return ctrl.Result{RequeueAfter: InitialFencingRetryDelay}, err
 	}
 
-	logger.Info("Status updated successfully", "phase", phase, "message", message)
+	logger.Info("Status updated successfully")
 
-	// Determine requeue behavior based on phase
-	switch phase {
-	case medik8sv1alpha1.SBDRemediationPhaseWaitingForLeadership:
+	// Determine requeue behavior based on conditions
+	switch {
+	case sbdRemediation.IsConditionUnknown(medik8sv1alpha1.SBDRemediationConditionLeadershipAcquired) ||
+		sbdRemediation.IsConditionFalse(medik8sv1alpha1.SBDRemediationConditionLeadershipAcquired):
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-	case medik8sv1alpha1.SBDRemediationPhaseFailed:
-		// For failed status, we don't requeue automatically - manual intervention may be needed
-		return ctrl.Result{}, nil
-	case medik8sv1alpha1.SBDRemediationPhaseFencedSuccessfully:
-		// Success - no requeue needed
+	case sbdRemediation.IsReady():
+		// Ready means either succeeded or failed - no requeue needed
 		return ctrl.Result{}, nil
 	default:
-		// For other phases, requeue for continued processing
+		// For other states, requeue for continued processing
 		return ctrl.Result{Requeue: true}, nil
 	}
 }

@@ -20,20 +20,18 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// SBDRemediationPhase represents the current phase of the remediation process
-type SBDRemediationPhase string
+// SBDRemediationConditionType represents the type of condition for SBDRemediation
+type SBDRemediationConditionType string
 
 const (
-	// SBDRemediationPhasePending indicates the remediation is waiting to be processed
-	SBDRemediationPhasePending SBDRemediationPhase = "Pending"
-	// SBDRemediationPhaseWaitingForLeadership indicates waiting for operator leadership
-	SBDRemediationPhaseWaitingForLeadership SBDRemediationPhase = "WaitingForLeadership"
-	// SBDRemediationPhaseFencingInProgress indicates the fencing operation is in progress
-	SBDRemediationPhaseFencingInProgress SBDRemediationPhase = "FencingInProgress"
-	// SBDRemediationPhaseFencedSuccessfully indicates the node was successfully fenced
-	SBDRemediationPhaseFencedSuccessfully SBDRemediationPhase = "FencedSuccessfully"
-	// SBDRemediationPhaseFailed indicates the remediation failed
-	SBDRemediationPhaseFailed SBDRemediationPhase = "Failed"
+	// SBDRemediationConditionLeadershipAcquired indicates whether the operator has acquired leadership for fencing
+	SBDRemediationConditionLeadershipAcquired SBDRemediationConditionType = "LeadershipAcquired"
+	// SBDRemediationConditionFencingInProgress indicates whether fencing is currently in progress
+	SBDRemediationConditionFencingInProgress SBDRemediationConditionType = "FencingInProgress"
+	// SBDRemediationConditionFencingSucceeded indicates whether fencing completed successfully
+	SBDRemediationConditionFencingSucceeded SBDRemediationConditionType = "FencingSucceeded"
+	// SBDRemediationConditionReady indicates the overall readiness of the remediation
+	SBDRemediationConditionReady SBDRemediationConditionType = "Ready"
 )
 
 // SBDRemediationReason represents the reason for the current remediation state
@@ -68,11 +66,12 @@ type SBDRemediationSpec struct {
 
 // SBDRemediationStatus defines the observed state of SBDRemediation.
 type SBDRemediationStatus struct {
-	// Phase indicates the current phase of the remediation process
-	Phase SBDRemediationPhase `json:"phase,omitempty"`
-
-	// Message provides a human-readable description of the current state
-	Message string `json:"message,omitempty"`
+	// Conditions represent the latest available observations of the remediation's current state
+	// +patchMergeKey=type
+	// +patchStrategy=merge
+	// +listType=map
+	// +listMapKey=type
+	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
 
 	// LastUpdateTime is the time when this status was last updated
 	LastUpdateTime *metav1.Time `json:"lastUpdateTime,omitempty"`
@@ -90,7 +89,8 @@ type SBDRemediationStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Node",type="string",JSONPath=".spec.nodeName"
-// +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase"
+// +kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].status"
+// +kubebuilder:printcolumn:name="Fencing Succeeded",type="string",JSONPath=".status.conditions[?(@.type=='FencingSucceeded')].status"
 // +kubebuilder:printcolumn:name="NodeID",type="integer",JSONPath=".status.nodeID"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
@@ -114,4 +114,86 @@ type SBDRemediationList struct {
 
 func init() {
 	SchemeBuilder.Register(&SBDRemediation{}, &SBDRemediationList{})
+}
+
+// GetCondition returns the condition with the given type if it exists
+func (r *SBDRemediation) GetCondition(conditionType SBDRemediationConditionType) *metav1.Condition {
+	for i := range r.Status.Conditions {
+		if r.Status.Conditions[i].Type == string(conditionType) {
+			return &r.Status.Conditions[i]
+		}
+	}
+	return nil
+}
+
+// SetCondition sets the given condition on the SBDRemediation
+func (r *SBDRemediation) SetCondition(conditionType SBDRemediationConditionType, status metav1.ConditionStatus, reason, message string) {
+	now := metav1.Now()
+
+	// Find existing condition
+	for i := range r.Status.Conditions {
+		if r.Status.Conditions[i].Type == string(conditionType) {
+			// Update existing condition
+			condition := &r.Status.Conditions[i]
+
+			// Only update LastTransitionTime if status changed
+			if condition.Status != status {
+				condition.LastTransitionTime = now
+			}
+
+			condition.Status = status
+			condition.Reason = reason
+			condition.Message = message
+			condition.ObservedGeneration = r.Generation
+			return
+		}
+	}
+
+	// Add new condition
+	r.Status.Conditions = append(r.Status.Conditions, metav1.Condition{
+		Type:               string(conditionType),
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		LastTransitionTime: now,
+		ObservedGeneration: r.Generation,
+	})
+}
+
+// IsConditionTrue returns true if the condition is set to True
+func (r *SBDRemediation) IsConditionTrue(conditionType SBDRemediationConditionType) bool {
+	condition := r.GetCondition(conditionType)
+	return condition != nil && condition.Status == metav1.ConditionTrue
+}
+
+// IsConditionFalse returns true if the condition is set to False
+func (r *SBDRemediation) IsConditionFalse(conditionType SBDRemediationConditionType) bool {
+	condition := r.GetCondition(conditionType)
+	return condition != nil && condition.Status == metav1.ConditionFalse
+}
+
+// IsConditionUnknown returns true if the condition is set to Unknown or doesn't exist
+func (r *SBDRemediation) IsConditionUnknown(conditionType SBDRemediationConditionType) bool {
+	condition := r.GetCondition(conditionType)
+	return condition == nil || condition.Status == metav1.ConditionUnknown
+}
+
+// IsFencingSucceeded returns true if fencing has completed successfully
+func (r *SBDRemediation) IsFencingSucceeded() bool {
+	return r.IsConditionTrue(SBDRemediationConditionFencingSucceeded)
+}
+
+// IsFencingInProgress returns true if fencing is currently in progress
+func (r *SBDRemediation) IsFencingInProgress() bool {
+	return r.IsConditionTrue(SBDRemediationConditionFencingInProgress)
+}
+
+// IsReady returns true if the remediation is ready (either succeeded or failed)
+func (r *SBDRemediation) IsReady() bool {
+	return r.IsConditionTrue(SBDRemediationConditionReady)
+}
+
+// HasLeadership returns true if leadership has been acquired
+func (r *SBDRemediation) HasLeadership() bool {
+	return r.IsConditionTrue(SBDRemediationConditionLeadershipAcquired)
 }

@@ -193,7 +193,8 @@ func (r *SBDRemediationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		"sbdremediation.generation", sbdRemediation.Generation,
 		"sbdremediation.resourceVersion", sbdRemediation.ResourceVersion,
 		"spec.nodeName", sbdRemediation.Spec.NodeName,
-		"status.phase", sbdRemediation.Status.Phase,
+		"status.ready", sbdRemediation.IsReady(),
+		"status.fencingSucceeded", sbdRemediation.IsFencingSucceeded(),
 	)
 
 	logger.V(1).Info("Starting SBDRemediation reconciliation",
@@ -312,7 +313,9 @@ The SBD Operator uses the standard controller-runtime logging configuration thro
   "sbdremediation.name": "fence-worker-2",
   "sbdremediation.namespace": "default",
   "spec.nodeName": "worker-2",
-  "status.phase": "FencingInProgress",
+  "status.ready": false,
+  "status.fencingSucceeded": false,
+  "status.fencingInProgress": true,
   "nodeName": "worker-2",
   "isLeader": true,
   "operation": "fencing-initiation"

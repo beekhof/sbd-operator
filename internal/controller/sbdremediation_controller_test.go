@@ -183,7 +183,7 @@ var _ = Describe("SBDRemediation Controller", func() {
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 
 				By("Reconciling the resource multiple times to complete the workflow")
-				Eventually(func() medik8sv1alpha1.SBDRemediationPhase {
+				Eventually(func() bool {
 					_, err := reconciler.Reconcile(ctx, reconcile.Request{
 						NamespacedName: namespacedName,
 					})
@@ -194,15 +194,25 @@ var _ = Describe("SBDRemediation Controller", func() {
 					err = k8sClient.Get(ctx, namespacedName, updatedResource)
 					Expect(err).NotTo(HaveOccurred())
 
-					return updatedResource.Status.Phase
-				}, 10*time.Second, 100*time.Millisecond).Should(Equal(medik8sv1alpha1.SBDRemediationPhaseFencedSuccessfully))
+					return updatedResource.IsFencingSucceeded()
+				}, 10*time.Second, 100*time.Millisecond).Should(BeTrue())
 
 				By("Verifying the final resource status")
 				finalResource := &medik8sv1alpha1.SBDRemediation{}
 				Expect(k8sClient.Get(ctx, namespacedName, finalResource)).To(Succeed())
 
-				Expect(finalResource.Status.Phase).To(Equal(medik8sv1alpha1.SBDRemediationPhaseFencedSuccessfully))
-				Expect(finalResource.Status.Message).To(Equal("Node worker-5 (ID: 5) successfully fenced via SBD device"))
+				Expect(finalResource.IsFencingSucceeded()).To(BeTrue())
+				Expect(finalResource.IsReady()).To(BeTrue())
+				readyCondition := finalResource.GetCondition(medik8sv1alpha1.SBDRemediationConditionReady)
+				Expect(readyCondition).NotTo(BeNil())
+				Expect(readyCondition.Status).To(Equal(metav1.ConditionTrue))
+				Expect(readyCondition.Reason).To(Equal("Succeeded"))
+
+				fencingCondition := finalResource.GetCondition(medik8sv1alpha1.SBDRemediationConditionFencingSucceeded)
+				Expect(fencingCondition).NotTo(BeNil())
+				Expect(fencingCondition.Status).To(Equal(metav1.ConditionTrue))
+				Expect(fencingCondition.Message).To(Equal("Node worker-5 (ID: 5) successfully fenced via SBD device"))
+
 				Expect(finalResource.Status.NodeID).NotTo(BeNil())
 				Expect(*finalResource.Status.NodeID).To(Equal(uint16(5)))
 				Expect(finalResource.Status.FenceMessageWritten).To(BeTrue())
@@ -242,7 +252,7 @@ var _ = Describe("SBDRemediation Controller", func() {
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 
 				By("Reconciling the resource")
-				Eventually(func() medik8sv1alpha1.SBDRemediationPhase {
+				Eventually(func() bool {
 					_, err := reconciler.Reconcile(ctx, reconcile.Request{
 						NamespacedName: namespacedName,
 					})
@@ -252,15 +262,26 @@ var _ = Describe("SBDRemediation Controller", func() {
 					err = k8sClient.Get(ctx, namespacedName, updatedResource)
 					Expect(err).NotTo(HaveOccurred())
 
-					return updatedResource.Status.Phase
-				}, 5*time.Second, 100*time.Millisecond).Should(Equal(medik8sv1alpha1.SBDRemediationPhaseFailed))
+					return updatedResource.IsReady() && !updatedResource.IsFencingSucceeded()
+				}, 5*time.Second, 100*time.Millisecond).Should(BeTrue())
 
 				By("Verifying the resource failed with appropriate error")
 				updatedResource := &medik8sv1alpha1.SBDRemediation{}
 				Expect(k8sClient.Get(ctx, namespacedName, updatedResource)).To(Succeed())
 
-				Expect(updatedResource.Status.Phase).To(Equal(medik8sv1alpha1.SBDRemediationPhaseFailed))
-				Expect(updatedResource.Status.Message).To(ContainSubstring("Failed to map node name to node ID"))
+				Expect(updatedResource.IsReady()).To(BeTrue())
+				Expect(updatedResource.IsFencingSucceeded()).To(BeFalse())
+
+				readyCondition := updatedResource.GetCondition(medik8sv1alpha1.SBDRemediationConditionReady)
+				Expect(readyCondition).NotTo(BeNil())
+				Expect(readyCondition.Status).To(Equal(metav1.ConditionTrue))
+				Expect(readyCondition.Reason).To(Equal("Failed"))
+				Expect(readyCondition.Message).To(ContainSubstring("Failed to map node name to node ID"))
+
+				fencingCondition := updatedResource.GetCondition(medik8sv1alpha1.SBDRemediationConditionFencingSucceeded)
+				Expect(fencingCondition).NotTo(BeNil())
+				Expect(fencingCondition.Status).To(Equal(metav1.ConditionFalse))
+
 				Expect(updatedResource.Status.LastUpdateTime).NotTo(BeNil())
 			})
 
@@ -282,7 +303,7 @@ var _ = Describe("SBDRemediation Controller", func() {
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 
 				By("Reconciling the resource and expecting failure after retries")
-				Eventually(func() medik8sv1alpha1.SBDRemediationPhase {
+				Eventually(func() bool {
 					_, err := reconciler.Reconcile(ctx, reconcile.Request{
 						NamespacedName: namespacedName,
 					})
@@ -292,15 +313,21 @@ var _ = Describe("SBDRemediation Controller", func() {
 					err = k8sClient.Get(ctx, namespacedName, updatedResource)
 					Expect(err).NotTo(HaveOccurred())
 
-					return updatedResource.Status.Phase
-				}, 30*time.Second, 500*time.Millisecond).Should(Equal(medik8sv1alpha1.SBDRemediationPhaseFailed))
+					return updatedResource.IsReady() && !updatedResource.IsFencingSucceeded()
+				}, 30*time.Second, 500*time.Millisecond).Should(BeTrue())
 
 				By("Verifying the resource failed with device error")
 				updatedResource := &medik8sv1alpha1.SBDRemediation{}
 				Expect(k8sClient.Get(ctx, namespacedName, updatedResource)).To(Succeed())
 
-				Expect(updatedResource.Status.Phase).To(Equal(medik8sv1alpha1.SBDRemediationPhaseFailed))
-				Expect(updatedResource.Status.Message).To(ContainSubstring("Failed to initialize SBD device"))
+				Expect(updatedResource.IsReady()).To(BeTrue())
+				Expect(updatedResource.IsFencingSucceeded()).To(BeFalse())
+
+				readyCondition := updatedResource.GetCondition(medik8sv1alpha1.SBDRemediationConditionReady)
+				Expect(readyCondition).NotTo(BeNil())
+				Expect(readyCondition.Status).To(Equal(metav1.ConditionTrue))
+				Expect(readyCondition.Reason).To(Equal("Failed"))
+				Expect(readyCondition.Message).To(ContainSubstring("Failed to initialize SBD device"))
 			})
 
 			It("should handle status update idempotency correctly", func() {
@@ -319,11 +346,20 @@ var _ = Describe("SBDRemediation Controller", func() {
 
 				By("Performing multiple status updates with the same values")
 				logger := logf.Log.WithName("test")
-				result1, err1 := reconciler.updateStatusRobust(ctx, resource, medik8sv1alpha1.SBDRemediationPhasePending, "Test message", logger)
+
+				conditions := map[medik8sv1alpha1.SBDRemediationConditionType]conditionUpdate{
+					medik8sv1alpha1.SBDRemediationConditionReady: {
+						status:  metav1.ConditionFalse,
+						reason:  "TestReason",
+						message: "Test message",
+					},
+				}
+
+				result1, err1 := reconciler.updateStatusWithConditions(ctx, resource, conditions, logger)
 				Expect(err1).NotTo(HaveOccurred())
 
 				// Second update with same values should be idempotent
-				result2, err2 := reconciler.updateStatusRobust(ctx, resource, medik8sv1alpha1.SBDRemediationPhasePending, "Test message", logger)
+				result2, err2 := reconciler.updateStatusWithConditions(ctx, resource, conditions, logger)
 				Expect(err2).NotTo(HaveOccurred())
 
 				// The second call should skip the actual update (idempotent behavior)
@@ -335,8 +371,12 @@ var _ = Describe("SBDRemediation Controller", func() {
 				By("Verifying status was updated correctly")
 				updatedResource := &medik8sv1alpha1.SBDRemediation{}
 				Expect(k8sClient.Get(ctx, namespacedName, updatedResource)).To(Succeed())
-				Expect(updatedResource.Status.Phase).To(Equal(medik8sv1alpha1.SBDRemediationPhasePending))
-				Expect(updatedResource.Status.Message).To(Equal("Test message"))
+
+				readyCondition := updatedResource.GetCondition(medik8sv1alpha1.SBDRemediationConditionReady)
+				Expect(readyCondition).NotTo(BeNil())
+				Expect(readyCondition.Status).To(Equal(metav1.ConditionFalse))
+				Expect(readyCondition.Reason).To(Equal("TestReason"))
+				Expect(readyCondition.Message).To(Equal("Test message"))
 			})
 		})
 
@@ -365,7 +405,7 @@ var _ = Describe("SBDRemediation Controller", func() {
 				// Set testReconciler to return true for IsLeader
 				testReconciler.isLeaderFunc = func() bool { return true }
 
-				Eventually(func() medik8sv1alpha1.SBDRemediationPhase {
+				Eventually(func() bool {
 					_, err := testReconciler.Reconcile(ctx, reconcile.Request{
 						NamespacedName: namespacedName,
 					})
@@ -375,14 +415,17 @@ var _ = Describe("SBDRemediation Controller", func() {
 					err = k8sClient.Get(ctx, namespacedName, updatedResource)
 					Expect(err).NotTo(HaveOccurred())
 
-					return updatedResource.Status.Phase
-				}, 10*time.Second, 100*time.Millisecond).Should(Equal(medik8sv1alpha1.SBDRemediationPhaseFencedSuccessfully))
+					return updatedResource.IsFencingSucceeded()
+				}, 10*time.Second, 100*time.Millisecond).Should(BeTrue())
 
 				By("Verifying the resource was successfully fenced")
 				updatedResource := &medik8sv1alpha1.SBDRemediation{}
 				Expect(k8sClient.Get(ctx, namespacedName, updatedResource)).To(Succeed())
-				Expect(updatedResource.Status.Phase).To(Equal(medik8sv1alpha1.SBDRemediationPhaseFencedSuccessfully))
-				Expect(updatedResource.Status.Message).To(Equal("Node worker-7 (ID: 7) successfully fenced via SBD device"))
+				Expect(updatedResource.IsFencingSucceeded()).To(BeTrue())
+				Expect(updatedResource.IsReady()).To(BeTrue())
+				Expect(updatedResource.GetCondition(medik8sv1alpha1.SBDRemediationConditionFencingSucceeded)).NotTo(BeNil())
+				Expect(updatedResource.GetCondition(medik8sv1alpha1.SBDRemediationConditionFencingSucceeded).Status).To(Equal(metav1.ConditionTrue))
+				Expect(updatedResource.GetCondition(medik8sv1alpha1.SBDRemediationConditionFencingSucceeded).Message).To(Equal("Node worker-7 (ID: 7) successfully fenced via SBD device"))
 			})
 		})
 
@@ -450,8 +493,8 @@ var _ = Describe("SBDRemediation Controller", func() {
 					return k8sClient.Get(ctx, namespacedName, updatedResource)
 				}, 2*time.Second, 100*time.Millisecond).Should(Succeed())
 
-				updatedResource.Status.Phase = medik8sv1alpha1.SBDRemediationPhaseFencedSuccessfully
-				updatedResource.Status.Message = "Already completed"
+				updatedResource.SetCondition(medik8sv1alpha1.SBDRemediationConditionFencingSucceeded, metav1.ConditionTrue, "AlreadyCompleted", "Already completed")
+				updatedResource.SetCondition(medik8sv1alpha1.SBDRemediationConditionReady, metav1.ConditionTrue, "Succeeded", "Already completed")
 				Expect(k8sClient.Status().Update(ctx, updatedResource)).To(Succeed())
 
 				By("Reconciling the already completed resource")
@@ -464,8 +507,11 @@ var _ = Describe("SBDRemediation Controller", func() {
 				By("Verifying the resource status remains unchanged")
 				finalResource := &medik8sv1alpha1.SBDRemediation{}
 				Expect(k8sClient.Get(ctx, namespacedName, finalResource)).To(Succeed())
-				Expect(finalResource.Status.Phase).To(Equal(medik8sv1alpha1.SBDRemediationPhaseFencedSuccessfully))
-				Expect(finalResource.Status.Message).To(Equal("Already completed"))
+				Expect(finalResource.IsFencingSucceeded()).To(BeTrue())
+				Expect(finalResource.IsReady()).To(BeTrue())
+				Expect(finalResource.GetCondition(medik8sv1alpha1.SBDRemediationConditionFencingSucceeded)).NotTo(BeNil())
+				Expect(finalResource.GetCondition(medik8sv1alpha1.SBDRemediationConditionFencingSucceeded).Status).To(Equal(metav1.ConditionTrue))
+				Expect(finalResource.GetCondition(medik8sv1alpha1.SBDRemediationConditionFencingSucceeded).Message).To(Equal("Already completed"))
 			})
 		})
 	})

@@ -1,11 +1,12 @@
 # SBDRemediation Controller Status Updates Enhancement
 
-This document describes the enhanced status update functionality implemented in the SBDRemediation controller to provide robust, idempotent, and conflict-resistant status management.
+This document describes the enhanced status update functionality implemented in the SBDRemediation controller to provide robust, idempotent, and conflict-resistant status management using Kubernetes conditions.
 
 ## Overview
 
 The SBDRemediation controller has been enhanced with comprehensive status update capabilities that include:
 
+- **Conditions-based Status**: Uses Kubernetes-standard conditions instead of phases
 - **Robust Error Handling**: Proper distinction between retryable and non-retryable errors
 - **Retry Logic**: Exponential backoff for transient failures
 - **Idempotent Updates**: Avoid unnecessary API calls when status hasn't changed
@@ -14,25 +15,40 @@ The SBDRemediation controller has been enhanced with comprehensive status update
 
 ## Key Features
 
-### 1. Robust Status Updates (`updateStatusRobust`)
+### 1. Conditions-based Status Management
 
-The `updateStatusRobust` method provides comprehensive status update functionality:
+The SBDRemediation now uses standard Kubernetes conditions for status tracking:
 
 ```go
-func (r *SBDRemediationReconciler) updateStatusRobust(ctx context.Context, 
+type SBDRemediationConditionType string
+
+const (
+    SBDRemediationConditionLeadershipAcquired SBDRemediationConditionType = "LeadershipAcquired"
+    SBDRemediationConditionFencingInProgress  SBDRemediationConditionType = "FencingInProgress"
+    SBDRemediationConditionFencingSucceeded   SBDRemediationConditionType = "FencingSucceeded"
+    SBDRemediationConditionReady              SBDRemediationConditionType = "Ready"
+)
+```
+
+### 2. Robust Status Updates (`updateStatusWithConditions`)
+
+The `updateStatusWithConditions` method provides comprehensive status update functionality:
+
+```go
+func (r *SBDRemediationReconciler) updateStatusWithConditions(ctx context.Context, 
     sbdRemediation *medik8sv1alpha1.SBDRemediation, 
-    phase medik8sv1alpha1.SBDRemediationPhase, 
-    message string) (ctrl.Result, error)
+    conditions map[medik8sv1alpha1.SBDRemediationConditionType]conditionUpdate, 
+    logger logr.Logger) (ctrl.Result, error)
 ```
 
 **Features:**
-- **Idempotency**: Skips update if status already matches the desired state
-- **Automatic Timestamping**: Updates `LastUpdateTime` on every change
+- **Idempotency**: Skips update if conditions already match the desired state
+- **Automatic Timestamping**: Updates `LastTransitionTime` on condition changes
 - **Operator Instance Tracking**: Records which operator instance made the update
-- **Phase-based Requeuing**: Different requeue behavior based on the target phase
+- **Condition-based Requeuing**: Different requeue behavior based on the condition states
 - **Conflict Handling**: Uses retry logic to handle concurrent updates
 
-### 2. Conflict-Resistant Updates (`updateStatusWithRetry`)
+### 3. Conflict-Resistant Updates (`updateStatusWithRetry`)
 
 The `updateStatusWithRetry` method handles optimistic locking conflicts:
 
@@ -48,7 +64,7 @@ func (r *SBDRemediationReconciler) updateStatusWithRetry(ctx context.Context,
 - **Transient Error Handling**: Retries on server timeouts and rate limits
 - **Permanent Error Detection**: Stops retrying on non-recoverable errors
 
-### 3. Fencing Error Classification (`FencingError`)
+### 4. Fencing Error Classification (`FencingError`)
 
 Custom error type for comprehensive fencing operation error handling:
 
@@ -66,7 +82,7 @@ type FencingError struct {
 - **Retryable**: Device I/O errors, sync failures, network issues
 - **Non-retryable**: Marshaling errors, invalid configuration, permanent failures
 
-### 4. Retry Logic with Backoff (`performFencingWithRetry`)
+### 5. Retry Logic with Backoff (`performFencingWithRetry`)
 
 The fencing operation includes intelligent retry logic:
 
@@ -86,21 +102,21 @@ func (r *SBDRemediationReconciler) performFencingWithRetry(ctx context.Context,
 
 ### Success Path
 
-1. **Pending** → Resource created, waiting for processing
-2. **FencingInProgress** → Writing fence message to SBD device
-3. **FencedSuccessfully** → Fence message written and verified
+1. **LeadershipAcquired=True** → Operator has leadership for fencing
+2. **FencingInProgress=True** → Writing fence message to SBD device
+3. **FencingSucceeded=True** → Fence message written and verified
+4. **Ready=True** → Overall remediation completed successfully
 
 ### Error Handling
 
-1. **Node ID Mapping Error** → `Failed` (non-retryable)
-2. **SBD Device Access Error** → Retry up to 3 times → `Failed`
-3. **Write/Sync Error** → Retry up to 3 times → `Failed`
-4. **Leadership Wait** → `WaitingForLeadership` (requeue every 10s)
+1. **Node ID Mapping Error** → `FencingSucceeded=False`, `Ready=True` (failed)
+2. **SBD Device Access Error** → Retry up to 3 times → `FencingSucceeded=False`, `Ready=True`
+3. **Write/Sync Error** → Retry up to 3 times → `FencingSucceeded=False`, `Ready=True`
+4. **Leadership Wait** → `LeadershipAcquired=False`, `Ready=False` (requeue every 10s)
 
 ### Status Fields Updated
 
-- `Phase`: Current remediation state
-- `Message`: Human-readable status description
+- `Conditions`: Array of condition objects with type, status, reason, and message
 - `NodeID`: Numeric ID assigned to target node
 - `FenceMessageWritten`: Boolean flag for successful writes
 - `OperatorInstance`: Instance that handled the remediation
@@ -112,9 +128,10 @@ func (r *SBDRemediationReconciler) performFencingWithRetry(ctx context.Context,
 
 ```go
 const (
-    maxRetryAttempts = 3
-    baseRetryDelay   = 5 * time.Second
-    maxRetryDelay    = 30 * time.Second
+    MaxFencingRetries         = 5
+    InitialFencingRetryDelay  = 1 * time.Second
+    MaxFencingRetryDelay      = 30 * time.Second
+    FencingRetryBackoffFactor = 2.0
 )
 ```
 
@@ -122,33 +139,35 @@ const (
 
 ```go
 const (
-    maxStatusUpdateRetries = 5
-    statusUpdateDelay     = 100 * time.Millisecond
+    MaxStatusUpdateRetries    = 10
+    InitialStatusUpdateDelay  = 100 * time.Millisecond
+    MaxStatusUpdateDelay      = 5 * time.Second
+    StatusUpdateBackoffFactor = 1.5
 )
 ```
 
 ## Error Scenarios and Responses
 
-| Error Type | Retryable | Max Attempts | Final Status | Requeue Behavior |
-|------------|-----------|--------------|--------------|------------------|
-| Node ID mapping | No | 1 | Failed | No requeue |
-| SBD device open | Yes | 3 | Failed | No requeue after final failure |
-| Write/sync error | Yes | 3 | Failed | No requeue after final failure |
-| Marshaling error | No | 1 | Failed | No requeue |
-| Status update conflict | Yes | 5 | Varies | Retry with backoff |
-| Leadership unavailable | N/A | N/A | WaitingForLeadership | 10s requeue |
+| Error Type | Retryable | Max Attempts | Final Conditions | Requeue Behavior |
+|------------|-----------|--------------|------------------|------------------|
+| Node ID mapping | No | 1 | FencingSucceeded=False, Ready=True | No requeue |
+| SBD device open | Yes | 5 | FencingSucceeded=False, Ready=True | No requeue after final failure |
+| Write/sync error | Yes | 5 | FencingSucceeded=False, Ready=True | No requeue after final failure |
+| Marshaling error | No | 1 | FencingSucceeded=False, Ready=True | No requeue |
+| Status update conflict | Yes | 10 | Varies | Retry with backoff |
+| Leadership unavailable | N/A | N/A | LeadershipAcquired=False, Ready=False | 10s requeue |
 
 ## Integration Tests
 
 The enhanced controller includes comprehensive integration tests covering:
 
 ### Success Scenarios
-- **Complete fencing workflow**: Pending → FencingInProgress → FencedSuccessfully
+- **Complete fencing workflow**: All conditions properly set through success path
 - **Status field verification**: All status fields properly populated
 - **SBD device verification**: Fence message actually written to device
 
 ### Error Scenarios
-- **Invalid node names**: Proper error handling and status updates
+- **Invalid node names**: Proper error handling and condition updates
 - **Device access failures**: Retry logic and final failure handling
 - **Status update idempotency**: Multiple updates with same values
 
@@ -166,9 +185,20 @@ The enhanced controller includes comprehensive integration tests covering:
 ### Basic Status Update
 
 ```go
-result, err := r.updateStatusRobust(ctx, sbdRemediation, 
-    medik8sv1alpha1.SBDRemediationPhaseFencingInProgress,
-    "Writing fence message to SBD device")
+conditions := map[medik8sv1alpha1.SBDRemediationConditionType]conditionUpdate{
+    medik8sv1alpha1.SBDRemediationConditionFencingInProgress: {
+        status:  metav1.ConditionTrue,
+        reason:  "FencingInitiated",
+        message: "Writing fence message to SBD device",
+    },
+    medik8sv1alpha1.SBDRemediationConditionReady: {
+        status:  metav1.ConditionFalse,
+        reason:  "FencingInProgress",
+        message: "Fencing operation in progress",
+    },
+}
+
+result, err := r.updateStatusWithConditions(ctx, sbdRemediation, conditions, logger)
 if err != nil {
     return result, err
 }
@@ -186,19 +216,51 @@ if err := r.performFencingWithRetry(ctx, sbdRemediation, targetNodeID); err != n
         message = fmt.Sprintf("Fencing operation failed: %v", err)
     }
     
-    _, updateErr := r.updateStatusRobust(ctx, sbdRemediation, 
-        medik8sv1alpha1.SBDRemediationPhaseFailed, message)
+    conditions := map[medik8sv1alpha1.SBDRemediationConditionType]conditionUpdate{
+        medik8sv1alpha1.SBDRemediationConditionFencingSucceeded: {
+            status:  metav1.ConditionFalse,
+            reason:  "FencingFailed",
+            message: message,
+        },
+        medik8sv1alpha1.SBDRemediationConditionReady: {
+            status:  metav1.ConditionTrue,
+            reason:  "Failed",
+            message: message,
+        },
+    }
+    
+    _, updateErr := r.updateStatusWithConditions(ctx, sbdRemediation, conditions, logger)
     return ctrl.Result{}, updateErr
 }
 ```
 
+## Condition Helper Methods
+
+The SBDRemediation type includes several helper methods for working with conditions:
+
+```go
+// Check condition states
+remediation.IsFencingSucceeded()     // Returns true if FencingSucceeded=True
+remediation.IsFencingInProgress()    // Returns true if FencingInProgress=True
+remediation.IsReady()                // Returns true if Ready=True
+remediation.HasLeadership()          // Returns true if LeadershipAcquired=True
+
+// Get specific conditions
+condition := remediation.GetCondition(SBDRemediationConditionReady)
+
+// Set conditions
+remediation.SetCondition(SBDRemediationConditionReady, 
+    metav1.ConditionTrue, "Succeeded", "Fencing completed successfully")
+```
+
 ## Best Practices
 
-1. **Always use `updateStatusRobust`** for status updates instead of direct API calls
-2. **Classify errors properly** using `FencingError` for better retry behavior
-3. **Handle conflicts gracefully** by relying on the built-in retry mechanisms
-4. **Monitor requeue behavior** to avoid infinite loops
-5. **Use appropriate logging levels** for different scenarios
+1. **Always use `updateStatusWithConditions`** for status updates instead of direct API calls
+2. **Use appropriate condition types** for different states (leadership, progress, completion)
+3. **Classify errors properly** using `FencingError` for better retry behavior
+4. **Handle conflicts gracefully** by relying on the built-in retry mechanisms
+5. **Monitor requeue behavior** to avoid infinite loops
+6. **Use helper methods** for condition checking to maintain consistency
 
 ## Monitoring and Observability
 

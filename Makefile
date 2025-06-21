@@ -68,38 +68,74 @@ vet: ## Run go vet against code.
 test: manifests generate fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
-# TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
-# The default setup assumes CRC (CodeReady Containers) is installed and starts/uses the OpenShift cluster.
-# CertManager is installed by default; skip with:
-# - CERT_MANAGER_INSTALL_SKIP=true
+# E2E Test Configuration
+# The e2e tests recreate the CRC environment from scratch for each test run.
+# This ensures a clean, consistent testing environment.
+#
+# Environment Variables:
+# - E2E_CLEANUP_SKIP=true: Skip cleanup after tests (useful for debugging)
+# - CERT_MANAGER_INSTALL_SKIP=true: Skip CertManager installation
+# - QUAY_REGISTRY: Container registry (default: quay.io)
+# - QUAY_ORG: Container organization (default: medik8s)
+# - VERSION: Image version tag (default: latest)
+#
+# The setup-test-e2e target handles:
+# 1. Stopping and starting CRC cluster
+# 2. Building and loading container images
+# 3. Installing CRDs
+# 4. Deploying the operator
+# 5. Waiting for operator readiness
 CRC_CLUSTER ?= sbd-operator-test-e2e
 
 .PHONY: setup-test-e2e
-setup-test-e2e: ## Set up a CRC OpenShift cluster for e2e tests if it is not running
+setup-test-e2e: ## Recreate CRC environment and set up everything for e2e tests
 	@command -v crc >/dev/null 2>&1 || { \
 		echo "CRC is not installed. Please install CRC manually."; \
 		echo "Visit: https://developers.redhat.com/products/codeready-containers/download"; \
 		exit 1; \
 	}
-	@echo "Checking CRC status..."
-	@if ! crc status | grep -q "OpenShift.*Running"; then \
-		echo "CRC cluster is not running. Starting CRC..."; \
-		crc start; \
-	else \
-		echo "CRC cluster is already running"; \
-	fi
+	@echo "Recreating CRC environment for e2e tests..."
+	@echo "Stopping any existing CRC cluster..."
+	@crc stop || true
+	@echo "Starting fresh CRC cluster..."
+	@crc start
 	@echo "Setting up CRC environment..."
 	@eval $$(crc oc-env) && oc whoami || { \
 		echo "Failed to authenticate with CRC cluster"; \
 		exit 1; \
 	}
+	@echo "Building and loading container images..."
+	@$(MAKE) build-images
+	@echo "Loading images into CRC..."
+	@eval $$(crc podman-env) && \
+		docker save $(QUAY_OPERATOR_IMG):$(VERSION) | podman load && \
+		docker save $(QUAY_AGENT_IMG):$(VERSION) | podman load
+	@echo "Installing CRDs..."
+	@$(MAKE) install
+	@echo "Deploying operator to CRC..."
+	@eval $$(crc oc-env) && kubectl apply -k test/e2e/ --server-side=true
+	@echo "Waiting for operator to be ready..."
+	@eval $$(crc oc-env) && kubectl wait --for=condition=ready pod -l control-plane=controller-manager -n sbd-operator-system --timeout=120s || { \
+		echo "Operator failed to start, checking logs..."; \
+		kubectl logs -n sbd-operator-system -l control-plane=controller-manager --tail=20 || true; \
+		exit 1; \
+	}
+	@echo "E2E environment setup complete!"
 
 .PHONY: test-e2e
-test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests on CRC OpenShift cluster.
+test-e2e: setup-test-e2e ## Run the e2e tests on CRC OpenShift cluster (setup handled in setup-test-e2e).
 	@echo "Running e2e tests on CRC OpenShift cluster..."
 	@eval $$(crc oc-env) && \
 	QUAY_REGISTRY=$(QUAY_REGISTRY) QUAY_ORG=$(QUAY_ORG) VERSION=$(VERSION) \
-	go test ./test/e2e/ -v -ginkgo.v
+	go test ./test/e2e/ -v -ginkgo.v; \
+	TEST_EXIT_CODE=$$?; \
+	if [ "$(E2E_CLEANUP_SKIP)" != "true" ]; then \
+		echo "Cleaning up e2e environment (set E2E_CLEANUP_SKIP=true to skip)..."; \
+		$(MAKE) cleanup-test-e2e; \
+	else \
+		echo "Skipping cleanup (E2E_CLEANUP_SKIP=true)"; \
+	fi; \
+	exit $$TEST_EXIT_CODE
 
 .PHONY: test-e2e-crc
 test-e2e-crc: ## Run e2e tests specifically on CRC OpenShift cluster
@@ -123,7 +159,14 @@ test-e2e-kind: ## Run e2e tests on Kind Kubernetes cluster (legacy support)
 	kind delete cluster --name $(CRC_CLUSTER)
 
 .PHONY: cleanup-test-e2e
-cleanup-test-e2e: ## Stop the CRC OpenShift cluster used for e2e tests
+cleanup-test-e2e: ## Clean up e2e test environment and stop CRC cluster
+	@echo "Cleaning up e2e test environment..."
+	@eval $$(crc oc-env) && kubectl delete ns sbd-operator-system --ignore-not-found=true || true
+	@eval $$(crc oc-env) && kubectl delete ns sbd-system --ignore-not-found=true || true
+	@eval $$(crc oc-env) && kubectl delete sbdconfig --all --ignore-not-found=true || true
+	@eval $$(crc oc-env) && kubectl delete clusterrolebinding -l app.kubernetes.io/managed-by=sbd-operator --ignore-not-found=true || true
+	@eval $$(crc oc-env) && kubectl delete clusterrole -l app.kubernetes.io/managed-by=sbd-operator --ignore-not-found=true || true
+	@$(MAKE) uninstall || true
 	@echo "Stopping CRC cluster..."
 	@crc stop || true
 

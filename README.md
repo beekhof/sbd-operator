@@ -79,62 +79,63 @@ make build build-agent
 
 ### Prerequisites for CRC (OpenShift)
 
-The e2e tests now use **CRC (CodeReady Containers)** with OpenShift by default. To run the tests, you need:
+The e2e tests use **CRC (CodeReady Containers)** with OpenShift and **recreate the environment from scratch** for each test run. This ensures clean, consistent testing. You need:
 
 1. **Install CRC**: Download from [Red Hat Developers](https://developers.redhat.com/products/codeready-containers/download)
-2. **Setup CRC**: Follow the setup guide to configure CRC with appropriate resources
-3. **Start CRC**: Ensure CRC is running before running tests
+2. **Setup CRC**: Run `crc setup` once to configure CRC with appropriate resources
+3. **Available disk space**: Ensure sufficient disk space as CRC will be stopped/started
 
 ### Running E2E Tests
 
+The Makefile handles all setup automatically:
+
 ```bash
-# Run e2e tests on CRC OpenShift cluster (default)
+# Run complete e2e test suite (recreates CRC environment)
 make test-e2e
 
-# Explicitly run on CRC OpenShift
-make test-e2e-crc
+# Skip cleanup after tests (useful for debugging)
+E2E_CLEANUP_SKIP=true make test-e2e
 
-# Run on Kind Kubernetes (legacy support)
-make test-e2e-kind
-
-# Setup CRC cluster without running tests
-make setup-test-e2e
-
-# Stop CRC cluster after tests
-make cleanup-test-e2e
+# Run with custom image settings
+QUAY_REGISTRY=my-registry.io QUAY_ORG=myorg VERSION=dev make test-e2e
 ```
 
-### CRC Setup Commands
+### What the E2E Setup Does
+
+The `make test-e2e` command automatically:
+
+1. **Stops any existing CRC cluster**
+2. **Starts a fresh CRC cluster**
+3. **Builds operator and agent container images**
+4. **Loads images into CRC's container runtime**
+5. **Installs CRDs**
+6. **Deploys the operator**
+7. **Waits for operator readiness**
+8. **Runs the Go test suite**
+9. **Cleans up the environment** (unless `E2E_CLEANUP_SKIP=true`)
+
+### Manual Setup (Advanced)
+
+For development, you can run individual steps:
 
 ```bash
-# Initial CRC setup (one-time)
-crc setup
+# Setup CRC environment and deploy operator
+make setup-test-e2e
 
-# Start CRC cluster
-crc start
+# Run tests only (assumes setup is done)
+go test ./test/e2e/ -v -ginkgo.v
 
-# Check CRC status
-crc status
-
-# Stop CRC cluster
-crc stop
-
-# Get OpenShift console URL
-crc console --url
-
-# Get admin credentials
-crc console --credentials
+# Clean up everything
+make cleanup-test-e2e
 ```
 
 ### Environment Variables
 
-- `USE_CRC=true`: Force using CRC OpenShift cluster
-- `USE_CRC=false`: Force using Kind Kubernetes cluster  
+- `E2E_CLEANUP_SKIP=true`: Skip cleanup after tests (useful for debugging)
 - `CERT_MANAGER_INSTALL_SKIP=true`: Skip CertManager installation
-- `TEST_IMG`: Complete override for the test image name (e.g., `quay.io/myorg/sbd-operator:dev`)
-- `QUAY_REGISTRY`: Registry URL (defaults to `localhost:5000` for tests, `quay.io` for builds)
-- `QUAY_ORG`: Organization/namespace (defaults to `sbd-operator` for tests, `medik8s` for builds)
-- `VERSION`: Image version tag (defaults to `e2e-test` for tests, `latest` for builds)
+- `QUAY_REGISTRY`: Registry URL (default: `quay.io`)
+- `QUAY_ORG`: Organization/namespace (default: `medik8s`)
+- `VERSION`: Image version tag (default: `latest`)
 
 ### OpenShift vs Kubernetes Differences
 

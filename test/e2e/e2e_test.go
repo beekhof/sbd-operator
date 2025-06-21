@@ -46,101 +46,40 @@ const metricsRoleBindingName = "sbd-operator-metrics-binding"
 var _ = Describe("Manager", Ordered, func() {
 	var controllerPodName string
 
-	// Before running the tests, set up the environment by creating the namespace,
-	// enforce the restricted security policy to the namespace, installing CRDs,
-	// and deploying the controller.
+	// Verify the environment is set up correctly (setup handled by Makefile)
 	BeforeAll(func() {
-		By("creating manager namespace")
-		cmd := exec.Command("kubectl", "create", "ns", namespace)
+		By("verifying the controller-manager namespace exists")
+		cmd := exec.Command("kubectl", "get", "ns", namespace)
 		_, err := utils.Run(cmd)
-		if err != nil {
-			// Check if namespace already exists
-			cmd = exec.Command("kubectl", "get", "ns", namespace)
-			_, getErr := utils.Run(cmd)
-			if getErr != nil {
-				Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
-			}
-			// If namespace exists, clean it up first
-			By("cleaning up existing namespace")
-			cmd = exec.Command("kubectl", "delete", "all", "--all", "-n", namespace)
-			_, _ = utils.Run(cmd)
-		}
+		Expect(err).NotTo(HaveOccurred(), "Expected namespace to exist (should be created by Makefile setup)")
 
-		// Check if we're running on OpenShift (CRC)
-		isOpenShift := utils.IsCRCEnvironment() || os.Getenv("USE_CRC") == "true"
-
-		if isOpenShift {
-			By("configuring OpenShift security context constraints")
-			// For OpenShift, we need to use SecurityContextConstraints instead of Pod Security Standards
-			cmd = exec.Command("oc", "adm", "policy", "add-scc-to-group", "anyuid", "system:serviceaccounts:"+namespace)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to add anyuid SCC to namespace")
-		} else {
-			By("labeling the namespace to enforce the restricted security policy")
-			cmd = exec.Command("kubectl", "label", "--overwrite", "ns", namespace,
-				"pod-security.kubernetes.io/enforce=restricted")
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to label namespace with restricted policy")
-		}
-
-		By("installing CRDs")
-		cmd = exec.Command("make", "install")
+		By("verifying CRDs are installed")
+		cmd = exec.Command("kubectl", "get", "crd", "sbdconfigs.medik8s.medik8s.io")
 		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
+		Expect(err).NotTo(HaveOccurred(), "Expected CRDs to be installed (should be done by Makefile setup)")
 
-		By("deploying the controller-manager")
-		// Create a temporary kustomization for e2e testing with imagePullPolicy: Never
-		err = createE2EKustomization(projectImage)
-		Expect(err).NotTo(HaveOccurred(), "Failed to create e2e kustomization")
-
-		cmd = exec.Command("kubectl", "apply", "-k", "test/e2e/", "--server-side=true")
+		By("verifying the controller-manager is deployed")
+		cmd = exec.Command("kubectl", "get", "deployment", "sbd-operator-controller-manager", "-n", namespace)
 		_, err = utils.Run(cmd)
-		if err != nil {
-			// Fallback to standard deployment if custom fails
-			// Extract image components for environment variables
-			parts := strings.Split(projectImage, "/")
-			var registry, org, version string
-			if len(parts) >= 3 {
-				registry = parts[0]
-				org = parts[1]
-				imageVersion := strings.Split(parts[2], ":")
-				if len(imageVersion) > 1 {
-					version = imageVersion[1]
-				} else {
-					version = "latest"
-				}
-			}
-
-			// Set environment and run deploy with new variables
-			cmd = exec.Command("bash", "-c", fmt.Sprintf(
-				"QUAY_REGISTRY=%s QUAY_ORG=%s VERSION=%s make deploy",
-				registry, org, version))
-			_, err = utils.Run(cmd)
-		}
-		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
+		Expect(err).NotTo(HaveOccurred(), "Expected controller-manager to be deployed (should be done by Makefile setup)")
 	})
 
-	// After all tests have been executed, clean up by undeploying the controller, uninstalling CRDs,
-	// and deleting the namespace.
+	// Clean up test-specific resources (overall cleanup handled by Makefile)
 	AfterAll(func() {
 		By("cleaning up the curl pod for metrics")
-		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
+		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace, "--ignore-not-found=true")
 		_, _ = utils.Run(cmd)
 
 		By("cleaning up metrics ClusterRoleBinding")
 		cmd = exec.Command("kubectl", "delete", "clusterrolebinding", metricsRoleBindingName, "--ignore-not-found=true")
 		_, _ = utils.Run(cmd)
 
-		By("undeploying the controller-manager")
-		cmd = exec.Command("make", "undeploy")
+		By("cleaning up any test SBDConfigs")
+		cmd = exec.Command("kubectl", "delete", "sbdconfig", "--all", "--ignore-not-found=true")
 		_, _ = utils.Run(cmd)
 
-		By("uninstalling CRDs")
-		cmd = exec.Command("make", "uninstall")
-		_, _ = utils.Run(cmd)
-
-		By("removing manager namespace")
-		cmd = exec.Command("kubectl", "delete", "ns", namespace)
+		By("cleaning up test namespaces")
+		cmd = exec.Command("kubectl", "delete", "ns", "sbd-system", "--ignore-not-found=true")
 		_, _ = utils.Run(cmd)
 	})
 

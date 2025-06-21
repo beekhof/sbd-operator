@@ -80,26 +80,15 @@ func TestE2E(t *testing.T) {
 }
 
 var _ = BeforeSuite(func() {
-	By("building the manager(Operator) image")
-	cmd := exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", projectImage))
+	By("verifying e2e environment setup")
+	_, _ = fmt.Fprintf(GinkgoWriter, "E2E environment setup completed by Makefile\n")
+	_, _ = fmt.Fprintf(GinkgoWriter, "Project image: %s\n", projectImage)
+
+	// Verify we can connect to the cluster
+	By("verifying cluster connection")
+	cmd := exec.Command("kubectl", "cluster-info")
 	_, err := utils.Run(cmd)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the manager(Operator) image")
-
-	// Check if we're using CRC or Kind
-	if utils.IsCRCEnvironment() || os.Getenv("USE_CRC") == "true" {
-		By("setting up CRC environment for OpenShift")
-		cmd = exec.Command("bash", "-c", "eval $(crc oc-env)")
-		_, err = utils.Run(cmd)
-		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to set up CRC environment")
-
-		By("loading the manager(Operator) image to CRC")
-		err = utils.LoadImageToCRCCluster(projectImage)
-		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the manager(Operator) image into CRC")
-	} else {
-		By("loading the manager(Operator) image on Kind")
-		err = utils.LoadImageToKindClusterWithName(projectImage)
-		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the manager(Operator) image into Kind")
-	}
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to connect to cluster")
 
 	// The tests-e2e are intended to run on a temporary cluster that is created and destroyed for testing.
 	// To prevent errors when tests run in environments with CertManager already installed,

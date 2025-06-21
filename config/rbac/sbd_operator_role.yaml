@@ -44,7 +44,19 @@ rules:
 # Allows operator to emit events for SBDConfig and SBDRemediation operations
 - apiGroups: [""]
   resources: ["events"]
-  verbs: ["create", "patch"]
+  verbs: ["create", "get", "list", "patch", "watch"]
+
+# Service account management for SBD Agent
+# Needed to create service accounts in target namespaces for SBD Agent pods
+- apiGroups: [""]
+  resources: ["serviceaccounts"]
+  verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+
+# RBAC management for SBD Agent
+# Required to create cluster roles and bindings for SBD Agent service accounts
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["clusterroles", "clusterrolebindings"]
+  verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
 
 # SBDConfig Custom Resource management
 # Full CRUD operations for managing SBD configuration

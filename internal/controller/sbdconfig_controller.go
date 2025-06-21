@@ -48,14 +48,15 @@ const (
 	EventTypeWarning = "Warning"
 
 	// Event reasons for SBDConfig operations
-	ReasonSBDConfigReconciled   = "SBDConfigReconciled"
-	ReasonDaemonSetManaged      = "DaemonSetManaged"
-	ReasonNamespaceCreated      = "NamespaceCreated"
-	ReasonServiceAccountCreated = "ServiceAccountCreated"
-	ReasonReconcileError        = "ReconcileError"
-	ReasonDaemonSetError        = "DaemonSetError"
-	ReasonNamespaceError        = "NamespaceError"
-	ReasonServiceAccountError   = "ServiceAccountError"
+	ReasonSBDConfigReconciled       = "SBDConfigReconciled"
+	ReasonDaemonSetManaged          = "DaemonSetManaged"
+	ReasonNamespaceCreated          = "NamespaceCreated"
+	ReasonServiceAccountCreated     = "ServiceAccountCreated"
+	ReasonClusterRoleBindingCreated = "ClusterRoleBindingCreated"
+	ReasonReconcileError            = "ReconcileError"
+	ReasonDaemonSetError            = "DaemonSetError"
+	ReasonNamespaceError            = "NamespaceError"
+	ReasonServiceAccountError       = "ServiceAccountError"
 
 	// Retry configuration constants for SBDConfig controller
 	// MaxSBDConfigRetries is the maximum number of retry attempts for SBDConfig operations
@@ -417,48 +418,7 @@ func (r *SBDConfigReconciler) ensureServiceAccount(ctx context.Context, sbdConfi
 			"Service account 'sbd-agent' created in namespace '%s'", namespaceName)
 	}
 
-	// Create the ClusterRole (cluster-scoped resource)
-	clusterRole := &rbacv1.ClusterRole{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: fmt.Sprintf("sbd-agent-%s", sbdConfig.Name),
-			Labels: map[string]string{
-				"app":                          "sbd-agent",
-				"app.kubernetes.io/name":       "sbd-agent",
-				"app.kubernetes.io/component":  "agent",
-				"app.kubernetes.io/part-of":    "sbd-operator",
-				"app.kubernetes.io/managed-by": "sbd-operator",
-				"sbdconfig":                    sbdConfig.Name,
-			},
-		},
-		Rules: []rbacv1.PolicyRule{
-			{
-				APIGroups: []string{""},
-				Resources: []string{"nodes"},
-				Verbs:     []string{"get", "list", "watch"},
-			},
-			{
-				APIGroups: []string{""},
-				Resources: []string{"pods"},
-				Verbs:     []string{"get", "list", "watch"},
-			},
-			{
-				APIGroups: []string{""},
-				Resources: []string{"events"},
-				Verbs:     []string{"get", "list", "watch", "create", "patch"},
-			},
-		},
-	}
-
-	result, err = controllerutil.CreateOrUpdate(ctx, r.Client, clusterRole, func() error {
-		// Set the controller reference
-		return controllerutil.SetControllerReference(sbdConfig, clusterRole, r.Scheme)
-	})
-
-	if err != nil {
-		return fmt.Errorf("failed to create or update cluster role: %w", err)
-	}
-
-	// Create the ClusterRoleBinding (cluster-scoped resource)
+	// Create the ClusterRoleBinding to use the existing sbd-agent-role
 	clusterRoleBinding := &rbacv1.ClusterRoleBinding{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: fmt.Sprintf("sbd-agent-%s", sbdConfig.Name),
@@ -481,7 +441,7 @@ func (r *SBDConfigReconciler) ensureServiceAccount(ctx context.Context, sbdConfi
 		RoleRef: rbacv1.RoleRef{
 			APIGroup: "rbac.authorization.k8s.io",
 			Kind:     "ClusterRole",
-			Name:     fmt.Sprintf("sbd-agent-%s", sbdConfig.Name),
+			Name:     "sbd-operator-sbd-agent-role", // Use the existing cluster role
 		},
 	}
 
@@ -492,6 +452,12 @@ func (r *SBDConfigReconciler) ensureServiceAccount(ctx context.Context, sbdConfi
 
 	if err != nil {
 		return fmt.Errorf("failed to create or update cluster role binding: %w", err)
+	}
+
+	if result == controllerutil.OperationResultCreated {
+		logger.Info("ClusterRoleBinding created for SBD agent", "clusterRoleBinding", fmt.Sprintf("sbd-agent-%s", sbdConfig.Name))
+		r.emitEventf(sbdConfig, EventTypeNormal, ReasonClusterRoleBindingCreated,
+			"ClusterRoleBinding 'sbd-agent-%s' created", sbdConfig.Name)
 	}
 
 	return nil

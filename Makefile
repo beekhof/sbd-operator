@@ -69,8 +69,8 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
 # E2E Test Configuration
-# The e2e tests recreate the CRC environment from scratch for each test run.
-# This ensures a clean, consistent testing environment.
+# The e2e tests can either reuse an existing CRC environment or recreate it from scratch.
+# Use 'test-e2e' to reuse existing CRC (faster) or 'test-e2e-fresh' for clean environment.
 #
 # Environment Variables:
 # - E2E_CLEANUP_SKIP=true: Skip cleanup after tests (useful for debugging)
@@ -80,7 +80,7 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 # - VERSION: Image version tag (default: latest)
 #
 # The setup-test-e2e target handles:
-# 1. Stopping and starting CRC cluster
+# 1. Starting CRC cluster (only if not already running)
 # 2. Building and loading container images
 # 3. Installing CRDs
 # 4. Deploying the operator
@@ -88,28 +88,31 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 CRC_CLUSTER ?= sbd-operator-test-e2e
 
 .PHONY: setup-test-e2e
-setup-test-e2e: ## Recreate CRC environment and set up everything for e2e tests
+setup-test-e2e: ## Set up CRC environment for e2e tests (start CRC only if not running)
 	@command -v crc >/dev/null 2>&1 || { \
 		echo "CRC is not installed. Please install CRC manually."; \
 		echo "Visit: https://developers.redhat.com/products/codeready-containers/download"; \
 		exit 1; \
 	}
-	@echo "Recreating CRC environment for e2e tests..."
-	@echo "Stopping any existing CRC cluster..."
-	@crc stop || true
-	@echo "Starting fresh CRC cluster..."
-	@crc start
+	@echo "Setting up CRC environment for e2e tests..."
+	@if crc status | grep -q "CRC VM.*Running"; then \
+		echo "CRC is already running, skipping CRC start..."; \
+	else \
+		echo "CRC is not running, starting CRC cluster..."; \
+		crc start; \
+	fi
 	@echo "Setting up CRC environment..."
 	@eval $$(crc oc-env) && oc whoami || { \
 		echo "Failed to authenticate with CRC cluster"; \
 		exit 1; \
 	}
 	@echo "Building and loading container images..."
-	@$(MAKE) build-images
-	@echo "Loading images into CRC..."
-	@eval $$(crc podman-env) && \
-		docker save $(QUAY_OPERATOR_IMG):$(VERSION) | podman load && \
-		docker save $(QUAY_AGENT_IMG):$(VERSION) | podman load
+	# TODO: Uncomment this when we need a way to build/load images in CI
+	#@$(MAKE) build-images
+	#@echo "Loading images into CRC..."
+	#@eval $$(crc podman-env) && \
+	#	docker save $(QUAY_OPERATOR_IMG):$(VERSION) | podman load && \
+	#	docker save $(QUAY_AGENT_IMG):$(VERSION) | podman load
 	@echo "Installing CRDs..."
 	@$(MAKE) install
 	@echo "Deploying operator to CRC..."
@@ -121,6 +124,9 @@ setup-test-e2e: ## Recreate CRC environment and set up everything for e2e tests
 		exit 1; \
 	}
 	@echo "E2E environment setup complete!"
+
+.PHONY: test-e2e-fresh
+test-e2e-fresh: cleanup-crc setup-test-e2e test-e2e
 
 .PHONY: test-e2e
 test-e2e: setup-test-e2e ## Run the e2e tests on CRC OpenShift cluster (setup handled in setup-test-e2e).
@@ -167,6 +173,8 @@ cleanup-test-e2e: ## Clean up e2e test environment and stop CRC cluster
 	@eval $$(crc oc-env) && kubectl delete clusterrolebinding -l app.kubernetes.io/managed-by=sbd-operator --ignore-not-found=true || true
 	@eval $$(crc oc-env) && kubectl delete clusterrole -l app.kubernetes.io/managed-by=sbd-operator --ignore-not-found=true || true
 	@$(MAKE) uninstall || true
+
+cleanup-crc:
 	@echo "Stopping CRC cluster..."
 	@crc stop || true
 

@@ -314,15 +314,113 @@ var _ = Describe("Manager", Ordered, func() {
 		})
 
 		// +kubebuilder:scaffold:e2e-webhooks-checks
+	})
 
-		// TODO: Customize the e2e test suite with scenarios specific to your project.
-		// Consider applying sample/CR(s) and check their status and/or verifying
-		// the reconciliation by using the metrics, i.e.:
-		// metricsOutput := getMetricsOutput()
-		// Expect(metricsOutput).To(ContainSubstring(
-		//    fmt.Sprintf(`controller_runtime_reconcile_total{controller="%s",result="success"} 1`,
-		//    strings.ToLower(<Kind>),
-		// ))
+	Context("SBD Agent", func() {
+		var sbdConfigName string
+		var tmpFile string
+
+		BeforeEach(func() {
+			sbdConfigName = fmt.Sprintf("test-sbdconfig-%d", time.Now().UnixNano())
+		})
+
+		AfterEach(func() {
+			// Clean up SBDConfig
+			By("cleaning up SBDConfig resource")
+			cmd := exec.Command("kubectl", "delete", "sbdconfig", sbdConfigName, "--ignore-not-found=true")
+			_, _ = utils.Run(cmd)
+
+			// Clean up any remaining DaemonSets
+			By("cleaning up SBD agent DaemonSets")
+			cmd = exec.Command("kubectl", "delete", "daemonset", "-l", "app.kubernetes.io/name=sbd-agent", "-n", "sbd-system", "--ignore-not-found=true")
+			_, _ = utils.Run(cmd)
+
+			// Clean up temporary file
+			if tmpFile != "" {
+				os.Remove(tmpFile)
+			}
+		})
+
+		It("should deploy SBD agent DaemonSet when SBDConfig is created", func() {
+			By("creating an SBDConfig resource")
+			sbdConfigYAML := fmt.Sprintf(`
+apiVersion: medik8s.medik8s.io/v1alpha1
+kind: SBDConfig
+metadata:
+  name: %s
+spec:
+  sbdWatchdogPath: "/dev/null"
+  image: "quay.io/medik8s/sbd-agent:latest"
+  namespace: "sbd-system"
+`, sbdConfigName)
+
+			// Write SBDConfig to temporary file
+			tmpFile = filepath.Join("/tmp", fmt.Sprintf("sbdconfig-%s.yaml", sbdConfigName))
+			err := os.WriteFile(tmpFile, []byte(sbdConfigYAML), 0644)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Apply the SBDConfig
+			cmd := exec.Command("kubectl", "apply", "-f", tmpFile)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create SBDConfig")
+
+			By("verifying the SBDConfig resource exists")
+			verifySBDConfigExists := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "sbdconfig", sbdConfigName, "-o", "jsonpath={.metadata.name}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal(sbdConfigName))
+			}
+			Eventually(verifySBDConfigExists, 30*time.Second).Should(Succeed())
+
+			By("verifying the SBD agent DaemonSet is created")
+			expectedDaemonSetName := fmt.Sprintf("sbd-agent-%s", sbdConfigName)
+			verifyDaemonSetCreated := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "daemonset", expectedDaemonSetName, "-n", "sbd-system", "-o", "jsonpath={.metadata.name}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal(expectedDaemonSetName))
+			}
+			Eventually(verifyDaemonSetCreated, 60*time.Second).Should(Succeed())
+
+			By("verifying the DaemonSet has correct image and configuration")
+			verifyDaemonSetConfig := func(g Gomega) {
+				// Check image
+				cmd := exec.Command("kubectl", "get", "daemonset", expectedDaemonSetName, "-n", "sbd-system", "-o", "jsonpath={.spec.template.spec.containers[0].image}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("quay.io/medik8s/sbd-agent:latest"))
+
+				// Check watchdog path argument
+				cmd = exec.Command("kubectl", "get", "daemonset", expectedDaemonSetName, "-n", "sbd-system", "-o", "jsonpath={.spec.template.spec.containers[0].args}")
+				output, err = utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(ContainSubstring("--watchdog-path=/dev/null"))
+			}
+			Eventually(verifyDaemonSetConfig, 30*time.Second).Should(Succeed())
+
+			By("verifying the DaemonSet has expected number of pods scheduled")
+			verifyDaemonSetScheduled := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "daemonset", expectedDaemonSetName, "-n", "sbd-system", "-o", "jsonpath={.status.desiredNumberScheduled}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				// Should have at least 1 pod scheduled (for the single CRC node)
+				g.Expect(output).ToNot(BeEmpty())
+				g.Expect(output).ToNot(Equal("0"))
+			}
+			Eventually(verifyDaemonSetScheduled, 60*time.Second).Should(Succeed())
+
+			By("verifying the SBDConfig status reflects DaemonSet creation")
+			verifySBDConfigStatus := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "sbdconfig", sbdConfigName, "-o", "jsonpath={.status.totalNodes}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				// Should have at least 1 node targeted
+				g.Expect(output).ToNot(BeEmpty())
+				g.Expect(output).ToNot(Equal("0"))
+			}
+			Eventually(verifySBDConfigStatus, 60*time.Second).Should(Succeed())
+		})
 	})
 })
 

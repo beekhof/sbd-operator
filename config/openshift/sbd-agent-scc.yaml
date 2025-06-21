@@ -59,7 +59,7 @@ rules:
   resources:
   - securitycontextconstraints
   resourceNames:
-  - sbd-agent-privileged
+  - sbd-operator-sbd-agent-privileged
   verbs:
   - use
 

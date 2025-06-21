@@ -502,7 +502,7 @@ rules:
 - apiGroups:
   - security.openshift.io
   resourceNames:
-  - sbd-agent-privileged
+  - sbd-operator-sbd-agent-privileged
   resources:
   - securitycontextconstraints
   verbs:

@@ -1,12 +1,12 @@
-# Image URL to use all building/pushing image targets
-IMG ?= controller:latest
-
-# Quay registry configuration
+# Quay registry configuration - primary image naming system
 QUAY_REGISTRY ?= quay.io
 QUAY_ORG ?= medik8s
 QUAY_OPERATOR_IMG ?= $(QUAY_REGISTRY)/$(QUAY_ORG)/sbd-operator
 QUAY_AGENT_IMG ?= $(QUAY_REGISTRY)/$(QUAY_ORG)/sbd-agent
 VERSION ?= latest
+
+# Legacy IMG variable for backwards compatibility (maps to operator image)
+IMG ?= $(QUAY_OPERATOR_IMG):$(VERSION)
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -153,113 +153,82 @@ build-agent: manifests generate fmt vet ## Build SBD agent binary.
 run: manifests generate fmt vet ## Run a controller from your host.
 	go run ./cmd/main.go
 
-# If you wish to build the manager image targeting other platforms you can use the --platform flag.
-# (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
-# More info: https://docs.docker.com/develop/develop-images/build_enhancements/
-.PHONY: docker-build
-docker-build: ## Build docker image with the manager.
-	$(CONTAINER_TOOL) build -t ${IMG} . --load
+##@ Container Images
 
-.PHONY: docker-push
-docker-push: ## Push docker image with the manager.
-	$(CONTAINER_TOOL) push ${IMG}
+# Primary build targets (Quay-first approach)
+# Use these for standard development and CI/CD workflows
+# Example: make build-images VERSION=v1.0.0
+# Example: make build-push QUAY_REGISTRY=my-registry.io QUAY_ORG=myorg
 
-# PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
-# architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:
-# - be able to use docker buildx. More info: https://docs.docker.com/build/buildx/
-# - have enabled BuildKit. More info: https://docs.docker.com/develop/develop-images/build_enhancements/
-# - be able to push the image to your registry (i.e. if you do not set a valid value via IMG=<myregistry/image:<tag>> then the export will fail)
-# To adequately provide solutions that are compatible with multiple platforms, you should consider using this option.
+# PLATFORMS defines the target platforms for multi-platform builds
 PLATFORMS ?= linux/arm64,linux/amd64,linux/s390x,linux/ppc64le
-.PHONY: docker-buildx
-docker-buildx: ## Build and push docker image for the manager for cross-platform support
-	# copy existing Dockerfile and insert --platform=${BUILDPLATFORM} into Dockerfile.cross, and preserve the original Dockerfile
-	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile > Dockerfile.cross
-	- $(CONTAINER_TOOL) buildx create --name sbd-operator-builder
-	$(CONTAINER_TOOL) buildx use sbd-operator-builder
-	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
-	- $(CONTAINER_TOOL) buildx rm sbd-operator-builder
-	rm Dockerfile.cross
 
-.PHONY: docker-build-agent
-docker-build-agent: ## Build docker image for the SBD agent.
-	$(CONTAINER_TOOL) build -f Dockerfile.sbd-agent -t sbd-agent:latest .
-
-.PHONY: docker-push-agent
-docker-push-agent: ## Push docker image for the SBD agent.
-	$(CONTAINER_TOOL) push sbd-agent:latest
-
-.PHONY: quay-build
-quay-build: manifests generate fmt vet ## Build both operator and agent images with Quay tags (no push).
-	@echo "Building SBD Operator images with Quay tags..."
-	@echo "Operator image: $(QUAY_OPERATOR_IMG):$(VERSION)"
-	@echo "Agent image: $(QUAY_AGENT_IMG):$(VERSION)"
-	
-	# Build operator image
-	@echo "Building operator image..."
+# Internal function to build operator image
+define build-operator-image
+	@echo "Building operator image: $(QUAY_OPERATOR_IMG):$(VERSION)"
 	$(CONTAINER_TOOL) build -t sbd-operator:$(VERSION) . --load
 	$(CONTAINER_TOOL) tag sbd-operator:$(VERSION) $(QUAY_OPERATOR_IMG):$(VERSION)
 	$(CONTAINER_TOOL) tag sbd-operator:$(VERSION) $(QUAY_OPERATOR_IMG):latest
-	
-	# Build agent image
-	@echo "Building SBD agent image..."
+endef
+
+# Internal function to build agent image  
+define build-agent-image
+	@echo "Building agent image: $(QUAY_AGENT_IMG):$(VERSION)"
 	$(CONTAINER_TOOL) build -f Dockerfile.sbd-agent -t sbd-agent:$(VERSION) . --load
 	$(CONTAINER_TOOL) tag sbd-agent:$(VERSION) $(QUAY_AGENT_IMG):$(VERSION)
 	$(CONTAINER_TOOL) tag sbd-agent:$(VERSION) $(QUAY_AGENT_IMG):latest
-	
-	@echo "Successfully built both images!"
+endef
+
+.PHONY: build-operator
+build-operator: manifests generate fmt vet ## Build operator container image.
+	$(call build-operator-image)
+
+.PHONY: build-agent-image  
+build-agent-image: manifests generate fmt vet ## Build agent container image.
+	$(call build-agent-image)
+
+.PHONY: build-images
+build-images: manifests generate fmt vet ## Build both operator and agent container images.
+	@echo "Building SBD Operator images..."
 	@echo "Operator: $(QUAY_OPERATOR_IMG):$(VERSION)"
 	@echo "Agent: $(QUAY_AGENT_IMG):$(VERSION)"
-	@echo ""
-	@echo "To push to registry, run: make quay-push"
-	@echo "Make sure you are logged in: docker login quay.io"
+	$(call build-operator-image)
+	$(call build-agent-image)
+	@echo "Successfully built both images!"
 
-.PHONY: quay-build-push
-quay-build-push: manifests generate fmt vet ## Build and push both operator and agent images to Quay registry.
-	@echo "Building and pushing SBD Operator images to Quay registry..."
-	@echo "Operator image: $(QUAY_OPERATOR_IMG):$(VERSION)"
-	@echo "Agent image: $(QUAY_AGENT_IMG):$(VERSION)"
-	@echo ""
-	@echo "Note: Make sure you are logged in to the registry:"
-	@echo "  docker login $(QUAY_REGISTRY)"
-	@echo ""
-	
-	# Build operator image
-	@echo "Building operator image..."
-	$(CONTAINER_TOOL) build -t sbd-operator:$(VERSION) . --load
-	$(CONTAINER_TOOL) tag sbd-operator:$(VERSION) $(QUAY_OPERATOR_IMG):$(VERSION)
-	$(CONTAINER_TOOL) tag sbd-operator:$(VERSION) $(QUAY_OPERATOR_IMG):latest
-	
-	# Build agent image
-	@echo "Building SBD agent image..."
-	$(CONTAINER_TOOL) build -f Dockerfile.sbd-agent -t sbd-agent:$(VERSION) . --load
-	$(CONTAINER_TOOL) tag sbd-agent:$(VERSION) $(QUAY_AGENT_IMG):$(VERSION)
-	$(CONTAINER_TOOL) tag sbd-agent:$(VERSION) $(QUAY_AGENT_IMG):latest
-	
-	# Push operator image
-	@echo "Pushing operator image..."
+.PHONY: push-operator
+push-operator: ## Push operator container image to registry.
+	@echo "Pushing operator image: $(QUAY_OPERATOR_IMG):$(VERSION)"
 	$(CONTAINER_TOOL) push $(QUAY_OPERATOR_IMG):$(VERSION)
 	$(CONTAINER_TOOL) push $(QUAY_OPERATOR_IMG):latest
-	
-	# Push agent image
-	@echo "Pushing SBD agent image..."
+
+.PHONY: push-agent
+push-agent: ## Push agent container image to registry.
+	@echo "Pushing agent image: $(QUAY_AGENT_IMG):$(VERSION)"
 	$(CONTAINER_TOOL) push $(QUAY_AGENT_IMG):$(VERSION)
 	$(CONTAINER_TOOL) push $(QUAY_AGENT_IMG):latest
-	
-	@echo "Successfully built and pushed both images to Quay!"
+
+.PHONY: push-images
+push-images: ## Push both operator and agent container images to registry.
+	@echo "Pushing SBD Operator images to registry..."
+	@echo "Make sure you are logged in: docker login $(QUAY_REGISTRY)"
+	$(MAKE) push-operator
+	$(MAKE) push-agent
+	@echo "Successfully pushed both images!"
+
+.PHONY: build-push
+build-push: build-images push-images ## Build and push both operator and agent images to registry.
+
+.PHONY: buildx
+buildx: manifests generate fmt vet ## Build and push multi-platform images to registry.
+	@echo "Building and pushing multi-platform SBD Operator images..."
+	@echo "Platforms: $(PLATFORMS)"
 	@echo "Operator: $(QUAY_OPERATOR_IMG):$(VERSION)"
 	@echo "Agent: $(QUAY_AGENT_IMG):$(VERSION)"
-
-.PHONY: quay-buildx
-quay-buildx: manifests generate fmt vet ## Build and push multi-platform images to Quay registry.
-	@echo "Building and pushing multi-platform SBD Operator images to Quay registry..."
-	@echo "Platforms: $(PLATFORMS)"
-	@echo "Operator image: $(QUAY_OPERATOR_IMG):$(VERSION)"
-	@echo "Agent image: $(QUAY_AGENT_IMG):$(VERSION)"
 	
 	# Create buildx builder if it doesn't exist
-	- $(CONTAINER_TOOL) buildx create --name sbd-quay-builder
-	- $(CONTAINER_TOOL) buildx use sbd-quay-builder
+	- $(CONTAINER_TOOL) buildx create --name sbd-operator-builder
+	- $(CONTAINER_TOOL) buildx use sbd-operator-builder
 	
 	# Build and push operator image (multi-platform)
 	@echo "Building and pushing multi-platform operator image..."
@@ -271,7 +240,7 @@ quay-buildx: manifests generate fmt vet ## Build and push multi-platform images 
 	rm Dockerfile.cross
 	
 	# Build and push agent image (multi-platform)
-	@echo "Building and pushing multi-platform SBD agent image..."
+	@echo "Building and pushing multi-platform agent image..."
 	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile.sbd-agent > Dockerfile.sbd-agent.cross
 	$(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) \
 		--tag $(QUAY_AGENT_IMG):$(VERSION) \
@@ -280,21 +249,60 @@ quay-buildx: manifests generate fmt vet ## Build and push multi-platform images 
 	rm Dockerfile.sbd-agent.cross
 	
 	# Cleanup builder
-	- $(CONTAINER_TOOL) buildx rm sbd-quay-builder
+	- $(CONTAINER_TOOL) buildx rm sbd-operator-builder
 	
-	@echo "Successfully built and pushed multi-platform images to Quay!"
-	@echo "Operator: $(QUAY_OPERATOR_IMG):$(VERSION)"
-	@echo "Agent: $(QUAY_AGENT_IMG):$(VERSION)"
+	@echo "Successfully built and pushed multi-platform images!"
 
-##@ Quay Registry
+##@ Legacy Docker Aliases (Deprecated - Use build-* targets instead)
+
+.PHONY: docker-build
+docker-build: ## Legacy alias with IMG support (deprecated - use build-operator instead).
+	@echo "⚠️  Warning: 'docker-build' is deprecated. Use 'make build-operator' instead."
+	@if [ "$(IMG)" != "$(QUAY_OPERATOR_IMG):$(VERSION)" ]; then \
+		echo "Building with legacy IMG=$(IMG) for backwards compatibility..."; \
+		$(CONTAINER_TOOL) build -t $(IMG) . --load; \
+	else \
+		$(MAKE) build-operator; \
+	fi
+
+.PHONY: docker-push
+docker-push: push-operator ## Legacy alias for push-operator (deprecated).
+	@echo "⚠️  Warning: 'docker-push' is deprecated. Use 'make push-operator' instead."
+
+.PHONY: docker-buildx
+docker-buildx: buildx ## Legacy alias for buildx (deprecated).
+	@echo "⚠️  Warning: 'docker-buildx' is deprecated. Use 'make buildx' instead."
+
+.PHONY: docker-build-agent
+docker-build-agent: build-agent-image ## Legacy alias for build-agent-image (deprecated).
+	@echo "⚠️  Warning: 'docker-build-agent' is deprecated. Use 'make build-agent-image' instead."
+
+.PHONY: docker-push-agent  
+docker-push-agent: push-agent ## Legacy alias for push-agent (deprecated).
+	@echo "⚠️  Warning: 'docker-push-agent' is deprecated. Use 'make push-agent' instead."
+
+##@ Legacy Quay Aliases (Deprecated - Use build-* targets instead)
+
+.PHONY: quay-build
+quay-build: build-images ## Legacy alias for build-images (deprecated).
+	@echo "⚠️  Warning: 'quay-build' is deprecated. Use 'make build-images' instead."
+
+.PHONY: quay-build-push  
+quay-build-push: build-push ## Legacy alias for build-push (deprecated).
+	@echo "⚠️  Warning: 'quay-build-push' is deprecated. Use 'make build-push' instead."
+
+.PHONY: quay-buildx
+quay-buildx: buildx ## Legacy alias for buildx (deprecated).
+	@echo "⚠️  Warning: 'quay-buildx' is deprecated. Use 'make buildx' instead."
 
 .PHONY: quay-push
-quay-push: quay-build-push ## Alias for quay-build-push - Build and push both images to Quay registry.
+quay-push: push-images ## Legacy alias for push-images (deprecated).
+	@echo "⚠️  Warning: 'quay-push' is deprecated. Use 'make push-images' instead."
 
 .PHONY: build-installer
 build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.
 	mkdir -p dist
-	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
+	cd config/manager && $(KUSTOMIZE) edit set image controller=$(QUAY_OPERATOR_IMG):$(VERSION)
 	$(KUSTOMIZE) build config/default > dist/install.yaml
 
 ##@ Deployment

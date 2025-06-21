@@ -97,7 +97,24 @@ var _ = Describe("Manager", Ordered, func() {
 		_, err = utils.Run(cmd)
 		if err != nil {
 			// Fallback to standard deployment if custom fails
-			cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", projectImage))
+			// Extract image components for environment variables
+			parts := strings.Split(projectImage, "/")
+			var registry, org, version string
+			if len(parts) >= 3 {
+				registry = parts[0]
+				org = parts[1]
+				imageVersion := strings.Split(parts[2], ":")
+				if len(imageVersion) > 1 {
+					version = imageVersion[1]
+				} else {
+					version = "latest"
+				}
+			}
+
+			// Set environment and run deploy with new variables
+			cmd = exec.Command("bash", "-c", fmt.Sprintf(
+				"QUAY_REGISTRY=%s QUAY_ORG=%s VERSION=%s make deploy",
+				registry, org, version))
 			_, err = utils.Run(cmd)
 		}
 		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")

@@ -31,7 +31,7 @@ spec:
         node-role.kubernetes.io/control-plane: ""
       containers:
       - name: sbd-agent
-        image: sbd-agent:latest
+        image: quay.io/medik8s/sbd-agent:latest
         imagePullPolicy: Always
         # Run with required privileges for hardware access
         securityContext:

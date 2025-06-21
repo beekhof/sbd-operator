@@ -7,7 +7,7 @@ resources:
 images:
 - name: controller:latest
   newName: localhost/sbd-operator
-  newTag: cleanup-test
+  newTag: manifest-test
 
 patches:
 - path: image-pull-policy-patch.yaml

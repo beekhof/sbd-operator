@@ -217,7 +217,7 @@ push-images: ## Push both operator and agent container images to registry.
 	@echo "Successfully pushed both images!"
 
 .PHONY: build-push
-build-push: build-images push-images ## Build and push both operator and agent images to registry.
+build-push: update-manifests build-images push-images ## Build and push both operator and agent images to registry.
 
 .PHONY: buildx
 buildx: manifests generate fmt vet ## Build and push multi-platform images to registry.
@@ -299,8 +299,34 @@ quay-buildx: buildx ## Legacy alias for buildx (deprecated).
 quay-push: push-images ## Legacy alias for push-images (deprecated).
 	@echo "⚠️  Warning: 'quay-push' is deprecated. Use 'make push-images' instead."
 
+.PHONY: update-manifests
+update-manifests: ## Update all manifests to use current QUAY image references (auto-runs with build-push).
+	@echo "Updating manifests with image references..."
+	@echo "Operator: $(QUAY_OPERATOR_IMG):$(VERSION)"
+	@echo "Agent: $(QUAY_AGENT_IMG):$(VERSION)"
+	
+	# Update agent daemonset manifests
+	@for file in deploy/sbd-agent-daemonset*.yaml; do \
+		if [ -f "$$file" ]; then \
+			echo "Updating $$file..."; \
+			sed -i.bak 's|image: quay\.io/medik8s/sbd-agent:.*|image: $(QUAY_AGENT_IMG):$(VERSION)|g' "$$file"; \
+			rm -f "$$file.bak"; \
+		fi; \
+	done
+	
+	# Update sample configs
+	@for file in config/samples/*.yaml; do \
+		if [ -f "$$file" ] && grep -q 'image:' "$$file"; then \
+			echo "Updating $$file..."; \
+			sed -i.bak 's|image: "quay\.io/medik8s/sbd-agent:.*"|image: "$(QUAY_AGENT_IMG):$(VERSION)"|g' "$$file"; \
+			rm -f "$$file.bak"; \
+		fi; \
+	done
+	
+	@echo "Manifests updated successfully!"
+
 .PHONY: build-installer
-build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.
+build-installer: update-manifests manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.
 	mkdir -p dist
 	cd config/manager && $(KUSTOMIZE) edit set image controller=$(QUAY_OPERATOR_IMG):$(VERSION)
 	$(KUSTOMIZE) build config/default > dist/install.yaml

@@ -68,7 +68,7 @@ spec:
       # Main container
       containers:
       - name: sbd-agent
-        image: sbd-agent:latest
+        image: quay.io/medik8s/sbd-agent:latest
         imagePullPolicy: Never
         
         # Security context with required privileges

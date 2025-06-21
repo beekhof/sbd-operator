@@ -1,5 +1,32 @@
 # sod-operator
 
+## Installation
+
+### Standard Kubernetes Installation
+
+```bash
+# Build and install the operator
+make build-installer
+kubectl apply -f dist/install.yaml
+```
+
+### OpenShift Installation
+
+For OpenShift clusters, use the OpenShift-specific installer that includes the required SecurityContextConstraints:
+
+```bash
+# Build and install the operator with OpenShift support
+make build-openshift-installer
+kubectl apply -f dist/install-openshift.yaml
+```
+
+The OpenShift installer includes:
+- All standard operator resources (CRDs, RBAC, deployment)
+- SecurityContextConstraints for SBD Agent privileged access
+- Proper service account bindings for OpenShift security model
+
+For more details on OpenShift-specific configuration, see [config/openshift/README.md](config/openshift/README.md).
+
 ## Building and Pushing Images
 
 ### Build Images Locally

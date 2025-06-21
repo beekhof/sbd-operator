@@ -382,6 +382,12 @@ build-installer: update-manifests manifests generate kustomize ## Generate a con
 	cd config/manager && $(KUSTOMIZE) edit set image controller=$(QUAY_OPERATOR_IMG):$(VERSION)
 	$(KUSTOMIZE) build config/default > dist/install.yaml
 
+.PHONY: build-openshift-installer
+build-openshift-installer: update-manifests manifests generate kustomize ## Generate a consolidated YAML with CRDs, deployment, and OpenShift SecurityContextConstraints.
+	mkdir -p dist
+	cd config/manager && $(KUSTOMIZE) edit set image controller=$(QUAY_OPERATOR_IMG):$(VERSION)
+	$(KUSTOMIZE) build config/openshift-default > dist/install-openshift.yaml
+
 ##@ Deployment
 
 ifndef ignore-not-found

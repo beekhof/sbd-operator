@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -88,8 +89,17 @@ var _ = Describe("Manager", Ordered, func() {
 		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
 
 		By("deploying the controller-manager")
-		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", projectImage))
+		// Create a temporary kustomization for e2e testing with imagePullPolicy: Never
+		err = createE2EKustomization(projectImage)
+		Expect(err).NotTo(HaveOccurred(), "Failed to create e2e kustomization")
+
+		cmd = exec.Command("kubectl", "apply", "-k", "test/e2e/", "--server-side=true")
 		_, err = utils.Run(cmd)
+		if err != nil {
+			// Fallback to standard deployment if custom fails
+			cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", projectImage))
+			_, err = utils.Run(cmd)
+		}
 		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
 	})
 
@@ -340,6 +350,51 @@ func getMetricsOutput() string {
 	Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
 	Expect(metricsOutput).To(ContainSubstring("< HTTP/1.1 200 OK"))
 	return metricsOutput
+}
+
+// createE2EKustomization creates a dynamic kustomization file for e2e testing
+func createE2EKustomization(imageName string) error {
+	// Parse the image name to extract components
+	parts := strings.Split(imageName, "/")
+	var newName, newTag string
+
+	if len(parts) >= 2 {
+		imageParts := strings.Split(parts[len(parts)-1], ":")
+		newName = strings.Join(parts[:len(parts)-1], "/") + "/" + imageParts[0]
+		if len(imageParts) > 1 {
+			newTag = imageParts[1]
+		} else {
+			newTag = "latest"
+		}
+	} else {
+		imageParts := strings.Split(imageName, ":")
+		newName = imageParts[0]
+		if len(imageParts) > 1 {
+			newTag = imageParts[1]
+		} else {
+			newTag = "latest"
+		}
+	}
+
+	kustomizationContent := fmt.Sprintf(`apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+- ../../config/default
+
+images:
+- name: controller:latest
+  newName: %s
+  newTag: %s
+
+patches:
+- path: image-pull-policy-patch.yaml
+  target:
+    kind: Deployment
+    name: controller-manager
+`, newName, newTag)
+
+	return os.WriteFile("test/e2e/kustomization.yaml", []byte(kustomizationContent), 0644)
 }
 
 // tokenRequest is a simplified representation of the Kubernetes TokenRequest API response,

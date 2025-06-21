@@ -216,16 +216,16 @@ func LoadImageToCRCCluster(name string) error {
 
 // loadImageToCRCPodman attempts to load image using podman
 func loadImageToCRCPodman(name string) error {
-	// Save the image using docker
-	cmd := exec.Command("docker", "save", name)
-	saveOutput, err := cmd.Output()
-	if err != nil {
+	// Save the image using docker to a temporary file
+	tempFile := "/tmp/crc-image-" + extractImageName(name) + ".tar"
+	cmd := exec.Command("docker", "save", "-o", tempFile, name)
+	if _, err := Run(cmd); err != nil {
 		return fmt.Errorf("failed to save image with docker: %w", err)
 	}
+	defer os.Remove(tempFile)
 
-	// Load the image using CRC's podman
-	cmd = exec.Command("crc", "podman", "load")
-	cmd.Stdin = strings.NewReader(string(saveOutput))
+	// Load the image using CRC's podman with proper environment
+	cmd = exec.Command("bash", "-c", fmt.Sprintf("eval $(crc podman-env) && podman load -i %s", tempFile))
 	if _, err := Run(cmd); err != nil {
 		return fmt.Errorf("failed to load image with CRC podman: %w", err)
 	}

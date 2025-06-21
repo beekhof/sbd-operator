@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+- ../../config/default
+
+images:
+- name: controller:latest
+  newName: localhost/sbd-operator
+  newTag: e2e-test
+
+patches:
+- path: image-pull-policy-patch.yaml
+  target:
+    kind: Deployment
+    name: controller-manager

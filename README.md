@@ -135,8 +135,8 @@ The `make test-e2e` command automatically:
 2. **Starts a fresh CRC cluster**
 3. **Builds operator and agent container images**
 4. **Loads images into CRC's container runtime**
-5. **Installs CRDs**
-6. **Deploys the operator**
+5. **Builds OpenShift installer with SecurityContextConstraints**
+6. **Deploys the operator with OpenShift support**
 7. **Waits for operator readiness**
 8. **Runs the Go test suite**
 9. **Cleans up the environment** (unless `E2E_CLEANUP_SKIP=true`)
@@ -168,9 +168,12 @@ make cleanup-test-e2e
 
 When running on OpenShift (CRC), the tests automatically handle:
 
-- **Security Context Constraints (SCC)** instead of Pod Security Standards
+- **Security Context Constraints (SCC)** deployed via OpenShift installer
+- **Privileged pod permissions** for hardware watchdog access
 - **OpenShift Routes** for ingress (if applicable)
 - **OpenShift Registry** for container images
 - **oc** command instead of kubectl where needed
+
+The tests use the OpenShift-specific installer (`build-openshift-installer`) which includes all necessary SecurityContextConstraints for SBD Agent pods to run with required privileges.
 
 The tests are backward compatible with Kind/Kubernetes for development environments.

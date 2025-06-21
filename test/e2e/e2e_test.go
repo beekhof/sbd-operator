@@ -389,62 +389,15 @@ spec:
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to create SBDConfig")
 
-			By("creating privileged SCC for SBD agent")
-			createSBDSCC := func(g Gomega) {
-				// Create a privileged SCC for SBD agent
-				sccYAML := `
-apiVersion: security.openshift.io/v1
-kind: SecurityContextConstraints
-metadata:
-  name: sbd-agent-privileged
-allowHostDirVolumePlugin: true
-allowHostIPC: false
-allowHostNetwork: true
-allowHostPID: true
-allowHostPorts: false
-allowPrivilegedContainer: true
-allowedCapabilities:
-- SYS_ADMIN
-defaultAddCapabilities: null
-fsGroup:
-  type: RunAsAny
-priority: null
-readOnlyRootFilesystem: false
-requiredDropCapabilities: null
-runAsUser:
-  type: RunAsAny
-seLinuxContext:
-  type: RunAsAny
-supplementalGroups:
-  type: RunAsAny
-volumes:
-- configMap
-- downwardAPI
-- emptyDir
-- hostPath
-- persistentVolumeClaim
-- projected
-- secret
-users: []
-groups: []
-`
-				// Write SCC to temporary file
-				sccFile := filepath.Join("/tmp", fmt.Sprintf("sbd-scc-%s.yaml", sbdConfigName))
-				err := os.WriteFile(sccFile, []byte(sccYAML), 0644)
-				g.Expect(err).NotTo(HaveOccurred())
-				defer os.Remove(sccFile)
-
-				// Apply the SCC
-				cmd := exec.Command("kubectl", "apply", "-f", sccFile)
-				_, err = utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-
-				// Add the sbd-agent service account to the SCC
-				cmd = exec.Command("oc", "adm", "policy", "add-scc-to-user", "sbd-agent-privileged", "system:serviceaccount:sbd-system:sbd-agent")
-				_, err = utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
+			By("verifying SecurityContextConstraints is deployed")
+			verifySCC := func(g Gomega) {
+				// Verify the SCC exists (deployed via OpenShift installer)
+				cmd := exec.Command("kubectl", "get", "scc", "sbd-operator-sbd-agent-privileged", "-o", "jsonpath={.metadata.name}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "SCC should be deployed via OpenShift installer")
+				g.Expect(output).To(Equal("sbd-operator-sbd-agent-privileged"))
 			}
-			createSBDSCC(Default)
+			Eventually(verifySCC, 30*time.Second).Should(Succeed())
 
 			expectedDaemonSetName := fmt.Sprintf("sbd-agent-%s", sbdConfigName)
 

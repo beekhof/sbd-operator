@@ -113,10 +113,10 @@ setup-test-e2e: ## Set up CRC environment for e2e tests (start CRC only if not r
 	#@eval $$(crc podman-env) && \
 	#	docker save $(QUAY_OPERATOR_IMG):$(VERSION) | podman load && \
 	#	docker save $(QUAY_AGENT_IMG):$(VERSION) | podman load
-	@echo "Installing CRDs..."
-	@$(MAKE) install
-	@echo "Deploying operator to CRC..."
-	@eval $$(crc oc-env) && kubectl apply -k test/e2e/ --server-side=true
+	@echo "Building OpenShift installer with SecurityContextConstraints..."
+	@$(MAKE) build-openshift-installer
+	@echo "Deploying operator to CRC with OpenShift support..."
+	@eval $$(crc oc-env) && kubectl apply -f dist/install-openshift.yaml --server-side=true
 	@echo "Waiting for operator to be ready..."
 	@eval $$(crc oc-env) && kubectl wait --for=condition=ready pod -l control-plane=controller-manager -n sbd-operator-system --timeout=120s || { \
 		echo "Operator failed to start, checking logs..."; \
@@ -172,6 +172,10 @@ cleanup-test-e2e: ## Clean up e2e test environment and stop CRC cluster
 	@eval $$(crc oc-env) && kubectl delete sbdconfig --all --ignore-not-found=true || true
 	@eval $$(crc oc-env) && kubectl delete clusterrolebinding -l app.kubernetes.io/managed-by=sbd-operator --ignore-not-found=true || true
 	@eval $$(crc oc-env) && kubectl delete clusterrole -l app.kubernetes.io/managed-by=sbd-operator --ignore-not-found=true || true
+	@echo "Cleaning up OpenShift-specific resources..."
+	@eval $$(crc oc-env) && kubectl delete scc sbd-operator-sbd-agent-privileged --ignore-not-found=true || true
+	@eval $$(crc oc-env) && kubectl delete clusterrolebinding sbd-operator-sbd-agent-scc-user --ignore-not-found=true || true
+	@eval $$(crc oc-env) && kubectl delete clusterrole sbd-operator-sbd-agent-scc-user --ignore-not-found=true || true
 	@$(MAKE) uninstall || true
 
 cleanup-crc:

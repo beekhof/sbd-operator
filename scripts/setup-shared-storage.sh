@@ -747,9 +747,28 @@ check_aws_permissions() {
         local existing_efs
         existing_efs=$(aws efs describe-file-systems --region "$AWS_REGION" --query 'FileSystems[0].FileSystemId' --output text 2>/dev/null || echo "")
         if [[ -n "$existing_efs" && "$existing_efs" != "None" ]]; then
-            # Test CreateTags permission
+            # Test ListTagsForResource permission
             if ! aws efs list-tags-for-resource --region "$AWS_REGION" --resource-id "$existing_efs" >/dev/null 2>&1; then
                 permission_errors+=("elasticfilesystem:ListTagsForResource - Required to manage EFS tags")
+            fi
+            
+            # Test CreateTags permission (required for create-tags command)
+            # We'll test this by attempting to create a test tag
+            local create_tags_error
+            create_tags_error=$(aws efs create-tags \
+                --region "$AWS_REGION" \
+                --file-system-id "$existing_efs" \
+                --tags "Key=test-permission-check,Value=testing" 2>&1 || echo "")
+            
+            if echo "$create_tags_error" | grep -qi "UnauthorizedOperation\|AccessDenied\|is not authorized"; then
+                permission_errors+=("elasticfilesystem:CreateTags - Required to add tags to EFS filesystem")
+            else
+                # Clean up the test tag if it was created successfully
+                aws efs create-tags \
+                    --region "$AWS_REGION" \
+                    --file-system-id "$existing_efs" \
+                    --tags "Key=test-permission-check,Value=" >/dev/null 2>&1 || true
+                log_info "✅ CreateTags permission verified"
             fi
         fi
         
@@ -794,6 +813,8 @@ check_aws_permissions() {
             echo "    - elasticfilesystem:DeleteAccessPoint"
             echo "    - elasticfilesystem:DescribeAccessPoints"
             echo "    - elasticfilesystem:TagResource"
+            echo "    - elasticfilesystem:CreateTags"
+            echo "    - elasticfilesystem:ListTagsForResource"
             echo
             echo "  IAM Permissions (for IAM role creation):"
             echo "    Core IAM Operations:"

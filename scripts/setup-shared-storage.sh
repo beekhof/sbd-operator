@@ -133,8 +133,6 @@ OPTIONS:
     --cluster-name NAME        Override cluster name detection
     --aws-region REGION        Override AWS region detection
     --efs-csi-role-name NAME   Specify EFS CSI IAM role name (default: auto-detect)
-    --create-iam-role          Create EFS CSI IAM role if missing (default: true)
-    --no-create-iam-role       Skip IAM role creation
     --cleanup                  Clean up all created resources
     --update-mode              Force update/recreation of StorageClass even if identical
     --dry-run                  Show what would be done without executing
@@ -162,10 +160,10 @@ REQUIREMENTS:
     • AWS CLI configured with appropriate permissions
     • kubectl/oc CLI tools
     • Cluster admin permissions
-    • IAM permissions for role creation (if --create-iam-role)
+    • IAM permissions for role creation (when needed)
 
 The script automatically detects cluster name and AWS region, creates all required
-AWS resources, and configures a ReadWriteMany (RWX) capable StorageClass.
+AWS resources (including IAM roles), and configures a ReadWriteMany (RWX) capable StorageClass.
 
 EOF
 }
@@ -226,14 +224,6 @@ parse_arguments() {
             --efs-csi-role-name)
                 EFS_CSI_ROLE_NAME="$2"
                 shift 2
-                ;;
-            --create-iam-role)
-                CREATE_IAM_ROLE="true"
-                shift
-                ;;
-            --no-create-iam-role)
-                CREATE_IAM_ROLE="false"
-                shift
                 ;;
             --update-mode)
                 UPDATE_MODE="true"
@@ -1049,37 +1039,23 @@ check_efs_csi_service_account() {
         # Validate the IAM role permissions
         validate_efs_csi_role_permissions "$current_role_arn"
     else
-        if [[ "$CREATE_IAM_ROLE" == "true" ]]; then
-            log_info "EFS CSI service account not configured with IAM role - will create and configure"
-            local role_arn
-            role_arn=$(create_efs_csi_iam_role)
-            
-            # Annotate service account with IAM role
-            log_info "Annotating EFS CSI service account with IAM role"
-            $KUBECTL annotate serviceaccount efs-csi-controller-sa -n kube-system \
-                eks.amazonaws.com/role-arn="$role_arn" --overwrite
-            
-            log_success "EFS CSI service account configured with IAM role: $role_arn"
-            
-            # Restart EFS CSI controller to pick up new credentials
-            log_info "Restarting EFS CSI controller to pick up new IAM role"
-            $KUBECTL rollout restart deployment/efs-csi-controller -n kube-system
-            
-            # Wait for restart to complete
-            $KUBECTL rollout status deployment/efs-csi-controller -n kube-system --timeout=60s
-        else
-            log_error "❌ EFS CSI service account missing IAM role annotation and IAM role creation is disabled"
-            echo
-            log_error "🔧 SOLUTION: Manually configure the EFS CSI service account with an IAM role:"
-            log_error "1. Create an IAM role with EFS permissions"
-            log_error "2. Configure the role trust policy for IRSA (IAM Roles for Service Accounts)"
-            log_error "3. Annotate the service account:"
-            log_error "   $KUBECTL annotate serviceaccount efs-csi-controller-sa -n kube-system \\"
-            log_error "     eks.amazonaws.com/role-arn=arn:aws:iam::ACCOUNT:role/ROLE_NAME"
-            echo
-            log_error "Or enable automatic IAM role creation with --create-iam-role"
-            exit 1
-        fi
+        log_info "EFS CSI service account not configured with IAM role - will create and configure"
+        local role_arn
+        role_arn=$(create_efs_csi_iam_role)
+        
+        # Annotate service account with IAM role
+        log_info "Annotating EFS CSI service account with IAM role"
+        $KUBECTL annotate serviceaccount efs-csi-controller-sa -n kube-system \
+            eks.amazonaws.com/role-arn="$role_arn" --overwrite
+        
+        log_success "EFS CSI service account configured with IAM role: $role_arn"
+        
+        # Restart EFS CSI controller to pick up new credentials
+        log_info "Restarting EFS CSI controller to pick up new IAM role"
+        $KUBECTL rollout restart deployment/efs-csi-controller -n kube-system
+        
+        # Wait for restart to complete
+        $KUBECTL rollout status deployment/efs-csi-controller -n kube-system --timeout=60s
     fi
 }
 
@@ -2107,7 +2083,7 @@ auto_resolve_problems() {
     # Check for existing misconfigured resources and fix them
     if [[ "$AUTO_RESOLVE" == "true" ]]; then
         # 1. Check and fix IAM role issues
-        if [[ "$CREATE_IAM_ROLE" == "true" && -n "$EFS_CSI_ROLE_NAME" ]]; then
+        if [[ -n "$EFS_CSI_ROLE_NAME" ]]; then
             log_auto_fix "Checking IAM role configuration..."
             if aws iam get-role --role-name "$EFS_CSI_ROLE_NAME" >/dev/null 2>&1; then
                 log_auto_fix "IAM role exists, checking trust policy..."
@@ -2117,7 +2093,6 @@ auto_resolve_problems() {
                 # Check if trust policy is configured for internal or external OIDC
                 if echo "$trust_policy" | grep -q "kubernetes.default.svc"; then
                     log_auto_fix "Role configured for internal Kubernetes service account - will use node IAM role approach"
-                    CREATE_IAM_ROLE="false"  # Skip IRSA, use node IAM role
                 elif echo "$trust_policy" | grep -q "oidc-provider"; then
                     log_auto_fix "Role configured for OIDC provider - checking validity..."
                     # Check if the OIDC provider in trust policy matches current cluster
@@ -2365,35 +2340,33 @@ check_aws_permissions() {
         permission_errors+=("ec2:DescribeSecurityGroups - Required to manage NFS security groups")
     fi
 
-    # Test IAM permissions (if IAM role creation is enabled)
-    if [[ "$CREATE_IAM_ROLE" == "true" ]]; then
-        log_info "Testing IAM permissions for role creation..."
-        
-        # Test basic IAM permissions
-        if ! aws iam list-open-id-connect-providers >/dev/null 2>&1; then
-            permission_errors+=("iam:ListOpenIdConnectProviders - Required to find cluster OIDC provider")
-        fi
-        
-        # Test get role permission (with non-existent role)
-        local get_role_error
-        get_role_error=$(aws iam get-role --role-name "non-existent-role-test-$$" 2>&1 || echo "")
-        if echo "$get_role_error" | grep -qi "UnauthorizedOperation\|AccessDenied\|is not authorized"; then
-            permission_errors+=("iam:GetRole - Required to check existing IAM roles")
-        fi
-        
-        # Test list attached role policies
-        local list_policies_error
-        list_policies_error=$(aws iam list-attached-role-policies --role-name "non-existent-role-test-$$" 2>&1 || echo "")
-        if echo "$list_policies_error" | grep -qi "UnauthorizedOperation\|AccessDenied\|is not authorized"; then
-            permission_errors+=("iam:ListAttachedRolePolicies - Required to validate IAM role permissions")
-        fi
-        
-        # Test attach role policy permission
-        local attach_policy_error
-        attach_policy_error=$(aws iam attach-role-policy --role-name "non-existent-role-test-$$" --policy-arn "arn:aws:iam::aws:policy/AmazonElasticFileSystemClientFullAccess" 2>&1 || echo "")
-        if echo "$attach_policy_error" | grep -qi "UnauthorizedOperation\|AccessDenied\|is not authorized"; then
-            permission_errors+=("iam:AttachRolePolicy - Required to attach EFS policies to IAM roles")
-        fi
+    # Test IAM permissions (required for automatic IAM role creation)
+    log_info "Testing IAM permissions for role creation..."
+    
+    # Test basic IAM permissions
+    if ! aws iam list-open-id-connect-providers >/dev/null 2>&1; then
+        permission_errors+=("iam:ListOpenIdConnectProviders - Required to find cluster OIDC provider")
+    fi
+    
+    # Test get role permission (with non-existent role)
+    local get_role_error
+    get_role_error=$(aws iam get-role --role-name "non-existent-role-test-$$" 2>&1 || echo "")
+    if echo "$get_role_error" | grep -qi "UnauthorizedOperation\|AccessDenied\|is not authorized"; then
+        permission_errors+=("iam:GetRole - Required to check existing IAM roles")
+    fi
+    
+    # Test list attached role policies
+    local list_policies_error
+    list_policies_error=$(aws iam list-attached-role-policies --role-name "non-existent-role-test-$$" 2>&1 || echo "")
+    if echo "$list_policies_error" | grep -qi "UnauthorizedOperation\|AccessDenied\|is not authorized"; then
+        permission_errors+=("iam:ListAttachedRolePolicies - Required to validate IAM role permissions")
+    fi
+    
+    # Test attach role policy permission
+    local attach_policy_error
+    attach_policy_error=$(aws iam attach-role-policy --role-name "non-existent-role-test-$$" --policy-arn "arn:aws:iam::aws:policy/AmazonElasticFileSystemClientFullAccess" 2>&1 || echo "")
+    if echo "$attach_policy_error" | grep -qi "UnauthorizedOperation\|AccessDenied\|is not authorized"; then
+        permission_errors+=("iam:AttachRolePolicy - Required to attach EFS policies to IAM roles")
     fi
 
     # Test EFS Access Point permissions (CRITICAL for CSI driver)
@@ -2447,10 +2420,8 @@ check_aws_permissions() {
     
     if [[ ${#permission_errors[@]} -eq 0 ]]; then
         log_success "All required AWS permissions are available"
-        if [[ "$CREATE_IAM_ROLE" == "true" ]]; then
-            log_info "Note: Some IAM permissions (CreateRole, CreatePolicy) will be"
-            log_info "      tested during actual resource creation and may still fail if missing."
-        fi
+        log_info "Note: Some IAM permissions (CreateRole, CreatePolicy) will be"
+        log_info "      tested during actual resource creation and may still fail if missing."
     else
         log_error "❌ Missing required AWS permissions:"
         for error in "${permission_errors[@]}"; do
@@ -2461,7 +2432,7 @@ check_aws_permissions() {
         echo
         log_error "The script requires specific AWS permissions to automatically create and configure:"
         log_error "• EFS filesystem with access points (CRITICAL for storage provisioning)"
-        log_error "• IAM roles for EFS CSI driver (if enabled with --create-iam-role)"
+        log_error "• IAM roles for EFS CSI driver (when needed)"
         log_error "• VPC security groups for NFS access"
         log_error "• EFS mount targets in cluster subnets"
         echo
@@ -2492,18 +2463,15 @@ check_aws_permissions() {
         echo "    - ec2:CreateTags"
         echo
         
-        if [[ "$CREATE_IAM_ROLE" == "true" ]]; then
-            echo "  IAM Permissions (for IAM role creation):"
-            echo "    - iam:CreateRole"
-            echo "    - iam:GetRole"
-            echo "    - iam:AttachRolePolicy"
-            echo "    - iam:ListAttachedRolePolicies"
-            echo "    - iam:ListOpenIdConnectProviders"
-            echo "    - iam:GetOpenIdConnectProvider"
-            echo "    - iam:TagRole"
-            echo
-            echo "  Alternative: Use existing IAM role with --no-create-iam-role and manually configure"
-        fi
+        echo "  IAM Permissions (for automatic IAM role creation):"
+        echo "    - iam:CreateRole"
+        echo "    - iam:GetRole"
+        echo "    - iam:AttachRolePolicy"
+        echo "    - iam:ListAttachedRolePolicies"
+        echo "    - iam:ListOpenIdConnectProviders"
+        echo "    - iam:GetOpenIdConnectProvider"
+        echo "    - iam:TagRole"
+        echo
         
         echo "💡 This is a one-time setup - once permissions are granted, the script will"
         echo "   automatically handle all AWS resource creation and configuration."

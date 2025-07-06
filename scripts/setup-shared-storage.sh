@@ -434,6 +434,23 @@ REQUIREMENTS:
     • Cluster admin permissions
     • IAM permissions for role creation (if --create-iam-role)
 
+AWS PERMISSIONS REQUIRED:
+    The script checks for required AWS permissions before proceeding. If you encounter
+    permission errors, you have several options:
+
+    1. PREFERRED: Ask your AWS administrator to grant the required permissions
+    2. Use --skip-permission-checks to bypass checks (may fail during execution)
+    3. Use --skip-iam-role-check to skip IAM role creation (manual setup required)
+    4. Create resources manually using the ARNs/names shown in error messages
+
+    Core permissions needed:
+      • EFS: Create/describe filesystems, access points, mount targets
+      • EC2: Describe VPCs/subnets, create/manage security groups  
+      • IAM: Create/manage roles and policies (if --create-iam-role is used)
+      
+    The script provides detailed error messages with specific missing permissions
+    and manual resolution steps when permission issues are encountered.
+
 The script automatically:
     1. Auto-detects cluster name from OpenShift/Kubernetes cluster using multiple methods:
        • OpenShift Infrastructure object (most reliable)
@@ -793,23 +810,75 @@ check_aws_permissions() {
         fi
         
         # Test get role permission (with non-existent role)
-        if ! aws iam get-role --role-name "non-existent-role-test" >/dev/null 2>&1; then
-            # Check if it's a permission error vs. not found error
-            local get_role_error
-            get_role_error=$(aws iam get-role --role-name "non-existent-role-test" 2>&1 || true)
-            if [[ "$get_role_error" =~ AccessDenied ]] || [[ "$get_role_error" =~ UnauthorizedOperation ]]; then
-                permission_errors+=("iam:GetRole")
+        local get_role_error
+        get_role_error=$(aws iam get-role --role-name "non-existent-role-test-$(date +%s)" 2>&1 || true)
+        if [[ "$get_role_error" =~ AccessDenied ]] || [[ "$get_role_error" =~ UnauthorizedOperation ]]; then
+            permission_errors+=("iam:GetRole")
+        fi
+        
+        # Test list policies permission (needed to find existing AWS managed policies)
+        if ! aws iam list-policies --scope AWS --max-items 1 >/dev/null 2>&1; then
+            permission_errors+=("iam:ListPolicies")
+        fi
+        
+        # Test list roles permission (for finding existing roles)
+        if ! aws iam list-roles --max-items 1 >/dev/null 2>&1; then
+            permission_errors+=("iam:ListRoles")
+        fi
+        
+        # Test get policy permission (with AWS managed policy)
+        if ! aws iam get-policy --policy-arn "arn:aws:iam::aws:policy/AmazonElasticFileSystemClientFullAccess" >/dev/null 2>&1; then
+            permission_errors+=("iam:GetPolicy")
+        fi
+        
+        # Test list attached role policies permission (using a common AWS service role)
+        local test_role_result
+        test_role_result=$(aws iam list-roles --path-prefix "/aws-service-role/" --max-items 1 --query 'Roles[0].RoleName' --output text 2>/dev/null || echo "")
+        if [[ -n "$test_role_result" && "$test_role_result" != "None" ]]; then
+            if ! aws iam list-attached-role-policies --role-name "$test_role_result" >/dev/null 2>&1; then
+                permission_errors+=("iam:ListAttachedRolePolicies")
             fi
         fi
         
-        # Note: We don't test CreateRole/CreatePolicy here as they would create actual resources
-        # These will be tested during actual IAM role creation
-        log_info "IAM role creation permissions will be tested during actual role creation"
+        # Test tag role permission (will be used to tag created roles)
+        local tag_role_error
+        tag_role_error=$(aws iam tag-role --role-name "non-existent-role-test-$(date +%s)" --tags Key=test,Value=permission-check 2>&1 || true)
+        if [[ "$tag_role_error" =~ AccessDenied ]] || [[ "$tag_role_error" =~ UnauthorizedOperation ]]; then
+            permission_errors+=("iam:TagRole")
+        fi
+        
+        # Note: We can't test these permissions without creating actual resources:
+        # - iam:CreateRole (creates actual IAM role)
+        # - iam:CreatePolicy (creates actual IAM policy) 
+        # - iam:AttachRolePolicy (requires existing role)
+        # - iam:DetachRolePolicy (requires existing role)
+        # - iam:DeleteRole (requires existing role)
+        # - iam:DeletePolicy (requires existing policy)
+        # These will be tested during actual IAM role creation and reported if they fail
+        
+        # Add warnings for permissions that cannot be pre-tested
+        local untestable_iam_permissions=(
+            "iam:CreateRole"
+            "iam:CreatePolicy" 
+            "iam:AttachRolePolicy"
+            "iam:DetachRolePolicy"
+            "iam:DeleteRole"
+            "iam:DeletePolicy"
+        )
+        
+        log_info "Note: The following IAM permissions will be tested during actual resource creation:"
+        for perm in "${untestable_iam_permissions[@]}"; do
+            log_info "  - $perm"
+        done
     fi
     
     # Report results
     if [[ ${#permission_errors[@]} -eq 0 ]]; then
-        log_success "All required AWS permissions are available"
+        log_success "All testable AWS permissions are available"
+        if [[ "$CREATE_IAM_ROLE" == "true" && "$SKIP_IAM_ROLE_CHECK" == "false" ]]; then
+            log_info "Note: Some IAM permissions (CreateRole, CreatePolicy, AttachRolePolicy) will be"
+            log_info "      tested during actual resource creation and may still fail if missing."
+        fi
     else
         log_error "Missing AWS permissions:"
         for perm in "${permission_errors[@]}"; do
@@ -837,15 +906,26 @@ check_aws_permissions() {
         echo "    - ec2:AuthorizeSecurityGroupIngress"
         echo "    - ec2:CreateTags"
         echo "  IAM Permissions (for IAM role creation):"
-        echo "    - iam:CreateRole"
-        echo "    - iam:GetRole"
-        echo "    - iam:CreatePolicy"
-        echo "    - iam:GetPolicy"
-        echo "    - iam:AttachRolePolicy"
-        echo "    - iam:ListAttachedRolePolicies"
-        echo "    - iam:GetPolicyVersion"
-        echo "    - iam:ListOpenIdConnectProviders"
-        echo "    - sts:GetCallerIdentity"
+        echo "    Core IAM Operations:"
+        echo "      - iam:CreateRole"
+        echo "      - iam:GetRole"
+        echo "      - iam:ListRoles"
+        echo "      - iam:DeleteRole (for cleanup)"
+        echo "      - iam:TagRole"
+        echo "    Policy Operations:"
+        echo "      - iam:CreatePolicy"
+        echo "      - iam:GetPolicy"
+        echo "      - iam:ListPolicies"
+        echo "      - iam:DeletePolicy (for cleanup)"
+        echo "      - iam:GetPolicyVersion"
+        echo "    Role-Policy Association:"
+        echo "      - iam:AttachRolePolicy"
+        echo "      - iam:DetachRolePolicy"
+        echo "      - iam:ListAttachedRolePolicies"
+        echo "    Identity Provider Operations:"
+        echo "      - iam:ListOpenIdConnectProviders"
+        echo "    Security Token Service:"
+        echo "      - sts:GetCallerIdentity"
         echo
         exit 1
     fi
@@ -972,15 +1052,36 @@ EOF
     # Create IAM role
     log_info "Creating IAM role: $role_name"
     local role_arn
-    role_arn=$(aws iam create-role \
+    local create_role_error
+    
+    create_role_error=$(aws iam create-role \
         --role-name "$role_name" \
         --assume-role-policy-document "$trust_policy" \
         --description "IAM role for EFS CSI driver in cluster $CLUSTER_NAME" \
         --query 'Role.Arn' \
-        --output text)
+        --output text 2>&1)
     
+    if [[ "$create_role_error" =~ "AccessDenied" ]] || [[ "$create_role_error" =~ "UnauthorizedOperation" ]]; then
+        log_error "Failed to create IAM role due to insufficient permissions"
+        log_error "Missing permission: iam:CreateRole"
+        log_error "Error details: $create_role_error"
+        log_error ""
+        log_error "To resolve this issue, ask your AWS administrator to:"
+        log_error "1. Grant you the 'iam:CreateRole' permission, OR"
+        log_error "2. Create the IAM role manually with these details:"
+        log_error "   Role Name: $role_name"
+        log_error "   Trust Policy: $trust_policy"
+        log_error "   Then attach the AWS managed policy: AmazonElasticFileSystemClientFullAccess"
+        log_error "   Or create a custom policy with EFS permissions"
+        exit 1
+    elif [[ "$create_role_error" =~ "error" ]] || [[ "$create_role_error" =~ "Error" ]]; then
+        log_error "Failed to create IAM role: $create_role_error"
+        exit 1
+    fi
+    
+    role_arn="$create_role_error"
     if [[ -z "$role_arn" ]]; then
-        log_error "Failed to create IAM role"
+        log_error "Failed to create IAM role - no ARN returned"
         exit 1
     fi
     
@@ -1011,37 +1112,86 @@ EOF
 EOF
 )
     
-    # Create policy
-    log_info "Creating IAM policy: $policy_name"
-    local policy_arn
-    policy_arn=$(aws iam create-policy \
-        --policy-name "$policy_name" \
-        --policy-document "$policy_document" \
-        --description "Policy for EFS CSI driver in cluster $CLUSTER_NAME" \
-        --query 'Policy.Arn' \
-        --output text 2>/dev/null || echo "")
+    # First, try to use AWS managed policy (preferred approach)
+    local aws_managed_policy_arn="arn:aws:iam::aws:policy/AmazonElasticFileSystemClientFullAccess"
+    log_info "Attempting to attach AWS managed policy: AmazonElasticFileSystemClientFullAccess"
     
-    if [[ -z "$policy_arn" ]]; then
-        # Policy might already exist, try to get it
-        local account_id
-        account_id=$(aws sts get-caller-identity --query 'Account' --output text)
-        policy_arn="arn:aws:iam::${account_id}:policy/${policy_name}"
+    local attach_managed_error
+    attach_managed_error=$(aws iam attach-role-policy \
+        --role-name "$role_name" \
+        --policy-arn "$aws_managed_policy_arn" 2>&1)
+    
+    if [[ "$attach_managed_error" =~ "AccessDenied" ]] || [[ "$attach_managed_error" =~ "UnauthorizedOperation" ]]; then
+        log_warning "Cannot attach AWS managed policy due to insufficient permissions"
+        log_warning "Missing permission: iam:AttachRolePolicy"
+        log_info "Will try to create custom policy instead..."
         
-        # Check if policy exists
-        if ! aws iam get-policy --policy-arn "$policy_arn" &>/dev/null; then
-            log_error "Failed to create or find IAM policy: $policy_name"
+        # Create custom policy as fallback
+        log_info "Creating custom IAM policy: $policy_name"
+        local policy_arn
+        local create_policy_error
+        
+        create_policy_error=$(aws iam create-policy \
+            --policy-name "$policy_name" \
+            --policy-document "$policy_document" \
+            --description "Policy for EFS CSI driver in cluster $CLUSTER_NAME" \
+            --query 'Policy.Arn' \
+            --output text 2>&1)
+        
+        if [[ "$create_policy_error" =~ "AccessDenied" ]] || [[ "$create_policy_error" =~ "UnauthorizedOperation" ]]; then
+            log_error "Failed to create custom IAM policy due to insufficient permissions"
+            log_error "Missing permission: iam:CreatePolicy"
+            log_error "Error details: $create_policy_error"
+            log_error ""
+            log_error "To resolve this issue, ask your AWS administrator to:"
+            log_error "1. Grant you 'iam:AttachRolePolicy' permission to attach AWS managed policies, OR"
+            log_error "2. Grant you 'iam:CreatePolicy' permission to create custom policies, OR"
+            log_error "3. Manually attach the AWS managed policy to the role:"
+            log_error "   aws iam attach-role-policy --role-name $role_name --policy-arn $aws_managed_policy_arn"
+            exit 1
+        elif [[ "$create_policy_error" =~ "EntityAlreadyExists" ]]; then
+            # Policy already exists, get its ARN
+            local account_id
+            account_id=$(aws sts get-caller-identity --query 'Account' --output text)
+            policy_arn="arn:aws:iam::${account_id}:policy/${policy_name}"
+            log_info "Using existing custom IAM policy: $policy_arn"
+        elif [[ "$create_policy_error" =~ "error" ]] || [[ "$create_policy_error" =~ "Error" ]]; then
+            log_error "Failed to create custom IAM policy: $create_policy_error"
+            exit 1
+        else
+            policy_arn="$create_policy_error"
+            log_success "Created custom IAM policy: $policy_arn"
+        fi
+        
+        # Attach custom policy to role
+        log_info "Attaching custom policy to role..."
+        local attach_custom_error
+        attach_custom_error=$(aws iam attach-role-policy \
+            --role-name "$role_name" \
+            --policy-arn "$policy_arn" 2>&1)
+        
+        if [[ "$attach_custom_error" =~ "AccessDenied" ]] || [[ "$attach_custom_error" =~ "UnauthorizedOperation" ]]; then
+            log_error "Failed to attach custom policy to role due to insufficient permissions"
+            log_error "Missing permission: iam:AttachRolePolicy"
+            log_error "Error details: $attach_custom_error"
+            log_error ""
+            log_error "To resolve this issue, ask your AWS administrator to:"
+            log_error "1. Grant you 'iam:AttachRolePolicy' permission, OR"
+            log_error "2. Manually attach the policy to the role:"
+            log_error "   aws iam attach-role-policy --role-name $role_name --policy-arn $policy_arn"
+            exit 1
+        elif [[ -n "$attach_custom_error" ]]; then
+            log_error "Failed to attach custom policy to role: $attach_custom_error"
             exit 1
         fi
-        log_info "Using existing IAM policy: $policy_arn"
+        
+        log_success "Successfully attached custom policy to role"
+    elif [[ -n "$attach_managed_error" ]]; then
+        log_error "Failed to attach AWS managed policy: $attach_managed_error"
+        exit 1
     else
-        log_success "Created IAM policy: $policy_arn"
+        log_success "Successfully attached AWS managed policy to role"
     fi
-    
-    # Attach policy to role
-    log_info "Attaching policy to role..."
-    aws iam attach-role-policy \
-        --role-name "$role_name" \
-        --policy-arn "$policy_arn"
     
     log_success "IAM role setup completed: $role_arn"
     echo "$role_arn"

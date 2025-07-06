@@ -36,8 +36,6 @@ KUBECTL=""
 # New flags for better resource management
 FORCE_RECREATE="false"
 UPDATE_MODE="false"
-SKIP_VALIDATION="false"
-SKIP_PERMISSION_CHECKS="false"
 
 # Function to compare StorageClass configurations
 compare_storage_class_config() {
@@ -377,11 +375,8 @@ OPTIONS:
     --create-iam-role          Create EFS CSI IAM role if missing (default: true)
     --no-create-iam-role       Skip IAM role creation
     --cleanup                  Clean up all created resources
-    --skip-permission-checks   Skip AWS permission validation (use with caution)
-    --skip-iam-role-check      Skip EFS CSI service account IAM role validation
     --force-recreate           Force recreation of existing resources even if compatible
     --update-mode              Force update/recreation of StorageClass even if identical
-    --skip-validation          Skip resource validation checks (use with caution)
     --dry-run                  Show what would be done without executing
     --verbose                  Enable verbose logging
     --help                     Show this help message
@@ -425,9 +420,6 @@ EXAMPLES:
     # Clean up everything
     $0 --cleanup --efs-name sbd-efs-mycluster
 
-    # Skip all validation checks (not recommended)
-    $0 --skip-validation
-
 REQUIREMENTS:
     • OpenShift/Kubernetes cluster with AWS provider
     • AWS CLI configured with appropriate permissions
@@ -437,12 +429,8 @@ REQUIREMENTS:
 
 AWS PERMISSIONS REQUIRED:
     The script checks for required AWS permissions before proceeding. If you encounter
-    permission errors, you have several options:
-
-    1. PREFERRED: Ask your AWS administrator to grant the required permissions
-    2. Use --skip-permission-checks to bypass checks (may fail during execution)
-    3. Use --skip-iam-role-check to skip IAM role creation (manual setup required)
-    4. Create resources manually using the ARNs/names shown in error messages
+    permission errors, ask your AWS administrator to grant the required permissions.
+    All permission checks are mandatory and cannot be bypassed.
 
     Core permissions needed:
       • EFS: Create/describe filesystems, access points, mount targets
@@ -527,14 +515,6 @@ while [[ $# -gt 0 ]]; do
             SKIP_CSI_INSTALL="true"
             shift
             ;;
-        --skip-permission-checks)
-            SKIP_PERMISSION_CHECKS="true"
-            shift
-            ;;
-        --skip-iam-role-check)
-            SKIP_IAM_ROLE_CHECK="true"
-            shift
-            ;;
         --efs-csi-role-name)
             EFS_CSI_ROLE_NAME="$2"
             shift 2
@@ -553,10 +533,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --update-mode)
             UPDATE_MODE="true"
-            shift
-            ;;
-        --skip-validation)
-            SKIP_VALIDATION="true"
             shift
             ;;
         --dry-run)
@@ -640,10 +616,7 @@ check_aws_permissions() {
         return
     fi
     
-    if [[ "$SKIP_PERMISSION_CHECKS" == "true" ]]; then
-        log_warning "Skipping AWS permission validation due to --skip-permission-checks"
-        return
-    fi
+
 
     local permission_errors=()
     local test_efs_id=""
@@ -686,7 +659,7 @@ check_aws_permissions() {
     fi
 
     # Test IAM permissions (if IAM role creation is enabled)
-    if [[ "$CREATE_IAM_ROLE" == "true" && "$SKIP_IAM_ROLE_CHECK" == "false" ]]; then
+    if [[ "$CREATE_IAM_ROLE" == "true" ]]; then
         log_info "Testing IAM permissions for role creation..."
         
         # Test basic IAM permissions
@@ -785,15 +758,13 @@ check_aws_permissions() {
 
     # Test Security Group permissions
     log_info "Testing Security Group permissions..."
-    if [[ "$SKIP_VALIDATION" != "true" ]]; then
-        # These are tested in the actual operations since they need real VPC context
-        log_info "Security group permissions will be validated during actual operations"
-    fi
+    # These are tested in the actual operations since they need real VPC context
+    log_info "Security group permissions will be validated during actual operations"
 
     # Report results
     if [[ ${#permission_errors[@]} -eq 0 ]]; then
         log_success "All testable AWS permissions are available"
-        if [[ "$CREATE_IAM_ROLE" == "true" && "$SKIP_IAM_ROLE_CHECK" == "false" ]]; then
+        if [[ "$CREATE_IAM_ROLE" == "true" ]]; then
             log_info "Note: Some IAM permissions (CreateRole, CreatePolicy, AttachRolePolicy) will be"
             log_info "      tested during actual resource creation and may still fail if missing."
         fi
@@ -806,8 +777,7 @@ check_aws_permissions() {
         log_error "🚨 FATAL: Cannot proceed without required AWS permissions!"
         echo
         log_info "To resolve this issue:"
-        log_info "1. PREFERRED: Ask your AWS administrator to grant the missing permissions"
-        log_info "2. If you cannot get the permissions, use --skip-permission-checks (may fail during execution)"
+        log_info "Ask your AWS administrator to grant the missing permissions"
         echo
         log_info "Required AWS permissions depend on your setup:"
         if [[ "$CREATE_IAM_ROLE" == "true" ]]; then
@@ -899,7 +869,7 @@ validate_efs_csi_role_permissions() {
         log_error "    --role-name $role_name \\"
         log_error "    --policy-arn arn:aws:iam::aws:policy/AmazonElasticFileSystemClientFullAccess"
         echo
-        log_error "Alternative: Use --skip-iam-role-check to bypass this validation"
+        log_error "This validation is mandatory and cannot be bypassed"
         exit 1
     fi
     
@@ -1085,7 +1055,7 @@ validate_efs_csi_role_permissions() {
         log_error "    --role-name $role_name \\"
         log_error "    --policy-arn arn:aws:iam::aws:policy/AmazonElasticFileSystemClientFullAccess"
         echo
-        log_error "Alternative: Use --skip-iam-role-check to bypass this validation"
+        log_error "This validation is mandatory and cannot be bypassed"
         exit 1
     fi
     
@@ -1105,10 +1075,7 @@ check_efs_csi_service_account() {
         return
     fi
     
-    if [[ "$SKIP_IAM_ROLE_CHECK" == "true" ]]; then
-        log_warning "Skipping EFS CSI service account IAM role check due to --skip-iam-role-check"
-        return
-    fi
+
     
     # Check if service account exists
     if ! $KUBECTL get serviceaccount efs-csi-controller-sa -n kube-system >/dev/null 2>&1; then
@@ -2194,11 +2161,7 @@ main() {
     set_default_values
     
     # Check AWS permissions (after region is detected)
-    if [[ "$SKIP_VALIDATION" != "true" ]]; then
-        check_aws_permissions
-    else
-        log_warning "Skipping AWS permission validation due to --skip-validation"
-    fi
+    check_aws_permissions
     
     # Handle cleanup
     if [[ "$CLEANUP" == "true" ]]; then
@@ -2207,19 +2170,13 @@ main() {
     fi
     
     # Check for existing resources before proceeding
-    if [[ "$SKIP_VALIDATION" != "true" ]]; then
-        check_existing_resources
-    fi
+    check_existing_resources
     
     # Install or verify EFS CSI driver
     install_or_verify_efs_csi_driver
     
     # Check and configure EFS CSI service account IAM role
-    if [[ "$SKIP_IAM_ROLE_CHECK" != "true" ]]; then
-        check_efs_csi_service_account
-    else
-        log_warning "Skipping IAM role check due to --skip-iam-role-check"
-    fi
+    check_efs_csi_service_account
     
     # Determine EFS filesystem ID with intelligent reuse
     local efs_id=""
@@ -2288,17 +2245,15 @@ main() {
             log_info "Using specified EFS filesystem: $efs_id"
             
             # Validate specified EFS exists and is compatible
-            if [[ "$SKIP_VALIDATION" != "true" ]]; then
-                local efs_status
-                efs_status=$(compare_efs_config "$efs_id")
-                
-                if [[ "$efs_status" == "missing" ]]; then
-                    log_error "Specified EFS filesystem not found: $efs_id"
-                    exit 1
-                elif [[ "$efs_status" == "config_changed" ]]; then
-                    log_warning "Specified EFS filesystem has different configuration than requested"
-                    log_warning "Proceeding anyway since --filesystem-id was explicitly specified"
-                fi
+            local efs_status
+            efs_status=$(compare_efs_config "$efs_id")
+            
+            if [[ "$efs_status" == "missing" ]]; then
+                log_error "Specified EFS filesystem not found: $efs_id"
+                exit 1
+            elif [[ "$efs_status" == "config_changed" ]]; then
+                log_warning "Specified EFS filesystem has different configuration than requested"
+                log_warning "Proceeding anyway since --filesystem-id was explicitly specified"
             fi
         else
             log_error "EFS filesystem ID is required when not creating new EFS"
@@ -2318,11 +2273,7 @@ main() {
     fi
     
     # Test EFS CSI driver credentials
-    if [[ "$SKIP_VALIDATION" != "true" ]]; then
-        test_efs_csi_credentials
-    else
-        log_warning "Skipping EFS CSI credentials test due to --skip-validation"
-    fi
+    test_efs_csi_credentials
     
     # Show summary
     if [[ "$DRY_RUN" != "true" ]]; then

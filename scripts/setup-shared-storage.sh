@@ -461,7 +461,7 @@ while [[ $# -gt 0 ]]; do
             EFS_NAME="$2"
             shift 2
             ;;
-        -r|--region)
+        -r|--region|--aws-region)
             AWS_REGION="$2"
             shift 2
             ;;

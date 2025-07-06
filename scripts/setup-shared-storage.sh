@@ -1210,7 +1210,48 @@ get_cluster_oidc_issuer() {
         return
     fi
     
-    # Method 2: From cluster endpoint (for EKS)
+    # Method 2: For HyperShift/hosted clusters, try to match OIDC provider based on cluster name
+    local cluster_base_name
+    cluster_base_name=$(echo "$CLUSTER_NAME" | sed 's/-[a-z0-9]\{5,\}$//')  # Remove random suffix
+    
+    local oidc_providers
+    oidc_providers=$(aws iam list-open-id-connect-providers --query 'OpenIDConnectProviderList[].Arn' --output text 2>/dev/null || echo "")
+    
+    if [[ -n "$oidc_providers" ]]; then
+        # Look for HyperShift patterns: vphcp-oidc.s3.{region}.amazonaws.com/{cluster-id}
+        for provider_arn in $oidc_providers; do
+            local provider_url
+            provider_url="https://${provider_arn##*/}"
+            
+            # Check if this provider contains part of our cluster name
+            if [[ "$provider_url" == *"vphcp-oidc"* ]] && [[ "$provider_url" == *"$cluster_base_name"* ]]; then
+                log_info "Found HyperShift OIDC provider: $provider_url"
+                echo "$provider_url"
+                return
+            fi
+        done
+        
+        # Look for other HyperShift patterns
+        for provider_arn in $oidc_providers; do
+            local provider_url
+            provider_url="https://${provider_arn##*/}"
+            
+            # Check for rh-oidc patterns that might match
+            if [[ "$provider_url" == *"rh-oidc"* ]]; then
+                # Get the cluster ID and try to match with infrastructure name
+                local infra_name
+                infra_name=$($KUBECTL get infrastructure cluster -o jsonpath='{.status.infrastructureName}' 2>/dev/null || echo "")
+                
+                if [[ -n "$infra_name" && "$provider_url" == *"$infra_name"* ]]; then
+                    log_info "Found Red Hat OIDC provider: $provider_url"
+                    echo "$provider_url"
+                    return
+                fi
+            fi
+        done
+    fi
+    
+    # Method 3: From cluster endpoint (for EKS)
     local cluster_endpoint
     cluster_endpoint=$($KUBECTL cluster-info | grep 'Kubernetes control plane' | sed -E 's/.*https:\/\/([^:]+).*/\1/' || echo "")
     
@@ -1225,17 +1266,30 @@ get_cluster_oidc_issuer() {
         fi
     fi
     
-    # Method 3: Try to find OIDC provider associated with cluster
-    local oidc_providers
-    oidc_providers=$(aws iam list-open-id-connect-providers --query 'OpenIDConnectProviderList[].Arn' --output text 2>/dev/null || echo "")
-    
+    # Method 4: Fallback - try to use any available OIDC provider for the region
     if [[ -n "$oidc_providers" ]]; then
-        # For now, use the first one (this is a fallback)
+        # Look for providers in the same region
+        for provider_arn in $oidc_providers; do
+            local provider_url
+            provider_url="https://${provider_arn##*/}"
+            
+            if [[ "$provider_url" == *"$AWS_REGION"* ]]; then
+                log_warning "Using fallback OIDC provider: $provider_url"
+                log_warning "This may not be the correct provider for your cluster"
+                echo "$provider_url"
+                return
+            fi
+        done
+        
+        # Last resort - use first provider and warn
         local first_provider
         first_provider=$(echo "$oidc_providers" | head -n1)
         if [[ -n "$first_provider" ]]; then
-            # Extract the issuer URL from the ARN
-            echo "https://${first_provider##*/}"
+            local provider_url
+            provider_url="https://${first_provider##*/}"
+            log_warning "Using first available OIDC provider: $provider_url"
+            log_warning "This may not be the correct provider for your cluster"
+            echo "$provider_url"
             return
         fi
     fi

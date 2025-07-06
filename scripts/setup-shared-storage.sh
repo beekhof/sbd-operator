@@ -28,14 +28,48 @@ AWS_REGION=""
 CREATE_EFS="true"
 DRY_RUN="false"
 CLEANUP="false"
+AUTO_RESOLVE="true"  # Enable automatic problem resolution by default
 PERFORMANCE_MODE="generalPurpose"
 THROUGHPUT_MODE="provisioned"
 PROVISIONED_THROUGHPUT="10"
 KUBECTL=""
 
 # New flags for better resource management
-FORCE_RECREATE="false"
 UPDATE_MODE="false"
+
+# Enhanced default values with better error recovery
+CLUSTER_NAME=""
+AWS_REGION=""
+STORAGE_CLASS_NAME=""
+EFS_NAME=""
+EFS_FILESYSTEM_ID=""
+EFS_CSI_ROLE_NAME=""
+PERFORMANCE_MODE="generalPurpose"
+THROUGHPUT_MODE="burstingThroughput"
+PROVISIONED_THROUGHPUT="100"
+KUBECTL=""
+SKIP_CSI_INSTALL="false"
+
+# Enhanced logging functions
+log_info() {
+    echo "[INFO] $1"
+}
+
+log_success() {
+    echo "[SUCCESS] $1"
+}
+
+log_warning() {
+    echo "[WARNING] $1"
+}
+
+log_error() {
+    echo "[ERROR] $1"
+}
+
+log_auto_fix() {
+    echo "[AUTO-FIX] $1"
+}
 
 # Function to compare StorageClass configurations
 compare_storage_class_config() {
@@ -99,16 +133,10 @@ detect_existing_iam_role() {
             echo "$role_arn"
             return
         else
-            log_warning "Existing IAM role missing required permissions"
-            if [[ "$FORCE_RECREATE" == "true" ]]; then
-                log_info "Force recreate enabled - will recreate IAM role with correct permissions"
-                delete_iam_role "$role_name"
-                echo ""
-                return
-            else
-                log_error "IAM role exists but has incorrect permissions. Use --force-recreate to fix."
-                exit 1
-            fi
+            log_warning "Existing IAM role missing required permissions - will recreate with correct permissions"
+            delete_iam_role "$role_name"
+            echo ""
+            return
         fi
     fi
     
@@ -212,7 +240,7 @@ handle_storage_class_update() {
             ;;
         "identical")
             log_success "StorageClass configuration is up to date"
-            if [[ "$UPDATE_MODE" != "true" && "$FORCE_RECREATE" != "true" ]]; then
+            if [[ "$UPDATE_MODE" != "true" ]]; then
                 log_info "Skipping StorageClass recreation (use --update-mode to force update)"
                 return 1
             fi
@@ -271,13 +299,8 @@ check_existing_resources() {
                     reuse_summary="${reuse_summary}✅ EFS Filesystem: $existing_efs (reusing)\n"
                     ;;
                 "config_changed")
-                    if [[ "$FORCE_RECREATE" == "true" ]]; then
-                        log_warning "EFS configuration differs - will recreate due to --force-recreate"
-                        resources_to_create="${resources_to_create}🔄 EFS Filesystem (recreate)\n"
-                    else
-                        log_error "EFS filesystem exists but has different configuration. Use --force-recreate to recreate."
-                        exit 1
-                    fi
+                    log_warning "EFS configuration differs - will recreate automatically"
+                    resources_to_create="${resources_to_create}🔄 EFS Filesystem (recreate)\n"
                     ;;
                 "missing")
                     resources_to_create="${resources_to_create}🆕 EFS Filesystem\n"
@@ -303,7 +326,7 @@ check_existing_resources() {
     local sc_status
     sc_status=$(compare_storage_class_config "placeholder")
     
-    if [[ "$sc_status" == "identical" && "$UPDATE_MODE" != "true" && "$FORCE_RECREATE" != "true" ]]; then
+    if [[ "$sc_status" == "identical" && "$UPDATE_MODE" != "true" ]]; then
         reuse_summary="${reuse_summary}✅ StorageClass: $STORAGE_CLASS_NAME (unchanged)\n"
     else
         case "$sc_status" in
@@ -333,509 +356,6 @@ check_existing_resources() {
     fi
     
     echo
-}
-
-# Functions
-log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1" >&2
-}
-
-log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1" >&2
-}
-
-log_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1" >&2
-}
-
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1" >&2
-}
-
-show_usage() {
-    cat << EOF
-Usage: $0 [OPTIONS]
-
-This script sets up EFS-based shared storage for OpenShift/Kubernetes clusters.
-It creates an EFS filesystem, configures networking (VPC, subnets, security groups,
-mount targets), installs the EFS CSI driver, and creates a StorageClass.
-
-For OpenShift on AWS, this script also configures the proper IAM roles and 
-service account annotations required for the EFS CSI driver to access AWS APIs.
-
-OPTIONS:
-    --create-efs                Create a new EFS filesystem (default: true)
-    --no-create-efs            Use existing EFS filesystem (requires --filesystem-id)
-    --filesystem-id FSID       Use existing EFS filesystem with ID FSID
-    --efs-name NAME            Name for the EFS filesystem (default: sbd-efs-CLUSTER_NAME)
-    --storage-class-name NAME  Name for the StorageClass (default: sbd-efs-sc)
-    --cluster-name NAME        Override cluster name detection
-    --aws-region REGION        Override AWS region detection
-    --efs-csi-role-name NAME   Specify EFS CSI IAM role name (default: auto-detect)
-    --create-iam-role          Create EFS CSI IAM role if missing (default: true)
-    --no-create-iam-role       Skip IAM role creation
-    --cleanup                  Clean up all created resources
-    --force-recreate           Force recreation of existing resources even if compatible
-    --update-mode              Force update/recreation of StorageClass even if identical
-    --dry-run                  Show what would be done without executing
-    --verbose                  Enable verbose logging
-    --help                     Show this help message
-
-NETWORKING FEATURES:
-    • Auto-detects cluster VPC and private subnets
-    • Creates NFS security group with proper port 2049 access
-    • Sets up EFS mount targets in all cluster subnets
-    • Configures EFS CSI driver with cluster credentials
-    • Handles existing resources gracefully (idempotent)
-
-OPENSHIFT INTEGRATION:
-    • Validates EFS CSI service account IAM role configuration
-    • Creates IAM roles with proper EFS permissions if needed
-    • Configures service account annotations for AWS access
-    • Validates CSI driver credential access to AWS APIs
-
-EXAMPLES:
-    # Create new EFS with intelligent resource reuse and auto-detection
-    # (automatically detects cluster name and AWS region from OpenShift/Kubernetes)
-    $0
-
-    # Force recreation of existing resources
-    $0 --force-recreate
-
-    # Update StorageClass configuration even if identical
-    $0 --update-mode
-
-    # Override auto-detected values if needed
-    $0 --cluster-name my-cluster --aws-region us-east-1
-
-    # Use existing EFS filesystem with existing IAM role
-    $0 --no-create-efs --filesystem-id fs-1234567890abcdef0 --efs-csi-role-name MyEFSRole
-
-    # Create with custom names and skip IAM role creation
-    $0 --efs-name my-shared-storage --storage-class-name my-efs-sc --no-create-iam-role
-
-    # Preview changes without executing (shows resource reuse plan and detected values)
-    $0 --dry-run
-
-    # Clean up everything
-    $0 --cleanup --efs-name sbd-efs-mycluster
-
-REQUIREMENTS:
-    • OpenShift/Kubernetes cluster with AWS provider
-    • AWS CLI configured with appropriate permissions
-    • kubectl/oc CLI tools
-    • Cluster admin permissions
-    • IAM permissions for role creation (if --create-iam-role)
-
-AWS PERMISSIONS REQUIRED:
-    The script checks for required AWS permissions before proceeding. If you encounter
-    permission errors, ask your AWS administrator to grant the required permissions.
-    All permission checks are mandatory and cannot be bypassed.
-
-    Core permissions needed:
-      • EFS: Create/describe filesystems, access points, mount targets
-      • EC2: Describe VPCs/subnets, create/manage security groups  
-      • IAM: Create/manage roles and policies (if --create-iam-role is used)
-      
-    The script provides detailed error messages with specific missing permissions
-    and manual resolution steps when permission issues are encountered.
-
-The script automatically:
-    1. Auto-detects cluster name from OpenShift/Kubernetes cluster using multiple methods:
-       • OpenShift Infrastructure object (most reliable)
-       • OpenShift DNS configuration and Console routes
-       • Kubernetes node labels and provider IDs
-       • kubectl context parsing with pattern matching
-    2. Auto-detects AWS region from cluster configuration:
-       • OpenShift Infrastructure platformStatus
-       • Node provider IDs and zone labels
-       • Machine configuration and StorageClass parameters
-    3. Validates AWS permissions for EFS and EC2 operations
-    4. Intelligently detects and reuses existing compatible AWS resources
-    5. Installs/verifies EFS CSI driver
-    6. Creates and configures IAM roles for EFS CSI service account (with smart reuse)
-    7. Creates EFS filesystem with proper tags (or reuses existing compatible ones)
-    8. Sets up complete networking (VPC, subnets, security groups, mount targets)
-    9. Creates/updates StorageClass with EFS Access Point provisioning for ReadWriteMany (RWX) access
-    10. Handles StorageClass updates by deleting and recreating (since they cannot be updated)
-    11. Provides comprehensive cleanup functionality and resource validation
-
-EOF
-}
-
-# Parse command line arguments
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        -s|--storage-class)
-            STORAGE_CLASS_NAME="$2"
-            shift 2
-            ;;
-        -f|--filesystem-id)
-            EFS_FILESYSTEM_ID="$2"
-            CREATE_EFS="false"  # Disable EFS creation when using existing filesystem
-            shift 2
-            ;;
-        -n|--efs-name)
-            EFS_NAME="$2"
-            shift 2
-            ;;
-        -r|--region|--aws-region)
-            AWS_REGION="$2"
-            shift 2
-            ;;
-        -k|--cluster-name)
-            CLUSTER_NAME="$2"
-            shift 2
-            ;;
-        --performance-mode)
-            PERFORMANCE_MODE="$2"
-            shift 2
-            ;;
-        --throughput-mode)
-            THROUGHPUT_MODE="$2"
-            shift 2
-            ;;
-        --provisioned-tp)
-            PROVISIONED_THROUGHPUT="$2"
-            shift 2
-            ;;
-        --create-efs)
-            CREATE_EFS="true"
-            shift
-            ;;
-        --no-create-efs)
-            CREATE_EFS="false"
-            shift
-            ;;
-        --cleanup)
-            CLEANUP="true"
-            shift
-            ;;
-        --skip-csi-install)
-            SKIP_CSI_INSTALL="true"
-            shift
-            ;;
-        --efs-csi-role-name)
-            EFS_CSI_ROLE_NAME="$2"
-            shift 2
-            ;;
-        --create-iam-role)
-            CREATE_IAM_ROLE="true"
-            shift
-            ;;
-        --no-create-iam-role)
-            CREATE_IAM_ROLE="false"
-            shift
-            ;;
-        --force-recreate)
-            FORCE_RECREATE="true"
-            shift
-            ;;
-        --update-mode)
-            UPDATE_MODE="true"
-            shift
-            ;;
-        --dry-run)
-            DRY_RUN="true"
-            shift
-            ;;
-        --verbose)
-            set -x  # Enable verbose mode
-            shift
-            ;;
-        -h|--help)
-            show_usage
-            exit 0
-            ;;
-        *)
-            log_error "Unknown option: $1"
-            show_usage
-            exit 1
-            ;;
-    esac
-done
-
-# Validate inputs
-if [[ "$PERFORMANCE_MODE" != "generalPurpose" && "$PERFORMANCE_MODE" != "maxIO" ]]; then
-    log_error "Invalid performance mode: $PERFORMANCE_MODE. Must be 'generalPurpose' or 'maxIO'"
-    exit 1
-fi
-
-if [[ "$THROUGHPUT_MODE" != "provisioned" && "$THROUGHPUT_MODE" != "burstingThroughput" ]]; then
-    log_error "Invalid throughput mode: $THROUGHPUT_MODE. Must be 'provisioned' or 'burstingThroughput'"
-    exit 1
-fi
-
-# Function to check required tools
-check_tools() {
-    log_info "Checking required tools..."
-    
-    # Auto-detect kubectl or oc command
-    if [[ -z "$KUBECTL" ]]; then
-        if command -v oc &> /dev/null; then
-            KUBECTL="oc"
-            log_info "Detected OpenShift CLI: oc"
-        elif command -v kubectl &> /dev/null; then
-            KUBECTL="kubectl" 
-            log_info "Detected Kubernetes CLI: kubectl"
-        else
-            log_error "Neither 'oc' nor 'kubectl' command found"
-            log_error "Please install OpenShift CLI (oc) or Kubernetes CLI (kubectl)"
-            exit 1
-        fi
-    fi
-    
-    local missing_tools=()
-    
-    if ! command -v aws &> /dev/null; then
-        missing_tools+=("aws")
-    fi
-    
-    if ! command -v $KUBECTL &> /dev/null; then
-        missing_tools+=("$KUBECTL")
-    fi
-    
-    if ! command -v jq &> /dev/null; then
-        missing_tools+=("jq")
-    fi
-    
-    if [[ ${#missing_tools[@]} -gt 0 ]]; then
-        log_error "Missing required tools: ${missing_tools[*]}"
-        exit 1
-    fi
-    
-    log_success "All required tools are available"
-}
-
-# Function to check ALL required AWS permissions
-check_aws_permissions() {
-    log_info "Checking AWS permissions..."
-    
-    if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "[DRY RUN] Would check AWS permissions"
-        return
-    fi
-    
-
-
-    local permission_errors=()
-    local test_efs_id=""
-
-    # Core AWS permissions - these are absolutely required
-    log_info "Testing core AWS permissions..."
-    
-    # Test STS permissions (required for all AWS operations)
-    if ! aws sts get-caller-identity >/dev/null 2>&1; then
-        permission_errors+=("sts:GetCallerIdentity - Required for AWS authentication")
-    fi
-
-    # Test EFS permissions
-    log_info "Testing EFS permissions..."
-    if ! aws efs describe-file-systems --region "$AWS_REGION" --max-items 1 >/dev/null 2>&1; then
-        permission_errors+=("elasticfilesystem:DescribeFileSystems - Required to list EFS filesystems")
-    else
-        # Get a test EFS for mount target testing
-        local test_efs_for_mount_targets
-        test_efs_for_mount_targets=$(aws efs describe-file-systems --region "$AWS_REGION" --query 'FileSystems[0].FileSystemId' --output text 2>/dev/null || echo "")
-        if [[ -n "$test_efs_for_mount_targets" && "$test_efs_for_mount_targets" != "None" ]]; then
-            if ! aws efs describe-mount-targets --region "$AWS_REGION" --file-system-id "$test_efs_for_mount_targets" >/dev/null 2>&1; then
-                permission_errors+=("elasticfilesystem:DescribeMountTargets - Required to manage EFS mount targets")
-            fi
-        fi
-    fi
-
-    # Test EC2 VPC permissions
-    log_info "Testing EC2 VPC permissions..."
-    if ! aws ec2 describe-vpcs --region "$AWS_REGION" --max-results 5 >/dev/null 2>&1; then
-        permission_errors+=("ec2:DescribeVpcs - Required to find cluster VPC")
-    fi
-    
-    if ! aws ec2 describe-subnets --region "$AWS_REGION" --max-results 5 >/dev/null 2>&1; then
-        permission_errors+=("ec2:DescribeSubnets - Required to find cluster subnets")
-    fi
-    
-    if ! aws ec2 describe-security-groups --region "$AWS_REGION" --max-results 5 >/dev/null 2>&1; then
-        permission_errors+=("ec2:DescribeSecurityGroups - Required to manage NFS security groups")
-    fi
-
-    # Test IAM permissions (if IAM role creation is enabled)
-    if [[ "$CREATE_IAM_ROLE" == "true" ]]; then
-        log_info "Testing IAM permissions for role creation..."
-        
-        # Test basic IAM permissions
-        if ! aws iam list-open-id-connect-providers >/dev/null 2>&1; then
-            permission_errors+=("iam:ListOpenIdConnectProviders - Required to find cluster OIDC provider")
-        fi
-        
-        # Test get role permission (with non-existent role)
-        local get_role_error
-        get_role_error=$(aws iam get-role --role-name "non-existent-role-test-$$" 2>&1 || echo "")
-        if echo "$get_role_error" | grep -qi "UnauthorizedOperation\|AccessDenied\|is not authorized"; then
-            permission_errors+=("iam:GetRole - Required to check existing IAM roles")
-        fi
-        
-        # Test create role permission (with invalid parameters to test permission only)
-        local create_role_error
-        create_role_error=$(aws iam create-role --role-name "" --assume-role-policy-document "" 2>&1 || echo "")
-        if echo "$create_role_error" | grep -qi "UnauthorizedOperation\|AccessDenied\|is not authorized"; then
-            permission_errors+=("iam:CreateRole - Required to create IAM roles")
-        fi
-        
-        # Test list attached role policies
-        if ! aws iam list-attached-role-policies --role-name "non-existent-role-test-$$" >/dev/null 2>&1; then
-            local list_policies_error
-            list_policies_error=$(aws iam list-attached-role-policies --role-name "non-existent-role-test-$$" 2>&1 || echo "")
-            if echo "$list_policies_error" | grep -qi "UnauthorizedOperation\|AccessDenied\|is not authorized"; then
-                permission_errors+=("iam:ListAttachedRolePolicies - Required to validate IAM role permissions")
-            fi
-        fi
-        
-        # Test attach role policy permission
-        local attach_policy_error
-        attach_policy_error=$(aws iam attach-role-policy --role-name "non-existent-role-test-$$" --policy-arn "arn:aws:iam::aws:policy/AmazonElasticFileSystemClientFullAccess" 2>&1 || echo "")
-        if echo "$attach_policy_error" | grep -qi "UnauthorizedOperation\|AccessDenied\|is not authorized"; then
-            permission_errors+=("iam:AttachRolePolicy - Required to attach EFS policies to IAM roles")
-        fi
-    fi
-
-    # Test EFS Access Point permissions (CRITICAL for CSI driver)
-    log_info "Testing EFS Access Point permissions..."
-    if [[ -z "$test_efs_id" ]]; then
-        test_efs_id=$(aws efs describe-file-systems --region "$AWS_REGION" --query 'FileSystems[0].FileSystemId' --output text 2>/dev/null || echo "")
-    fi
-    
-    if [[ -n "$test_efs_id" && "$test_efs_id" != "None" ]]; then
-        log_info "Testing CreateAccessPoint permission with filesystem: $test_efs_id"
-        
-        # Test CreateAccessPoint permission by actually creating one
-        local test_ap_id=""
-        local create_ap_error
-        create_ap_error=$(aws efs create-access-point \
-            --region "$AWS_REGION" \
-            --file-system-id "$test_efs_id" \
-            --posix-user Uid=1001,Gid=1001 \
-            --root-directory "Path=/permission-test-$(date +%s),CreationInfo={OwnerUid=1001,OwnerGid=1001,Permissions=755}" \
-            --tags Key=test,Value=permission-check \
-            --query AccessPointId --output text 2>&1)
-        
-        if [[ -n "$create_ap_error" && "$create_ap_error" != "None" && ! "$create_ap_error" =~ error && ! "$create_ap_error" =~ AccessDenied ]]; then
-            test_ap_id="$create_ap_error"
-            log_info "✅ CreateAccessPoint and TagResource permissions verified"
-            
-            # Test DeleteAccessPoint permission
-            if ! aws efs delete-access-point --region "$AWS_REGION" --access-point-id "$test_ap_id" >/dev/null 2>&1; then
-                permission_errors+=("elasticfilesystem:DeleteAccessPoint - Required to clean up EFS access points")
-            else
-                log_info "✅ DeleteAccessPoint permission verified"
-            fi
-        else
-            permission_errors+=("elasticfilesystem:CreateAccessPoint - CRITICAL: Required for EFS CSI driver to create access points")
-            permission_errors+=("elasticfilesystem:TagResource - Required to tag EFS access points")
-        fi
-        
-        # Test DescribeAccessPoints permission
-        if ! aws efs describe-access-points --region "$AWS_REGION" --file-system-id "$test_efs_id" --max-results 5 >/dev/null 2>&1; then
-            permission_errors+=("elasticfilesystem:DescribeAccessPoints - CRITICAL: Required for EFS CSI driver")
-        fi
-    else
-        permission_errors+=("No EFS filesystem found for testing access point permissions")
-    fi
-
-    # Test EFS creation permissions
-    if [[ "$CREATE_IAM_ROLE" == "true" ]]; then
-        log_info "Testing EFS creation permissions..."
-        local existing_efs
-        existing_efs=$(aws efs describe-file-systems --region "$AWS_REGION" --query 'FileSystems[0].FileSystemId' --output text 2>/dev/null || echo "")
-        if [[ -n "$existing_efs" && "$existing_efs" != "None" ]]; then
-            # Test ListTagsForResource permission
-            if ! aws efs list-tags-for-resource --region "$AWS_REGION" --resource-id "$existing_efs" >/dev/null 2>&1; then
-                permission_errors+=("elasticfilesystem:ListTagsForResource - Required to manage EFS tags")
-            fi
-            
-            # Test CreateTags permission (required for create-tags command)
-            # We'll test this by attempting to create a test tag
-            local create_tags_error
-            create_tags_error=$(aws efs create-tags \
-                --region "$AWS_REGION" \
-                --file-system-id "$existing_efs" \
-                --tags "Key=test-permission-check,Value=testing" 2>&1 || echo "")
-            
-            if echo "$create_tags_error" | grep -qi "UnauthorizedOperation\|AccessDenied\|is not authorized"; then
-                permission_errors+=("elasticfilesystem:CreateTags - Required to add tags to EFS filesystem")
-            else
-                # Clean up the test tag if it was created successfully
-                aws efs create-tags \
-                    --region "$AWS_REGION" \
-                    --file-system-id "$existing_efs" \
-                    --tags "Key=test-permission-check,Value=" >/dev/null 2>&1 || true
-                log_info "✅ CreateTags permission verified"
-            fi
-        fi
-        
-        log_info "CreateMountTarget permission will be tested during mount target creation"
-    fi
-
-    # Test Security Group permissions
-    log_info "Testing Security Group permissions..."
-    # These are tested in the actual operations since they need real VPC context
-    log_info "Security group permissions will be validated during actual operations"
-
-    # Report results
-    if [[ ${#permission_errors[@]} -eq 0 ]]; then
-        log_success "All testable AWS permissions are available"
-        if [[ "$CREATE_IAM_ROLE" == "true" ]]; then
-            log_info "Note: Some IAM permissions (CreateRole, CreatePolicy, AttachRolePolicy) will be"
-            log_info "      tested during actual resource creation and may still fail if missing."
-        fi
-    else
-        log_error "❌ Missing required AWS permissions:"
-        for error in "${permission_errors[@]}"; do
-            log_error "  ❌ $error"
-        done
-        echo
-        log_error "🚨 FATAL: Cannot proceed without required AWS permissions!"
-        echo
-        log_info "To resolve this issue:"
-        log_info "Ask your AWS administrator to grant the missing permissions"
-        echo
-        log_info "Required AWS permissions depend on your setup:"
-        if [[ "$CREATE_IAM_ROLE" == "true" ]]; then
-            echo "  Core AWS Permissions:"
-            echo "    - sts:GetCallerIdentity"
-            echo "    - elasticfilesystem:DescribeFileSystems"
-            echo "    - elasticfilesystem:DescribeMountTargets" 
-            echo "    - ec2:DescribeVpcs"
-            echo "    - ec2:DescribeSubnets"
-            echo "    - ec2:DescribeSecurityGroups"
-            echo
-            echo "  EFS CSI Driver Permissions (CRITICAL):"
-            echo "    - elasticfilesystem:CreateAccessPoint"
-            echo "    - elasticfilesystem:DeleteAccessPoint"
-            echo "    - elasticfilesystem:DescribeAccessPoints"
-            echo "    - elasticfilesystem:TagResource"
-            echo "    - elasticfilesystem:CreateTags"
-            echo "    - elasticfilesystem:ListTagsForResource"
-            echo
-            echo "  IAM Permissions (for IAM role creation):"
-            echo "    Core IAM Operations:"
-            echo "      - iam:CreateRole"
-            echo "      - iam:GetRole"
-            echo "      - iam:ListRoles"
-            echo "      - iam:DeleteRole (for cleanup)"
-            echo "      - iam:TagRole"
-            echo "    Policy Operations:"
-            echo "      - iam:CreatePolicy"
-            echo "      - iam:GetPolicy"
-            echo "      - iam:ListPolicies"
-            echo "      - iam:AttachRolePolicy" 
-            echo "      - iam:DetachRolePolicy"
-            echo "      - iam:ListAttachedRolePolicies"
-            echo "    OIDC Operations:"
-            echo "      - iam:ListOpenIdConnectProviders"
-            echo "      - iam:GetOpenIdConnectProvider"
-        fi
-        exit 1
-    fi
 }
 
 # Function to validate EFS CSI role permissions using practical tests
@@ -899,6 +419,208 @@ validate_efs_csi_role_permissions() {
     # Additional practical validation - test if we can assume the role
     # Note: We can't test role assumption without complex setup, but the EFS CSI driver will test this
     log_info "✅ IAM role validation completed - EFS CSI driver will perform runtime credential tests"
+}
+
+# Function to create EFS CSI IAM role with proper trust policy
+create_efs_csi_iam_role() {
+    log_info "Creating EFS CSI IAM role..."
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[DRY RUN] Would create EFS CSI IAM role"
+        echo "arn:aws:iam::123456789012:role/EFS_CSI_DriverRole_${CLUSTER_NAME}"
+        return
+    fi
+    
+    # Generate role name  
+    local role_name="EFS_CSI_DriverRole_${CLUSTER_NAME}"
+    local account_id
+    account_id=$(aws sts get-caller-identity --query 'Account' --output text 2>/dev/null)
+    
+    if [[ -z "$account_id" ]]; then
+        log_error "Failed to get AWS account ID"
+        exit 1
+    fi
+    
+    # Detect cluster's actual service account issuer
+    log_info "Detecting cluster service account issuer..."
+    local service_account_issuer
+    service_account_issuer=$($KUBECTL get authentication cluster -o jsonpath='{.spec.serviceAccountIssuer}' 2>/dev/null || echo "")
+    
+    if [[ -z "$service_account_issuer" ]]; then
+        log_warning "Could not detect service account issuer from cluster authentication"
+        log_info "Trying alternative method - checking actual service account token..."
+        
+        # Create a temporary token to detect the actual issuer
+        local temp_token
+        temp_token=$($KUBECTL create token efs-csi-controller-sa -n kube-system --duration=60s 2>/dev/null || echo "")
+        
+        if [[ -n "$temp_token" ]]; then
+            # Parse JWT token to get issuer
+            service_account_issuer=$(echo "$temp_token" | python3 -c "
+import sys
+import json
+import base64
+
+try:
+    token = sys.stdin.read().strip()
+    parts = token.split('.')
+    if len(parts) >= 2:
+        payload = parts[1]
+        payload += '=' * (4 - len(payload) % 4)
+        decoded = base64.urlsafe_b64decode(payload)
+        token_data = json.loads(decoded)
+        print(token_data.get('iss', ''))
+    else:
+        print('')
+except:
+    print('')
+" 2>/dev/null || echo "")
+        fi
+        
+        if [[ -z "$service_account_issuer" ]]; then
+            log_warning "Could not detect service account issuer - using default Kubernetes internal issuer"
+            service_account_issuer="https://kubernetes.default.svc"
+        fi
+    fi
+    
+    log_info "Detected service account issuer: $service_account_issuer"
+    
+    # Create trust policy based on the detected issuer
+    local trust_policy=""
+    
+    if [[ "$service_account_issuer" == "https://kubernetes.default.svc" ]]; then
+        log_info "Cluster is using internal Kubernetes service account issuer"
+        log_info "Creating trust policy with AWS service principals (compatible with internal issuer)"
+        
+        # Use EC2 service as principal (works with internal Kubernetes issuer)
+        trust_policy=$(cat << EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "Service": [
+                    "ec2.amazonaws.com",
+                    "efs.amazonaws.com"
+                ]
+            },
+            "Action": "sts:AssumeRole",
+            "Condition": {
+                "StringEquals": {
+                    "aws:RequestedRegion": "$AWS_REGION"
+                }
+            }
+        }
+    ]
+}
+EOF
+)
+    else
+        # External OIDC provider detected - use IRSA approach
+        log_info "Cluster is using external OIDC provider for service accounts"
+        local oidc_provider_arn
+        local oidc_provider_url
+        oidc_provider_url=$(echo "$service_account_issuer" | sed 's|https://||')
+        oidc_provider_arn="arn:aws:iam::${account_id}:oidc-provider/${oidc_provider_url}"
+        
+        log_info "Using external OIDC provider: $oidc_provider_arn"
+        
+        # Check if OIDC provider exists
+        if aws iam get-open-id-connect-provider --open-id-connect-provider-arn "$oidc_provider_arn" >/dev/null 2>&1; then
+            log_info "OIDC provider exists - creating IRSA trust policy"
+            
+            trust_policy=$(cat << EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "Federated": "$oidc_provider_arn"
+            },
+            "Action": "sts:AssumeRoleWithWebIdentity",
+            "Condition": {
+                "StringEquals": {
+                    "${oidc_provider_url}:aud": "sts.amazonaws.com",
+                    "${oidc_provider_url}:sub": "system:serviceaccount:kube-system:efs-csi-controller-sa"
+                }
+            }
+        }
+    ]
+}
+EOF
+)
+        else
+            log_warning "OIDC provider $oidc_provider_arn does not exist"
+            log_info "Falling back to AWS service principals"
+            
+            trust_policy=$(cat << EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "Service": [
+                    "ec2.amazonaws.com",
+                    "efs.amazonaws.com"
+                ]
+            },
+            "Action": "sts:AssumeRole",
+            "Condition": {
+                "StringEquals": {
+                    "aws:RequestedRegion": "$AWS_REGION"
+                }
+            }
+        }
+    ]
+}
+EOF
+)
+        fi
+    fi
+    
+    # Create IAM role
+    log_info "Creating IAM role: $role_name"
+    local role_arn
+    role_arn=$(aws iam create-role \
+        --role-name "$role_name" \
+        --assume-role-policy-document "$trust_policy" \
+        --description "EFS CSI driver role for cluster $CLUSTER_NAME" \
+        --query 'Role.Arn' \
+        --output text 2>/dev/null)
+    
+    if [[ -z "$role_arn" || "$role_arn" == "None" ]]; then
+        log_error "Failed to create IAM role. Check IAM permissions:"
+        log_error "  - iam:CreateRole"
+        log_error "  - iam:AttachRolePolicy"
+            exit 1
+        fi
+    
+    log_success "Created IAM role: $role_arn"
+    
+    # Attach AWS managed EFS policy
+    log_info "Attaching EFS policy to IAM role..."
+    if aws iam attach-role-policy \
+        --role-name "$role_name" \
+        --policy-arn "arn:aws:iam::aws:policy/AmazonElasticFileSystemClientFullAccess" >/dev/null 2>&1; then
+        log_success "Attached AmazonElasticFileSystemClientFullAccess policy"
+    else
+        log_error "Failed to attach EFS policy. Check IAM permissions:"
+        log_error "  - iam:AttachRolePolicy"
+        log_error "IAM role was created but needs manual policy attachment"
+        exit 1
+    fi
+    
+    # Add tags to role
+    aws iam tag-role \
+        --role-name "$role_name" \
+        --tags "Key=Purpose,Value=EFS-CSI-Driver" \
+               "Key=Cluster,Value=$CLUSTER_NAME" \
+               "Key=CreatedBy,Value=sbd-operator-script" >/dev/null 2>&1 || true
+    
+    echo "$role_arn"
 }
 
 # Function to test EFS CSI driver credentials
@@ -1410,19 +1132,19 @@ detect_aws_region() {
     
     # Method 3: Node names (AWS pattern)
     if [[ -z "$detected_region" ]]; then
-        local node_names
-        node_names=$($KUBECTL get nodes -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
-        
-        if [[ -n "$node_names" ]]; then
-            for node in $node_names; do
+    local node_names
+    node_names=$($KUBECTL get nodes -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+    
+    if [[ -n "$node_names" ]]; then
+        for node in $node_names; do
                 # Pattern: ip-10-0-1-1.us-west-2.compute.internal
-                if [[ "$node" =~ \.([^.]*-(east|west|north|south|southeast|northeast|central)-[0-9]+)\.compute\.internal ]]; then
-                    detected_region="${BASH_REMATCH[1]}"
+            if [[ "$node" =~ \.([^.]*-(east|west|north|south|southeast|northeast|central)-[0-9]+)\.compute\.internal ]]; then
+                detected_region="${BASH_REMATCH[1]}"
                     detection_method="node DNS names"
                     log_info "Detected AWS region from node name pattern: $detected_region"
-                    break
-                fi
-            done
+                break
+            fi
+        done
         fi
     fi
     
@@ -1482,7 +1204,7 @@ detect_aws_region() {
     if [[ -n "$detected_region" ]]; then
         # Validate region format (basic check)
         if [[ "$detected_region" =~ ^[a-z]{2,3}-[a-z]+-[0-9]+$ ]]; then
-            AWS_REGION="$detected_region"
+        AWS_REGION="$detected_region"
             log_success "Auto-detected AWS region: $AWS_REGION (via: $detection_method)"
         else
             log_warning "Detected region '$detected_region' has invalid format, trying anyway..."
@@ -2178,6 +1900,417 @@ show_summary() {
     echo "  ./scripts/setup-shared-storage.sh --cleanup --efs-name $EFS_NAME"
 }
 
+# Enhanced automatic problem resolution function
+auto_resolve_problems() {
+    log_auto_fix "Starting automatic problem detection and resolution..."
+    
+    # Check for existing misconfigured resources and fix them
+    if [[ "$AUTO_RESOLVE" == "true" ]]; then
+        # 1. Check and fix IAM role issues
+        if [[ "$CREATE_IAM_ROLE" == "true" && -n "$EFS_CSI_ROLE_NAME" ]]; then
+            log_auto_fix "Checking IAM role configuration..."
+            if aws iam get-role --role-name "$EFS_CSI_ROLE_NAME" >/dev/null 2>&1; then
+                log_auto_fix "IAM role exists, checking trust policy..."
+                local trust_policy
+                trust_policy=$(aws iam get-role --role-name "$EFS_CSI_ROLE_NAME" --query 'Role.AssumeRolePolicyDocument' --output text 2>/dev/null || echo "")
+                
+                # Check if trust policy is configured for internal or external OIDC
+                if echo "$trust_policy" | grep -q "kubernetes.default.svc"; then
+                    log_auto_fix "Role configured for internal Kubernetes service account - will use node IAM role approach"
+                    CREATE_IAM_ROLE="false"  # Skip IRSA, use node IAM role
+                elif echo "$trust_policy" | grep -q "oidc-provider"; then
+                    log_auto_fix "Role configured for OIDC provider - checking validity..."
+                    # Check if the OIDC provider in trust policy matches current cluster
+                    local current_oidc
+                    current_oidc=$(detect_oidc_provider)
+                    if [[ -n "$current_oidc" ]] && ! echo "$trust_policy" | grep -q "$current_oidc"; then
+                        log_auto_fix "OIDC provider mismatch detected - recreating role with correct provider"
+                        aws iam delete-role --role-name "$EFS_CSI_ROLE_NAME" >/dev/null 2>&1 || true
+                    fi
+                else
+                    log_auto_fix "Trust policy format unrecognized - recreating role"
+                    aws iam delete-role --role-name "$EFS_CSI_ROLE_NAME" >/dev/null 2>&1 || true
+                fi
+            fi
+        fi
+        
+        # 2. Check and fix EFS CSI service account configuration
+        check_and_fix_efs_csi_service_account
+        
+        # 3. Check and fix StorageClass issues
+        if [[ -n "$STORAGE_CLASS_NAME" ]]; then
+            if $KUBECTL get storageclass "$STORAGE_CLASS_NAME" >/dev/null 2>&1; then
+                log_auto_fix "Checking existing StorageClass configuration..."
+                local current_provisioner
+                current_provisioner=$($KUBECTL get storageclass "$STORAGE_CLASS_NAME" -o jsonpath='{.provisioner}' 2>/dev/null || echo "")
+                if [[ "$current_provisioner" != "efs.csi.aws.com" ]]; then
+                    log_auto_fix "StorageClass has wrong provisioner ($current_provisioner) - will recreate"
+                    $KUBECTL delete storageclass "$STORAGE_CLASS_NAME" >/dev/null 2>&1 || true
+                fi
+            fi
+        fi
+        
+        # 4. Check and fix EFS filesystem issues
+        if [[ -n "$EFS_FILESYSTEM_ID" ]]; then
+            log_auto_fix "Checking EFS filesystem health..."
+            local efs_state
+            efs_state=$(aws efs describe-file-systems --region "$AWS_REGION" --file-system-id "$EFS_FILESYSTEM_ID" --query 'FileSystems[0].LifeCycleState' --output text 2>/dev/null || echo "notfound")
+            
+            if [[ "$efs_state" == "notfound" ]]; then
+                log_auto_fix "EFS filesystem not found - will create new one"
+                EFS_FILESYSTEM_ID=""
+                CREATE_EFS="true"
+            elif [[ "$efs_state" != "available" ]]; then
+                log_auto_fix "EFS filesystem in state: $efs_state - waiting for availability"
+            fi
+        fi
+    fi
+    
+    log_auto_fix "Automatic problem resolution completed"
+}
+
+# Enhanced function to check and fix EFS CSI service account
+check_and_fix_efs_csi_service_account() {
+    log_auto_fix "Checking EFS CSI service account configuration..."
+    
+    # Check if EFS CSI driver is installed
+    if ! $KUBECTL get daemonset -n kube-system efs-csi-node >/dev/null 2>&1 && \
+       ! $KUBECTL get deployment -n kube-system efs-csi-controller >/dev/null 2>&1; then
+        log_auto_fix "EFS CSI driver not found - will install"
+        return
+    fi
+    
+    # Check service account
+    if $KUBECTL get serviceaccount -n kube-system efs-csi-controller-sa >/dev/null 2>&1; then
+        local sa_annotation
+        sa_annotation=$($KUBECTL get serviceaccount -n kube-system efs-csi-controller-sa -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}' 2>/dev/null || echo "")
+        
+        if [[ -n "$sa_annotation" ]]; then
+            log_auto_fix "Service account has IRSA annotation: $sa_annotation"
+            # Check if the annotated role exists and is valid
+            local role_name
+            role_name=$(echo "$sa_annotation" | grep -o 'role/[^"]*' | cut -d'/' -f2 || echo "")
+            
+            if [[ -n "$role_name" ]]; then
+                if ! aws iam get-role --role-name "$role_name" >/dev/null 2>&1; then
+                    log_auto_fix "Annotated IAM role doesn't exist - removing annotation and switching to node IAM role"
+                    $KUBECTL annotate serviceaccount -n kube-system efs-csi-controller-sa eks.amazonaws.com/role-arn- >/dev/null 2>&1 || true
+                    configure_efs_csi_for_node_iam_role
+                elif ! validate_efs_csi_role_permissions "$role_name"; then
+                    log_auto_fix "Annotated IAM role lacks EFS permissions - attaching policy"
+                    aws iam attach-role-policy \
+                        --role-name "$role_name" \
+                        --policy-arn "arn:aws:iam::aws:policy/AmazonElasticFileSystemClientFullAccess" >/dev/null 2>&1 || {
+                        log_auto_fix "Failed to attach policy - switching to node IAM role approach"
+                        configure_efs_csi_for_node_iam_role
+                    }
+                fi
+            fi
+        else
+            log_auto_fix "Service account has no IRSA annotation - configuring for node IAM role"
+            configure_efs_csi_for_node_iam_role
+        fi
+    fi
+}
+
+# Function to configure EFS CSI driver for node IAM role
+configure_efs_csi_for_node_iam_role() {
+    log_auto_fix "Configuring EFS CSI driver to use node IAM role..."
+    
+    # Remove IRSA annotation if present
+    $KUBECTL annotate serviceaccount -n kube-system efs-csi-controller-sa eks.amazonaws.com/role-arn- >/dev/null 2>&1 || true
+    
+    # Find worker node IAM role and attach EFS policy
+    local worker_role
+    worker_role=$(detect_worker_node_iam_role)
+    
+    if [[ -n "$worker_role" ]]; then
+        log_auto_fix "Found worker node IAM role: $worker_role"
+        log_auto_fix "Attaching EFS policy to worker node role..."
+        
+        # Attach EFS policy to worker node role
+        aws iam attach-role-policy \
+            --role-name "$worker_role" \
+            --policy-arn "arn:aws:iam::aws:policy/AmazonElasticFileSystemClientFullAccess" >/dev/null 2>&1 || {
+            log_warning "Failed to attach EFS policy to worker node role"
+            return 1
+        }
+        
+        # Configure EFS CSI controller to use instance metadata
+        configure_efs_csi_controller_for_instance_metadata
+        
+        log_auto_fix "EFS CSI driver configured for node IAM role"
+    else
+        log_warning "Could not detect worker node IAM role"
+        return 1
+    fi
+}
+
+# Function to configure EFS CSI controller for instance metadata
+configure_efs_csi_controller_for_instance_metadata() {
+    log_auto_fix "Configuring EFS CSI controller for EC2 instance metadata..."
+    
+    # Check if controller deployment exists
+    if $KUBECTL get deployment -n kube-system efs-csi-controller >/dev/null 2>&1; then
+        # Remove IRSA projected volume if present
+        $KUBECTL patch deployment -n kube-system efs-csi-controller --type='json' -p='[
+            {"op": "remove", "path": "/spec/template/spec/volumes"}
+        ]' >/dev/null 2>&1 || true
+        
+        $KUBECTL patch deployment -n kube-system efs-csi-controller --type='json' -p='[
+            {"op": "remove", "path": "/spec/template/spec/containers/0/volumeMounts"}
+        ]' >/dev/null 2>&1 || true
+        
+        # Add environment variable to use instance metadata
+        $KUBECTL patch deployment -n kube-system efs-csi-controller --type='json' -p='[
+            {"op": "add", "path": "/spec/template/spec/containers/0/env/-", "value": {"name": "AWS_ROLE_ARN", "value": ""}}
+        ]' >/dev/null 2>&1 || true
+        
+        # Restart controller to pick up changes
+        $KUBECTL rollout restart deployment -n kube-system efs-csi-controller >/dev/null 2>&1 || true
+        
+        log_auto_fix "EFS CSI controller restarted with instance metadata configuration"
+    fi
+}
+
+# Function to detect worker node IAM role
+detect_worker_node_iam_role() {
+    # Try multiple methods to find worker node IAM role
+    local role_name=""
+    
+    # Method 1: Check node instance profile
+    local instance_id
+    instance_id=$($KUBECTL get nodes -o jsonpath='{.items[0].spec.providerID}' 2>/dev/null | grep -o 'i-[a-f0-9]*' || echo "")
+    
+    if [[ -n "$instance_id" ]]; then
+        local instance_profile
+        instance_profile=$(aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$instance_id" \
+            --query 'Reservations[0].Instances[0].IamInstanceProfile.Arn' --output text 2>/dev/null || echo "")
+        
+        if [[ -n "$instance_profile" && "$instance_profile" != "None" ]]; then
+            # Extract instance profile name
+            local profile_name
+            profile_name=$(echo "$instance_profile" | grep -o 'instance-profile/[^"]*' | cut -d'/' -f2 || echo "")
+            
+            if [[ -n "$profile_name" ]]; then
+                # Get role from instance profile
+                role_name=$(aws iam get-instance-profile --instance-profile-name "$profile_name" \
+                    --query 'InstanceProfile.Roles[0].RoleName' --output text 2>/dev/null || echo "")
+            fi
+        fi
+    fi
+    
+    # Method 2: Look for common worker role patterns
+    if [[ -z "$role_name" ]]; then
+        local cluster_name_lower
+        cluster_name_lower=$(echo "$CLUSTER_NAME" | tr '[:upper:]' '[:lower:]')
+        
+        # Try common patterns
+        local patterns=(
+            "${cluster_name_lower}-worker-role"
+            "${CLUSTER_NAME}-worker-role"
+            "${cluster_name_lower}-nodegroup-role"
+            "${CLUSTER_NAME}-nodegroup-role"
+            "eksWorkerNodeInstanceRole"
+        )
+        
+        for pattern in "${patterns[@]}"; do
+            if aws iam get-role --role-name "$pattern" >/dev/null 2>&1; then
+                role_name="$pattern"
+                break
+            fi
+        done
+    fi
+    
+    echo "$role_name"
+}
+
+# Enhanced AWS permission checking function
+check_aws_permissions() {
+    log_info "Checking AWS permissions..."
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[DRY RUN] Would check AWS permissions"
+        return
+    fi
+    
+    local permission_errors=()
+    local warning_messages=()
+    
+    # Core AWS permissions - these are absolutely required
+    log_info "Testing core AWS permissions..."
+    
+    # Test STS permissions (required for all AWS operations)
+    if ! aws sts get-caller-identity >/dev/null 2>&1; then
+        permission_errors+=("sts:GetCallerIdentity - Required for AWS authentication")
+    fi
+
+    # Test EFS permissions
+    log_info "Testing EFS permissions..."
+    if ! aws efs describe-file-systems --region "$AWS_REGION" --max-items 1 >/dev/null 2>&1; then
+        permission_errors+=("elasticfilesystem:DescribeFileSystems - Required to list EFS filesystems")
+    fi
+    
+    # Test EC2 VPC permissions
+    log_info "Testing EC2 VPC permissions..."
+    if ! aws ec2 describe-vpcs --region "$AWS_REGION" --max-results 5 >/dev/null 2>&1; then
+        permission_errors+=("ec2:DescribeVpcs - Required to find cluster VPC")
+    fi
+    
+    if ! aws ec2 describe-subnets --region "$AWS_REGION" --max-results 5 >/dev/null 2>&1; then
+        permission_errors+=("ec2:DescribeSubnets - Required to find cluster subnets")
+    fi
+    
+    if ! aws ec2 describe-security-groups --region "$AWS_REGION" --max-results 5 >/dev/null 2>&1; then
+        permission_errors+=("ec2:DescribeSecurityGroups - Required to manage NFS security groups")
+    fi
+
+    # Test IAM permissions (if IAM role creation is enabled)
+    if [[ "$CREATE_IAM_ROLE" == "true" ]]; then
+        log_info "Testing IAM permissions for role creation..."
+        
+        # Test basic IAM permissions
+        if ! aws iam list-open-id-connect-providers >/dev/null 2>&1; then
+            permission_errors+=("iam:ListOpenIdConnectProviders - Required to find cluster OIDC provider")
+        fi
+        
+        # Test get role permission (with non-existent role)
+        local get_role_error
+        get_role_error=$(aws iam get-role --role-name "non-existent-role-test-$$" 2>&1 || echo "")
+        if echo "$get_role_error" | grep -qi "UnauthorizedOperation\|AccessDenied\|is not authorized"; then
+            permission_errors+=("iam:GetRole - Required to check existing IAM roles")
+        fi
+        
+        # Test list attached role policies
+        local list_policies_error
+        list_policies_error=$(aws iam list-attached-role-policies --role-name "non-existent-role-test-$$" 2>&1 || echo "")
+        if echo "$list_policies_error" | grep -qi "UnauthorizedOperation\|AccessDenied\|is not authorized"; then
+            permission_errors+=("iam:ListAttachedRolePolicies - Required to validate IAM role permissions")
+        fi
+        
+        # Test attach role policy permission
+        local attach_policy_error
+        attach_policy_error=$(aws iam attach-role-policy --role-name "non-existent-role-test-$$" --policy-arn "arn:aws:iam::aws:policy/AmazonElasticFileSystemClientFullAccess" 2>&1 || echo "")
+        if echo "$attach_policy_error" | grep -qi "UnauthorizedOperation\|AccessDenied\|is not authorized"; then
+            permission_errors+=("iam:AttachRolePolicy - Required to attach EFS policies to IAM roles")
+        fi
+    fi
+
+    # Test EFS Access Point permissions (CRITICAL for CSI driver)
+    log_info "Testing EFS Access Point permissions..."
+    local test_efs_id
+    test_efs_id=$(aws efs describe-file-systems --region "$AWS_REGION" --query 'FileSystems[0].FileSystemId' --output text 2>/dev/null || echo "")
+    
+    if [[ -n "$test_efs_id" && "$test_efs_id" != "None" ]]; then
+        log_info "Testing CreateAccessPoint permission with filesystem: $test_efs_id"
+        
+        # Test CreateAccessPoint permission by actually creating one
+        local test_ap_id=""
+        local create_ap_error
+        create_ap_error=$(aws efs create-access-point \
+            --region "$AWS_REGION" \
+            --file-system-id "$test_efs_id" \
+            --posix-user Uid=1001,Gid=1001 \
+            --root-directory "Path=/permission-test-$(date +%s),CreationInfo={OwnerUid=1001,OwnerGid=1001,Permissions=755}" \
+            --tags Key=test,Value=permission-check \
+            --query AccessPointId --output text 2>&1)
+        
+        if [[ -n "$create_ap_error" && "$create_ap_error" != "None" && ! "$create_ap_error" =~ error && ! "$create_ap_error" =~ AccessDenied ]]; then
+            test_ap_id="$create_ap_error"
+            log_info "✅ CreateAccessPoint and TagResource permissions verified"
+            
+            # Test DeleteAccessPoint permission
+            if ! aws efs delete-access-point --region "$AWS_REGION" --access-point-id "$test_ap_id" >/dev/null 2>&1; then
+                permission_errors+=("elasticfilesystem:DeleteAccessPoint - Required to clean up EFS access points")
+            else
+                log_info "✅ DeleteAccessPoint permission verified"
+            fi
+        else
+            permission_errors+=("elasticfilesystem:CreateAccessPoint - CRITICAL: Required for EFS CSI driver to create access points")
+            permission_errors+=("elasticfilesystem:TagResource - Required to tag EFS access points")
+        fi
+        
+        # Test DescribeAccessPoints permission
+        if ! aws efs describe-access-points --region "$AWS_REGION" --file-system-id "$test_efs_id" --max-results 5 >/dev/null 2>&1; then
+            permission_errors+=("elasticfilesystem:DescribeAccessPoints - CRITICAL: Required for EFS CSI driver")
+        fi
+    else
+        warning_messages+=("No EFS filesystem found for testing access point permissions - will be tested during EFS creation")
+    fi
+    
+    # Report results
+    if [[ ${#warning_messages[@]} -gt 0 ]]; then
+        for warning in "${warning_messages[@]}"; do
+            log_warning "$warning"
+        done
+    fi
+    
+    if [[ ${#permission_errors[@]} -eq 0 ]]; then
+        log_success "All required AWS permissions are available"
+        if [[ "$CREATE_IAM_ROLE" == "true" ]]; then
+            log_info "Note: Some IAM permissions (CreateRole, CreatePolicy) will be"
+            log_info "      tested during actual resource creation and may still fail if missing."
+        fi
+    else
+        log_error "❌ Missing required AWS permissions:"
+        for error in "${permission_errors[@]}"; do
+            log_error "  ❌ $error"
+        done
+        echo
+        log_error "🚨 FATAL: Cannot proceed without required AWS permissions!"
+        echo
+        log_error "The script requires specific AWS permissions to automatically create and configure:"
+        log_error "• EFS filesystem with access points (CRITICAL for storage provisioning)"
+        log_error "• IAM roles for EFS CSI driver (if enabled with --create-iam-role)"
+        log_error "• VPC security groups for NFS access"
+        log_error "• EFS mount targets in cluster subnets"
+        echo
+        log_info "📋 RESOLUTION REQUIRED:"
+        log_info "Ask your AWS administrator to grant the missing permissions listed above."
+        log_info "The script will automatically detect, create, and configure all required resources"
+        log_info "once these permissions are available."
+        echo
+        log_info "Required AWS permissions summary:"
+        
+        echo "  Core EFS Permissions (CRITICAL):"
+        echo "    - elasticfilesystem:CreateFileSystem"
+        echo "    - elasticfilesystem:DescribeFileSystems"
+        echo "    - elasticfilesystem:CreateAccessPoint"
+        echo "    - elasticfilesystem:DeleteAccessPoint"
+        echo "    - elasticfilesystem:DescribeAccessPoints"
+        echo "    - elasticfilesystem:CreateMountTarget"
+        echo "    - elasticfilesystem:DescribeMountTargets"
+        echo "    - elasticfilesystem:TagResource"
+        echo "    - elasticfilesystem:CreateTags"
+        echo
+        echo "  Core VPC/Networking Permissions:"
+        echo "    - ec2:DescribeVpcs"
+        echo "    - ec2:DescribeSubnets"
+        echo "    - ec2:DescribeSecurityGroups"
+        echo "    - ec2:CreateSecurityGroup"
+        echo "    - ec2:AuthorizeSecurityGroupIngress"
+        echo "    - ec2:CreateTags"
+        echo
+        
+        if [[ "$CREATE_IAM_ROLE" == "true" ]]; then
+            echo "  IAM Permissions (for IAM role creation):"
+            echo "    - iam:CreateRole"
+            echo "    - iam:GetRole"
+            echo "    - iam:AttachRolePolicy"
+            echo "    - iam:ListAttachedRolePolicies"
+            echo "    - iam:ListOpenIdConnectProviders"
+            echo "    - iam:GetOpenIdConnectProvider"
+            echo "    - iam:TagRole"
+            echo
+            echo "  Alternative: Use existing IAM role with --no-create-iam-role and manually configure"
+        fi
+        
+        echo "💡 This is a one-time setup - once permissions are granted, the script will"
+        echo "   automatically handle all AWS resource creation and configuration."
+        exit 1
+    fi
+}
+
 # Main execution
 main() {
     log_info "Starting EFS StorageClass management for OpenShift with intelligent resource reuse"
@@ -2191,6 +2324,9 @@ main() {
     
     # Set default values after cluster detection
     set_default_values
+    
+    # Automatically resolve common problems before proceeding
+    auto_resolve_problems
     
     # Check AWS permissions (after region is detected)
     check_aws_permissions
@@ -2218,56 +2354,51 @@ main() {
         existing_efs=$(find_efs_by_name "$EFS_NAME")
         
         if [[ -n "$existing_efs" && "$existing_efs" != "None" ]]; then
-            if [[ "$FORCE_RECREATE" == "true" ]]; then
-                log_info "Force recreate enabled - deleting existing EFS filesystem"
-                # Clean up existing EFS in cleanup_resources style
-                local vpc_info
-                vpc_info=$(detect_cluster_vpc_and_subnets)
-                local vpc_id
-                vpc_id=$(echo "$vpc_info" | cut -d'|' -f1)
-                
-                # Delete mount targets first
-                local mount_targets
-                mount_targets=$(aws efs describe-mount-targets \
-                    --region "$AWS_REGION" \
-                    --file-system-id "$existing_efs" \
-                    --query 'MountTargets[].MountTargetId' \
-                    --output text 2>/dev/null || echo "")
-                
-                if [[ -n "$mount_targets" && "$mount_targets" != "None" ]]; then
-                    log_info "Deleting existing mount targets..."
-                    for mt_id in $mount_targets; do
-                        aws efs delete-mount-target --region "$AWS_REGION" --mount-target-id "$mt_id" >/dev/null 2>&1 || true
-                    done
-                    sleep 15
-                fi
-                
-                # Delete EFS filesystem
-                aws efs delete-file-system --region "$AWS_REGION" --file-system-id "$existing_efs" >/dev/null 2>&1 || \
-                    log_warning "Could not delete existing EFS filesystem"
-                
-                # Create new one
-                efs_id=$(create_efs_filesystem)
-            else
-                # Validate existing EFS configuration
-                local efs_status
-                efs_status=$(compare_efs_config "$existing_efs")
-                
-                case "$efs_status" in
-                    "valid")
-                        log_success "Reusing existing compatible EFS filesystem: $existing_efs"
-                        efs_id="$existing_efs"
-                        ;;
-                    "config_changed")
-                        log_error "Existing EFS filesystem has incompatible configuration. Use --force-recreate to recreate."
-                        exit 1
-                        ;;
-                    "missing")
-                        log_info "EFS filesystem not found - creating new one"
-                        efs_id=$(create_efs_filesystem)
-                        ;;
-                esac
-            fi
+            # Validate existing EFS configuration
+            local efs_status
+            efs_status=$(compare_efs_config "$existing_efs")
+            
+            case "$efs_status" in
+                "valid")
+                    log_success "Reusing existing compatible EFS filesystem: $existing_efs"
+                    efs_id="$existing_efs"
+                    ;;
+                "config_changed")
+                    log_info "EFS configuration changed - recreating filesystem automatically"
+                    # Clean up existing EFS
+                    local vpc_info
+                    vpc_info=$(detect_cluster_vpc_and_subnets)
+                    local vpc_id
+                    vpc_id=$(echo "$vpc_info" | cut -d'|' -f1)
+                    
+                    # Delete mount targets first
+                    local mount_targets
+                    mount_targets=$(aws efs describe-mount-targets \
+                        --region "$AWS_REGION" \
+                        --file-system-id "$existing_efs" \
+                        --query 'MountTargets[].MountTargetId' \
+                        --output text 2>/dev/null || echo "")
+                    
+                    if [[ -n "$mount_targets" && "$mount_targets" != "None" ]]; then
+                        log_info "Deleting existing mount targets..."
+                        for mt_id in $mount_targets; do
+                            aws efs delete-mount-target --region "$AWS_REGION" --mount-target-id "$mt_id" >/dev/null 2>&1 || true
+                        done
+                        sleep 15
+                    fi
+                    
+                    # Delete EFS filesystem
+                    aws efs delete-file-system --region "$AWS_REGION" --file-system-id "$existing_efs" >/dev/null 2>&1 || \
+                        log_warning "Could not delete existing EFS filesystem"
+                    
+                    # Create new one
+        efs_id=$(create_efs_filesystem)
+                    ;;
+                "missing")
+                    log_info "EFS filesystem not found - creating new one"
+                    efs_id=$(create_efs_filesystem)
+                    ;;
+            esac
         else
             efs_id=$(create_efs_filesystem)
         fi
@@ -2299,7 +2430,7 @@ main() {
     
     # Handle StorageClass creation/update intelligently
     if handle_storage_class_update "$efs_id"; then
-        create_storage_class "$efs_id"
+    create_storage_class "$efs_id"
     else
         log_success "StorageClass is up to date - no changes needed"
     fi

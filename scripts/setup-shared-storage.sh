@@ -399,7 +399,8 @@ OPENSHIFT INTEGRATION:
     • Validates CSI driver credential access to AWS APIs
 
 EXAMPLES:
-    # Create new EFS with intelligent resource reuse
+    # Create new EFS with intelligent resource reuse and auto-detection
+    # (automatically detects cluster name and AWS region from OpenShift/Kubernetes)
     $0
 
     # Force recreation of existing resources
@@ -408,13 +409,16 @@ EXAMPLES:
     # Update StorageClass configuration even if identical
     $0 --update-mode
 
+    # Override auto-detected values if needed
+    $0 --cluster-name my-cluster --aws-region us-east-1
+
     # Use existing EFS filesystem with existing IAM role
     $0 --no-create-efs --filesystem-id fs-1234567890abcdef0 --efs-csi-role-name MyEFSRole
 
     # Create with custom names and skip IAM role creation
     $0 --efs-name my-shared-storage --storage-class-name my-efs-sc --no-create-iam-role
 
-    # Preview changes without executing (shows resource reuse plan)
+    # Preview changes without executing (shows resource reuse plan and detected values)
     $0 --dry-run
 
     # Clean up everything
@@ -431,16 +435,24 @@ REQUIREMENTS:
     • IAM permissions for role creation (if --create-iam-role)
 
 The script automatically:
-    1. Detects cluster name and AWS region
-    2. Validates AWS permissions for EFS and EC2 operations
-    3. Intelligently detects and reuses existing compatible AWS resources
-    4. Installs/verifies EFS CSI driver
-    5. Creates and configures IAM roles for EFS CSI service account (with smart reuse)
-    6. Creates EFS filesystem with proper tags (or reuses existing compatible ones)
-    7. Sets up complete networking (VPC, subnets, security groups, mount targets)
-    8. Creates/updates StorageClass with EFS Access Point provisioning for ReadWriteMany (RWX) access
-    9. Handles StorageClass updates by deleting and recreating (since they cannot be updated)
-    10. Provides comprehensive cleanup functionality and resource validation
+    1. Auto-detects cluster name from OpenShift/Kubernetes cluster using multiple methods:
+       • OpenShift Infrastructure object (most reliable)
+       • OpenShift DNS configuration and Console routes
+       • Kubernetes node labels and provider IDs
+       • kubectl context parsing with pattern matching
+    2. Auto-detects AWS region from cluster configuration:
+       • OpenShift Infrastructure platformStatus
+       • Node provider IDs and zone labels
+       • Machine configuration and StorageClass parameters
+    3. Validates AWS permissions for EFS and EC2 operations
+    4. Intelligently detects and reuses existing compatible AWS resources
+    5. Installs/verifies EFS CSI driver
+    6. Creates and configures IAM roles for EFS CSI service account (with smart reuse)
+    7. Creates EFS filesystem with proper tags (or reuses existing compatible ones)
+    8. Sets up complete networking (VPC, subnets, security groups, mount targets)
+    9. Creates/updates StorageClass with EFS Access Point provisioning for ReadWriteMany (RWX) access
+    10. Handles StorageClass updates by deleting and recreating (since they cannot be updated)
+    11. Provides comprehensive cleanup functionality and resource validation
 
 EOF
 }
@@ -1211,67 +1223,298 @@ EOF
     esac
 }
 
-# Function to auto-detect cluster name
+# Function to auto-detect cluster name from OpenShift/Kubernetes cluster
 detect_cluster_name() {
-    if [[ -z "$CLUSTER_NAME" ]]; then
-        log_info "Auto-detecting cluster name..."
+    if [[ -n "$CLUSTER_NAME" ]]; then
+        log_info "Using specified cluster name: $CLUSTER_NAME"
+        return
+    fi
+    
+    log_info "Auto-detecting cluster name from OpenShift/Kubernetes cluster..."
+    
+    local detected_name=""
+    local detection_method=""
+    
+    # Method 1: OpenShift Infrastructure object (most reliable for OpenShift)
+    if [[ -z "$detected_name" ]]; then
+        detected_name=$($KUBECTL get infrastructure cluster -o jsonpath='{.status.infrastructureName}' 2>/dev/null || echo "")
+        if [[ -n "$detected_name" ]]; then
+            detection_method="infrastructure.status.infrastructureName"
+            log_info "Detected cluster name from OpenShift infrastructure: $detected_name"
+        fi
+    fi
+    
+    # Method 2: OpenShift cluster domain from Infrastructure spec
+    if [[ -z "$detected_name" ]]; then
+        local cluster_domain
+        cluster_domain=$($KUBECTL get infrastructure cluster -o jsonpath='{.spec.cloudConfig.name}' 2>/dev/null || echo "")
+        if [[ -n "$cluster_domain" ]]; then
+            # Extract cluster name from domain (e.g., mycluster-12345 from mycluster-12345.example.com)
+            detected_name=$(echo "$cluster_domain" | cut -d'.' -f1)
+            detection_method="infrastructure.spec.cloudConfig.name"
+            log_info "Detected cluster name from cloud config: $detected_name"
+        fi
+    fi
+    
+    # Method 3: OpenShift DNS configuration
+    if [[ -z "$detected_name" ]]; then
+        local dns_domain
+        dns_domain=$($KUBECTL get dns cluster -o jsonpath='{.spec.baseDomain}' 2>/dev/null || echo "")
+        if [[ -n "$dns_domain" ]]; then
+            # Try to extract cluster name from base domain
+            # Pattern: apps.clustername.domain.com -> clustername
+            if [[ "$dns_domain" =~ ^apps\.([^.]+)\. ]]; then
+                detected_name="${BASH_REMATCH[1]}"
+                detection_method="dns.spec.baseDomain"
+                log_info "Detected cluster name from DNS base domain: $detected_name"
+            fi
+        fi
+    fi
+    
+    # Method 4: OpenShift Console URL
+    if [[ -z "$detected_name" ]]; then
+        local console_url
+        console_url=$($KUBECTL get route console -n openshift-console -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
+        if [[ -n "$console_url" ]]; then
+            # Pattern: console-openshift-console.apps.clustername.domain.com -> clustername  
+            if [[ "$console_url" =~ apps\.([^.]+)\. ]]; then
+                detected_name="${BASH_REMATCH[1]}"
+                detection_method="console route host"
+                log_info "Detected cluster name from console route: $detected_name"
+            fi
+        fi
+    fi
+    
+    # Method 5: Node labels (for OpenShift/EKS clusters)
+    if [[ -z "$detected_name" ]]; then
+        # Check for cluster-specific node labels
+        local cluster_label
+        cluster_label=$($KUBECTL get nodes -o jsonpath='{.items[0].metadata.labels}' 2>/dev/null | grep -o 'kubernetes\.io/cluster/[^"]*' | head -1 | cut -d'/' -f3 || echo "")
+        if [[ -n "$cluster_label" ]]; then
+            detected_name="$cluster_label"
+            detection_method="node labels kubernetes.io/cluster"
+            log_info "Detected cluster name from node labels: $detected_name"
+        fi
+    fi
+    
+    # Method 6: EKS cluster name from node provider ID
+    if [[ -z "$detected_name" ]]; then
+        local provider_id
+        provider_id=$($KUBECTL get nodes -o jsonpath='{.items[0].spec.providerID}' 2>/dev/null || echo "")
+        if [[ "$provider_id" =~ aws:///([^/]+)/ ]]; then
+            local availability_zone="${BASH_REMATCH[1]}"
+            # For EKS, try to get cluster name from instance metadata
+            local instance_id
+            if [[ "$provider_id" =~ /([i-][a-f0-9]+)$ ]]; then
+                instance_id="${BASH_REMATCH[1]}"
+                # Try to get cluster name from instance tags
+                local cluster_tag
+                cluster_tag=$(aws ec2 describe-instances \
+                    --instance-ids "$instance_id" \
+                    --region "${availability_zone%?}" \
+                    --query 'Reservations[0].Instances[0].Tags[?Key==`kubernetes.io/cluster/*`].Key' \
+                    --output text 2>/dev/null | cut -d'/' -f3 || echo "")
+                if [[ -n "$cluster_tag" ]]; then
+                    detected_name="$cluster_tag"
+                    detection_method="EC2 instance tags"
+                    log_info "Detected cluster name from EC2 instance tags: $detected_name"
+                fi
+            fi
+        fi
+    fi
+    
+    # Method 7: Current kubectl context (fallback)
+    if [[ -z "$detected_name" ]]; then
+        local context_name
+        context_name=$($KUBECTL config current-context 2>/dev/null || echo "")
+        if [[ -n "$context_name" ]]; then
+            # Try different context patterns
+            if [[ "$context_name" =~ ^[^/]+/[^/]+:([^/]+)/ ]]; then
+                # Pattern: user/cluster:server/context
+                detected_name="${BASH_REMATCH[1]}"
+                detection_method="kubectl context (pattern 1)"
+            elif [[ "$context_name" =~ /([^/]+)$ ]]; then
+                # Pattern: anything/clustername
+                detected_name="${BASH_REMATCH[1]}"
+                detection_method="kubectl context (pattern 2)"
+            elif [[ "$context_name" =~ ^([^-]+)-[a-f0-9]{8,}$ ]]; then
+                # Pattern: clustername-hash
+                detected_name="${context_name%-*}"
+                detection_method="kubectl context (pattern 3)"
+            else
+                # Use full context name as fallback
+                detected_name="$context_name"
+                detection_method="kubectl context (full name)"
+            fi
+            log_info "Detected cluster name from kubectl context: $detected_name"
+        fi
+    fi
+    
+    # Method 8: ClusterVersion for OpenShift (additional validation)
+    if [[ -n "$detected_name" ]]; then
+        local cluster_id
+        cluster_id=$($KUBECTL get clusterversion version -o jsonpath='{.spec.clusterID}' 2>/dev/null || echo "")
+        if [[ -n "$cluster_id" ]]; then
+            log_info "Cluster ID: $cluster_id (method: $detection_method)"
+        fi
+    fi
+    
+    # Validate and set cluster name
+    if [[ -n "$detected_name" ]]; then
+        # Clean up cluster name (remove special characters, make lowercase)
+        CLUSTER_NAME=$(echo "$detected_name" | sed 's/[^a-zA-Z0-9-]/-/g' | tr '[:upper:]' '[:lower:]' | sed 's/--*/-/g' | sed 's/^-\|-$//g')
         
-        # Get cluster name from context
-        CLUSTER_NAME=$($KUBECTL config current-context 2>/dev/null | cut -d'/' -f2 2>/dev/null || echo "")
-        
-        # Fallback: try to get from cluster infrastructure
-        if [[ -z "$CLUSTER_NAME" ]]; then
-            CLUSTER_NAME=$($KUBECTL get infrastructure cluster -o jsonpath='{.status.infrastructureName}' 2>/dev/null || echo "")
+        if [[ ${#CLUSTER_NAME} -gt 63 ]]; then
+            # AWS resource names have limits, truncate if necessary
+            CLUSTER_NAME="${CLUSTER_NAME:0:63}"
+            log_warning "Cluster name truncated to 63 characters: $CLUSTER_NAME"
         fi
         
-        if [[ -n "$CLUSTER_NAME" ]]; then
-            log_info "Detected cluster name: $CLUSTER_NAME"
-        else
-            log_error "Could not auto-detect cluster name. Please specify with --cluster-name"
-            exit 1
-        fi
+        log_success "Auto-detected cluster name: $CLUSTER_NAME (via: $detection_method)"
+    else
+        log_error "Could not auto-detect cluster name from any available source."
+        log_error "Available detection methods attempted:"
+        log_error "  1. OpenShift Infrastructure object"
+        log_error "  2. OpenShift DNS configuration"
+        log_error "  3. OpenShift Console route"
+        log_error "  4. Kubernetes node labels"
+        log_error "  5. AWS EC2 instance tags"
+        log_error "  6. kubectl current context"
+        log_error ""
+        log_error "Please specify cluster name manually with --cluster-name"
+        log_error "Example: $0 --cluster-name my-openshift-cluster"
+        exit 1
     fi
 }
 
-# Function to auto-detect AWS region
+# Function to auto-detect AWS region from OpenShift/Kubernetes cluster
 detect_aws_region() {
     if [[ -n "$AWS_REGION" ]]; then
         log_info "Using specified AWS region: $AWS_REGION"
         return
     fi
     
-    log_info "Auto-detecting AWS region..."
+    log_info "Auto-detecting AWS region from OpenShift/Kubernetes cluster..."
     
-    # Try to detect region from cluster nodes
     local detected_region=""
-    local node_names
-    node_names=$($KUBECTL get nodes -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+    local detection_method=""
     
-    if [[ -n "$node_names" ]]; then
-        for node in $node_names; do
-            if [[ "$node" =~ \.([^.]*-(east|west|north|south|southeast|northeast|central)-[0-9]+)\.compute\.internal ]]; then
-                detected_region="${BASH_REMATCH[1]}"
-                log_info "Detected region from node name pattern: $detected_region"
-                break
-            fi
-        done
+    # Method 1: OpenShift Infrastructure object (most reliable for OpenShift)
+    if [[ -z "$detected_region" ]]; then
+        detected_region=$($KUBECTL get infrastructure cluster -o jsonpath='{.status.platformStatus.aws.region}' 2>/dev/null || echo "")
+        if [[ -n "$detected_region" ]]; then
+            detection_method="infrastructure.status.platformStatus.aws.region"
+            log_info "Detected AWS region from OpenShift infrastructure: $detected_region"
+        fi
     fi
     
-    # Fallback: try AWS CLI default region
+    # Method 2: Node provider IDs (works for both OpenShift and EKS)
+    if [[ -z "$detected_region" ]]; then
+        local provider_id
+        provider_id=$($KUBECTL get nodes -o jsonpath='{.items[0].spec.providerID}' 2>/dev/null || echo "")
+        if [[ "$provider_id" =~ aws:///([^/]+)/ ]]; then
+            # Extract region from availability zone (remove last character)
+            local availability_zone="${BASH_REMATCH[1]}"
+            detected_region="${availability_zone%?}"
+            detection_method="node provider ID"
+            log_info "Detected AWS region from node provider ID: $detected_region"
+        fi
+    fi
+    
+    # Method 3: Node names (AWS pattern)
+    if [[ -z "$detected_region" ]]; then
+        local node_names
+        node_names=$($KUBECTL get nodes -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+        
+        if [[ -n "$node_names" ]]; then
+            for node in $node_names; do
+                # Pattern: ip-10-0-1-1.us-west-2.compute.internal
+                if [[ "$node" =~ \.([^.]*-(east|west|north|south|southeast|northeast|central)-[0-9]+)\.compute\.internal ]]; then
+                    detected_region="${BASH_REMATCH[1]}"
+                    detection_method="node DNS names"
+                    log_info "Detected AWS region from node name pattern: $detected_region"
+                    break
+                fi
+            done
+        fi
+    fi
+    
+    # Method 4: Node zone labels
+    if [[ -z "$detected_region" ]]; then
+        local zone_label
+        zone_label=$($KUBECTL get nodes -o jsonpath='{.items[0].metadata.labels.topology\.kubernetes\.io/zone}' 2>/dev/null || echo "")
+        if [[ -n "$zone_label" ]]; then
+            # Extract region from zone (remove last character)
+            detected_region="${zone_label%?}"
+            detection_method="node zone labels"
+            log_info "Detected AWS region from node zone label: $detected_region"
+        fi
+    fi
+    
+    # Method 5: OpenShift Machine Config
+    if [[ -z "$detected_region" ]]; then
+        local machine_region
+        machine_region=$($KUBECTL get machine -n openshift-machine-api -o jsonpath='{.items[0].spec.providerSpec.value.placement.region}' 2>/dev/null || echo "")
+        if [[ -n "$machine_region" ]]; then
+            detected_region="$machine_region"
+            detection_method="machine placement.region"
+            log_info "Detected AWS region from machine config: $detected_region"
+        fi
+    fi
+    
+    # Method 6: StorageClass region parameters
+    if [[ -z "$detected_region" ]]; then
+        local sc_region
+        sc_region=$($KUBECTL get storageclass -o jsonpath='{.items[?(@.provisioner=="ebs.csi.aws.com")].parameters.region}' 2>/dev/null | head -1 || echo "")
+        if [[ -n "$sc_region" ]]; then
+            detected_region="$sc_region"
+            detection_method="StorageClass parameters"
+            log_info "Detected AWS region from StorageClass: $detected_region"
+        fi
+    fi
+    
+    # Method 7: AWS CLI default region
     if [[ -z "$detected_region" ]]; then
         detected_region=$(aws configure get region 2>/dev/null || echo "")
+        if [[ -n "$detected_region" ]]; then
+            detection_method="AWS CLI configuration"
+            log_info "Detected AWS region from AWS CLI config: $detected_region"
+        fi
     fi
     
-    # Fallback: try environment variable
+    # Method 8: Environment variable
     if [[ -z "$detected_region" ]]; then
         detected_region="$AWS_DEFAULT_REGION"
+        if [[ -n "$detected_region" ]]; then
+            detection_method="AWS_DEFAULT_REGION environment variable"
+            log_info "Using AWS region from environment: $detected_region"
+        fi
     fi
     
+    # Validate and set region
     if [[ -n "$detected_region" ]]; then
-        AWS_REGION="$detected_region"
-        log_info "Using AWS region: $AWS_REGION"
+        # Validate region format (basic check)
+        if [[ "$detected_region" =~ ^[a-z]{2,3}-[a-z]+-[0-9]+$ ]]; then
+            AWS_REGION="$detected_region"
+            log_success "Auto-detected AWS region: $AWS_REGION (via: $detection_method)"
+        else
+            log_warning "Detected region '$detected_region' has invalid format, trying anyway..."
+            AWS_REGION="$detected_region"
+        fi
     else
-        log_error "Could not auto-detect AWS region. Please specify with --region or set AWS_REGION"
+        log_error "Could not auto-detect AWS region from any available source."
+        log_error "Available detection methods attempted:"
+        log_error "  1. OpenShift Infrastructure object"
+        log_error "  2. Node provider IDs"
+        log_error "  3. Node DNS names"
+        log_error "  4. Node zone labels"
+        log_error "  5. OpenShift Machine Config"
+        log_error "  6. StorageClass parameters"
+        log_error "  7. AWS CLI configuration"
+        log_error "  8. Environment variables"
+        log_error ""
+        log_error "Please specify AWS region manually with --aws-region"
+        log_error "Example: $0 --aws-region us-west-2"
         exit 1
     fi
 }

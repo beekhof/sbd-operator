@@ -934,7 +934,7 @@ EOF
     local max_attempts=30
     local attempt=0
     local test_result="unknown"
-    local hypershift_irsa_issue=false
+    local detailed_error_messages=""
     
     while [[ $attempt -lt $max_attempts ]]; do
         local pvc_status
@@ -948,19 +948,27 @@ EOF
             break
         fi
         
-        # Check for events indicating credential issues
+        # Collect detailed error information from events
         local pvc_events
         pvc_events=$($KUBECTL get events -n default --field-selector involvedObject.name="$test_pvc_name" -o json 2>/dev/null | jq -r '.items[].message' 2>/dev/null || echo "")
         
-        # Check for HyperShift IRSA configuration issue
-        if echo "$pvc_events" | grep -qi "No OpenIDConnect provider found.*kubernetes.default.svc"; then
-            test_result="hypershift_irsa_issue"
-            hypershift_irsa_issue=true
+        if [[ -n "$pvc_events" ]]; then
+            detailed_error_messages="$pvc_events"
+        fi
+        
+        # Check for specific error patterns
+        if echo "$pvc_events" | grep -qi "No OpenIDConnect provider found\|could not get OIDC provider\|oidc.*not found"; then
+            test_result="oidc_provider_issue"
             break
         fi
         
-        if echo "$pvc_events" | grep -qi "credential\|permission\|unauthorized\|access.*denied"; then
+        if echo "$pvc_events" | grep -qi "credential\|permission\|unauthorized\|access.*denied\|AssumeRoleWithWebIdentity"; then
             test_result="credential_error"
+            break
+        fi
+        
+        if echo "$pvc_events" | grep -qi "storage class.*not found\|provisioner.*not found"; then
+            test_result="storage_class_error"
             break
         fi
         
@@ -968,123 +976,126 @@ EOF
         ((attempt++))
     done
     
+    # Get additional diagnostic information
+    local csi_controller_logs=""
+    local service_account_config=""
+    
+    # Get EFS CSI controller logs (last 50 lines)
+    csi_controller_logs=$($KUBECTL logs -n kube-system deployment/efs-csi-controller --container=efs-plugin --tail=50 2>/dev/null || echo "Could not retrieve CSI controller logs")
+    
+    # Get service account configuration
+    service_account_config=$($KUBECTL get serviceaccount efs-csi-controller-sa -n kube-system -o yaml 2>/dev/null || echo "Could not retrieve service account config")
+    
     # Clean up test PVC
-    $KUBECTL delete pvc "$test_pvc_name" -n default --ignore-not-found=true
+    $KUBECTL delete pvc "$test_pvc_name" -n default --ignore-not-found=true >/dev/null 2>&1
     
     case "$test_result" in
         "success")
             log_success "✅ EFS CSI driver credentials are working correctly"
+            log_success "✅ Test PVC was successfully provisioned and bound"
             ;;
-        "hypershift_irsa_issue")
+        "oidc_provider_issue")
             log_error "❌ EFS CSI driver credential validation failed"
-            log_error "❌ HyperShift IRSA (IAM Roles for Service Accounts) configuration issue detected"
+            log_error "❌ OIDC Provider configuration issue detected"
             echo
-            log_error "🔍 DIAGNOSIS: Your HyperShift cluster is using the internal Kubernetes service account"
-            log_error "              token issuer (https://kubernetes.default.svc) instead of the external"
-            log_error "              OIDC provider required for AWS IRSA functionality."
+            log_error "🔍 DETAILED ERROR MESSAGES:"
+            echo "$detailed_error_messages" | while IFS= read -r line; do
+                if [[ -n "$line" ]]; then
+                    log_error "   $line"
+                fi
+            done
             echo
-            log_error "💡 SOLUTION OPTIONS:"
-            log_error "   1. PREFERRED: Ask your cluster administrator to configure HyperShift for AWS IRSA"
-            log_error "   2. WORKAROUND: Use static EFS provisioning instead of dynamic provisioning"
+            log_error "💡 DIAGNOSIS: The IAM role cannot be assumed because the OIDC provider"
+            log_error "              trust policy doesn't match your cluster's actual OIDC issuer."
             echo
-            log_error "📋 Infrastructure Status:"
-            log_error "   ✅ EFS Filesystem: Created successfully"
-            log_error "   ✅ IAM Role: Created with correct trust policy and permissions"
-            log_error "   ✅ StorageClass: Created successfully"
-            log_error "   ❌ Dynamic PVC Provisioning: Blocked by IRSA configuration"
+            log_error "🔧 TROUBLESHOOTING STEPS:"
+            log_error "   1. Check your cluster's OIDC provider URL:"
+            log_error "      $KUBECTL get authentication cluster -o jsonpath='{.spec.serviceAccountIssuer}'"
             echo
-            log_error "🔧 Static Provisioning Workaround:"
-            log_error "   You can use the created EFS filesystem directly with static PVs:"
-            log_error "   See documentation: docs/static-efs-provisioning.md"
+            log_error "   2. Verify the IAM role trust policy matches the OIDC provider:"
+            local role_name
+            role_name=$($KUBECTL get serviceaccount efs-csi-controller-sa -n kube-system -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}' 2>/dev/null | sed 's|.*/||' || echo "unknown")
+            if [[ "$role_name" != "unknown" ]]; then
+                log_error "      aws iam get-role --role-name $role_name --query 'Role.AssumeRolePolicyDocument'"
+            fi
+            echo
+            log_error "   3. Update the IAM role trust policy with the correct OIDC provider URL"
+            log_error "   4. Ensure the OIDC provider exists in your AWS account"
             exit 1
             ;;
         "credential_error")
-            log_error "❌ EFS CSI driver credential validation failed"
-            log_error "❌ Check the service account IAM role configuration and permissions"
+            log_error "❌ EFS CSI driver credential validation failed" 
+            log_error "❌ AWS credential or permission issue detected"
             echo
-            log_error "🔍 Common causes:"
-            log_error "   - IAM role missing EFS permissions"
-            log_error "   - Incorrect OIDC provider trust policy"
-            log_error "   - Service account not properly annotated"
+            log_error "🔍 DETAILED ERROR MESSAGES:"
+            echo "$detailed_error_messages" | while IFS= read -r line; do
+                if [[ -n "$line" ]]; then
+                    log_error "   $line"
+                fi
+            done
             echo
-            log_error "💡 Troubleshooting steps:"
-            log_error "   1. Verify IAM role has AmazonElasticFileSystemClientFullAccess policy"
-            log_error "   2. Check service account annotation: eks.amazonaws.com/role-arn"
-            log_error "   3. Verify OIDC provider trust policy matches cluster"
+            log_error "💡 COMMON CAUSES:"
+            log_error "   - IAM role missing required EFS permissions"
+            log_error "   - Service account not properly annotated with IAM role ARN"
+            log_error "   - IAM role trust policy doesn't allow the service account to assume it"
+            echo
+            log_error "🔧 TROUBLESHOOTING STEPS:"
+            log_error "   1. Verify service account annotation:"
+            local current_role
+            current_role=$($KUBECTL get serviceaccount efs-csi-controller-sa -n kube-system -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}' 2>/dev/null || echo "NOT SET")
+            log_error "      Current role-arn: $current_role"
+            echo
+            log_error "   2. Verify IAM role has EFS permissions:"
+            if [[ "$current_role" != "NOT SET" ]]; then
+                local role_name
+                role_name=$(basename "$current_role")
+                log_error "      aws iam list-attached-role-policies --role-name $role_name"
+            fi
+            echo
+            log_error "   3. Check EFS CSI controller logs for detailed errors:"
+            log_error "      $KUBECTL logs -n kube-system deployment/efs-csi-controller"
+            exit 1
+            ;;
+        "storage_class_error")
+            log_error "❌ StorageClass configuration issue detected"
+            log_error "🔍 DETAILED ERROR MESSAGES:"
+            echo "$detailed_error_messages" | while IFS= read -r line; do
+                if [[ -n "$line" ]]; then
+                    log_error "   $line"
+                fi
+            done
             exit 1
             ;;
         "failed")
-            log_warning "⚠️  Test PVC failed to provision (may be due to other issues)"
-            log_info "Check PVC events for more details: oc describe pvc $test_pvc_name"
+            log_error "❌ Test PVC failed to provision"
+            log_error "🔍 DETAILED ERROR MESSAGES:"
+            echo "$detailed_error_messages" | while IFS= read -r line; do
+                if [[ -n "$line" ]]; then
+                    log_error "   $line"
+                fi
+            done
+            echo
+            log_error "🔧 MANUAL DEBUGGING:"
+            log_error "   Check PVC events: $KUBECTL describe pvc $test_pvc_name -n default"
+            log_error "   Check CSI logs: $KUBECTL logs -n kube-system deployment/efs-csi-controller"
+            exit 1
             ;;
         *)
             log_warning "⚠️  Could not determine EFS CSI driver credential status within timeout"
-            log_info "The EFS infrastructure was created successfully, but credential testing timed out"
+            if [[ -n "$detailed_error_messages" ]]; then
+                log_warning "🔍 Last known error messages:"
+                echo "$detailed_error_messages" | while IFS= read -r line; do
+                    if [[ -n "$line" ]]; then
+                        log_warning "   $line"
+                    fi
+                done
+            fi
+            log_info "📋 The EFS infrastructure was created successfully"
+            log_info "🔧 Manual verification steps:"
+            log_info "   1. Check if test PVC eventually succeeds: $KUBECTL get pvc -n default"
+            log_info "   2. Review EFS CSI controller logs: $KUBECTL logs -n kube-system deployment/efs-csi-controller"
             ;;
     esac
-}
-
-# Function to validate EFS CSI role permissions using practical tests
-validate_efs_csi_role_permissions() {
-    local role_arn="$1"
-    local role_name
-    role_name=$(basename "$role_arn")
-    
-    log_info "Validating IAM role permissions: $role_name"
-    
-    # Check if role has required AWS managed policy attached
-    local attached_policies
-    attached_policies=$(aws iam list-attached-role-policies --role-name "$role_name" --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null || echo "")
-    
-    if [[ -z "$attached_policies" ]]; then
-        log_error "❌ FATAL: Cannot read IAM role policies - missing iam:ListAttachedRolePolicies permission"
-        log_error "Ask your AWS administrator to grant you iam:ListAttachedRolePolicies permission"
-        exit 1
-    fi
-    
-    # Check for AWS managed EFS policy
-    local has_efs_policy=false
-    local policy_names=()
-    
-    for policy_arn in $attached_policies; do
-        local policy_name
-        policy_name=$(basename "$policy_arn")
-        policy_names+=("$policy_name")
-        
-        # Check for AWS managed EFS policies
-        if [[ "$policy_arn" == "arn:aws:iam::aws:policy/AmazonElasticFileSystemClientFullAccess" ]] || \
-           [[ "$policy_arn" == "arn:aws:iam::aws:policy/AmazonElasticFileSystemFullAccess" ]] || \
-           [[ "$policy_name" == *"EFS"* ]] || \
-           [[ "$policy_name" == *"ElasticFileSystem"* ]]; then
-            has_efs_policy=true
-            log_success "✅ Found EFS policy: $policy_name"
-            break
-        fi
-    done
-    
-    if [[ "$has_efs_policy" == "false" ]]; then
-        log_error "❌ FATAL: IAM role '$role_name' missing required EFS permissions!"
-        echo
-        log_error "Current attached policies:"
-        for policy_name in "${policy_names[@]}"; do
-            log_error "  - $policy_name"
-        done
-        echo
-        log_error "Required: The IAM role must have EFS permissions attached."
-        log_error "SOLUTION: Ask your AWS administrator to run:"
-        log_error "  aws iam attach-role-policy \\"
-        log_error "    --role-name $role_name \\"
-        log_error "    --policy-arn arn:aws:iam::aws:policy/AmazonElasticFileSystemClientFullAccess"
-        echo
-        log_error "This validation is mandatory and cannot be bypassed"
-        exit 1
-    fi
-    
-    log_success "✅ IAM role has required EFS permissions attached"
-    
-    # Additional practical validation - test if we can assume the role
-    # Note: We can't test role assumption without complex setup, but the EFS CSI driver will test this
-    log_info "✅ IAM role validation completed - EFS CSI driver will perform runtime credential tests"
 }
 
 # Function to check and configure EFS CSI service account

@@ -34,6 +34,9 @@ DRY_RUN="false"
 CREATE_EFS="true"
 SKIP_CSI_INSTALL="false"
 SKIP_PERMISSION_CHECKS="false"
+SKIP_IAM_ROLE_CHECK="false"
+EFS_CSI_ROLE_NAME=""  # Auto-detected or specified
+CREATE_IAM_ROLE="true"
 
 # Functions
 log_info() {
@@ -60,6 +63,9 @@ This script sets up EFS-based shared storage for OpenShift/Kubernetes clusters.
 It creates an EFS filesystem, configures networking (VPC, subnets, security groups,
 mount targets), installs the EFS CSI driver, and creates a StorageClass.
 
+For OpenShift on AWS, this script also configures the proper IAM roles and 
+service account annotations required for the EFS CSI driver to access AWS APIs.
+
 OPTIONS:
     --create-efs                Create a new EFS filesystem (default: true)
     --no-create-efs            Use existing EFS filesystem (requires --filesystem-id)
@@ -68,8 +74,12 @@ OPTIONS:
     --storage-class-name NAME  Name for the StorageClass (default: sbd-efs-sc)
     --cluster-name NAME        Override cluster name detection
     --aws-region REGION        Override AWS region detection
+    --efs-csi-role-name NAME   Specify EFS CSI IAM role name (default: auto-detect)
+    --create-iam-role          Create EFS CSI IAM role if missing (default: true)
+    --no-create-iam-role       Skip IAM role creation
     --cleanup                  Clean up all created resources
     --skip-permission-checks   Skip AWS permission validation (use with caution)
+    --skip-iam-role-check      Skip EFS CSI service account IAM role validation
     --dry-run                  Show what would be done without executing
     --verbose                  Enable verbose logging
     --help                     Show this help message
@@ -81,15 +91,21 @@ NETWORKING FEATURES:
     • Configures EFS CSI driver with cluster credentials
     • Handles existing resources gracefully (idempotent)
 
+OPENSHIFT INTEGRATION:
+    • Validates EFS CSI service account IAM role configuration
+    • Creates IAM roles with proper EFS permissions if needed
+    • Configures service account annotations for AWS access
+    • Validates CSI driver credential access to AWS APIs
+
 EXAMPLES:
-    # Create new EFS with automatic networking setup
+    # Create new EFS with automatic IAM role setup
     $0
 
-    # Use existing EFS filesystem
-    $0 --no-create-efs --filesystem-id fs-1234567890abcdef0
+    # Use existing EFS filesystem with existing IAM role
+    $0 --no-create-efs --filesystem-id fs-1234567890abcdef0 --efs-csi-role-name MyEFSRole
 
-    # Create with custom names
-    $0 --efs-name my-shared-storage --storage-class-name my-efs-sc
+    # Create with custom names and skip IAM role creation
+    $0 --efs-name my-shared-storage --storage-class-name my-efs-sc --no-create-iam-role
 
     # Preview changes without executing
     $0 --dry-run
@@ -102,15 +118,17 @@ REQUIREMENTS:
     • AWS CLI configured with appropriate permissions
     • kubectl/oc CLI tools
     • Cluster admin permissions
+    • IAM permissions for role creation (if --create-iam-role)
 
 The script automatically:
     1. Detects cluster name and AWS region
     2. Validates AWS permissions for EFS and EC2 operations
     3. Installs/verifies EFS CSI driver
-    4. Creates EFS filesystem with proper tags
-    5. Sets up complete networking (VPC, subnets, security groups, mount targets)
-    6. Creates StorageClass with EFS Access Point provisioning for ReadWriteMany (RWX) access
-    7. Provides comprehensive cleanup functionality
+    4. Creates and configures IAM roles for EFS CSI service account
+    5. Creates EFS filesystem with proper tags
+    6. Sets up complete networking (VPC, subnets, security groups, mount targets)
+    7. Creates StorageClass with EFS Access Point provisioning for ReadWriteMany (RWX) access
+    8. Provides comprehensive cleanup functionality
 
 EOF
 }
@@ -169,6 +187,22 @@ while [[ $# -gt 0 ]]; do
             ;;
         --skip-permission-checks)
             SKIP_PERMISSION_CHECKS="true"
+            shift
+            ;;
+        --skip-iam-role-check)
+            SKIP_IAM_ROLE_CHECK="true"
+            shift
+            ;;
+        --efs-csi-role-name)
+            EFS_CSI_ROLE_NAME="$2"
+            shift 2
+            ;;
+        --create-iam-role)
+            CREATE_IAM_ROLE="true"
+            shift
+            ;;
+        --no-create-iam-role)
+            CREATE_IAM_ROLE="false"
             shift
             ;;
         --dry-run)
@@ -393,6 +427,35 @@ check_aws_permissions() {
     # We'll test CreateSecurityGroup during actual security group creation
     # But we can test AuthorizeSecurityGroupIngress on an existing group if needed
     
+    # Test IAM permissions (if IAM role creation is enabled)
+    if [[ "$CREATE_IAM_ROLE" == "true" && "$SKIP_IAM_ROLE_CHECK" == "false" ]]; then
+        log_info "Testing IAM permissions for role creation..."
+        
+        # Test basic IAM permissions
+        if ! aws sts get-caller-identity >/dev/null 2>&1; then
+            permission_errors+=("sts:GetCallerIdentity")
+        fi
+        
+        # Test list OIDC providers permission
+        if ! aws iam list-open-id-connect-providers >/dev/null 2>&1; then
+            permission_errors+=("iam:ListOpenIdConnectProviders")
+        fi
+        
+        # Test get role permission (with non-existent role)
+        if ! aws iam get-role --role-name "non-existent-role-test" >/dev/null 2>&1; then
+            # Check if it's a permission error vs. not found error
+            local get_role_error
+            get_role_error=$(aws iam get-role --role-name "non-existent-role-test" 2>&1 || true)
+            if [[ "$get_role_error" =~ AccessDenied ]] || [[ "$get_role_error" =~ UnauthorizedOperation ]]; then
+                permission_errors+=("iam:GetRole")
+            fi
+        fi
+        
+        # Note: We don't test CreateRole/CreatePolicy here as they would create actual resources
+        # These will be tested during actual IAM role creation
+        log_info "IAM role creation permissions will be tested during actual role creation"
+    fi
+    
     # Report results
     if [[ ${#permission_errors[@]} -eq 0 ]]; then
         log_success "All required AWS permissions are available"
@@ -422,9 +485,407 @@ check_aws_permissions() {
         echo "    - ec2:DeleteSecurityGroup"
         echo "    - ec2:AuthorizeSecurityGroupIngress"
         echo "    - ec2:CreateTags"
+        echo "  IAM Permissions (for IAM role creation):"
+        echo "    - iam:CreateRole"
+        echo "    - iam:GetRole"
+        echo "    - iam:CreatePolicy"
+        echo "    - iam:GetPolicy"
+        echo "    - iam:AttachRolePolicy"
+        echo "    - iam:ListAttachedRolePolicies"
+        echo "    - iam:GetPolicyVersion"
+        echo "    - iam:ListOpenIdConnectProviders"
+        echo "    - sts:GetCallerIdentity"
         echo
         exit 1
     fi
+}
+
+# Function to check and configure EFS CSI service account IAM role
+check_efs_csi_service_account() {
+    log_info "Checking EFS CSI service account configuration..."
+    
+    if [[ "$SKIP_IAM_ROLE_CHECK" == "true" ]]; then
+        log_warning "Skipping EFS CSI service account IAM role checks (--skip-iam-role-check specified)"
+        return
+    fi
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[DRY RUN] Would check and configure EFS CSI service account"
+        return
+    fi
+    
+    # Check if EFS CSI controller service account exists
+    if ! $KUBECTL get serviceaccount efs-csi-controller-sa -n kube-system &>/dev/null; then
+        log_error "EFS CSI controller service account not found. Please install EFS CSI driver first."
+        exit 1
+    fi
+    
+    # Get current service account configuration
+    local current_role_arn
+    current_role_arn=$($KUBECTL get serviceaccount efs-csi-controller-sa -n kube-system -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}' 2>/dev/null || echo "")
+    
+    if [[ -n "$current_role_arn" ]]; then
+        log_success "EFS CSI service account already has IAM role configured: $current_role_arn"
+        
+        # Validate that the role has proper permissions
+        validate_efs_csi_role_permissions "$current_role_arn"
+        return
+    fi
+    
+    log_warning "EFS CSI service account missing IAM role annotation"
+    
+    if [[ "$CREATE_IAM_ROLE" == "false" ]]; then
+        log_error "IAM role creation is disabled and no role is configured."
+        log_error "Either enable IAM role creation (--create-iam-role) or configure manually:"
+        log_error "  1. Create IAM role with EFS permissions"
+        log_error "  2. Add annotation to service account:"
+        log_error "     kubectl annotate serviceaccount efs-csi-controller-sa -n kube-system eks.amazonaws.com/role-arn=arn:aws:iam::ACCOUNT:role/ROLE_NAME"
+        exit 1
+    fi
+    
+    # Create or use existing IAM role
+    local role_arn
+    role_arn=$(setup_efs_csi_iam_role)
+    
+    # Annotate the service account
+    log_info "Adding IAM role annotation to EFS CSI service account..."
+    $KUBECTL annotate serviceaccount efs-csi-controller-sa -n kube-system \
+        "eks.amazonaws.com/role-arn=$role_arn" \
+        --overwrite
+    
+    log_success "EFS CSI service account configured with IAM role: $role_arn"
+    
+    # Restart EFS CSI controller to pick up new credentials
+    log_info "Restarting EFS CSI controller to apply new IAM role..."
+    $KUBECTL rollout restart deployment/efs-csi-controller -n kube-system
+    
+    # Wait for rollout to complete
+    log_info "Waiting for EFS CSI controller restart to complete..."
+    $KUBECTL rollout status deployment/efs-csi-controller -n kube-system --timeout=300s
+    
+    log_success "EFS CSI service account configuration completed"
+}
+
+# Function to setup EFS CSI IAM role
+setup_efs_csi_iam_role() {
+    local role_name="${EFS_CSI_ROLE_NAME:-EFS_CSI_DriverRole_${CLUSTER_NAME}}"
+    
+    log_info "Setting up IAM role for EFS CSI driver: $role_name"
+    
+    # Check if role already exists
+    local existing_role_arn
+    existing_role_arn=$(aws iam get-role --role-name "$role_name" --query 'Role.Arn' --output text 2>/dev/null || echo "")
+    
+    if [[ -n "$existing_role_arn" && "$existing_role_arn" != "None" ]]; then
+        log_info "IAM role already exists: $existing_role_arn"
+        validate_efs_csi_role_permissions "$existing_role_arn"
+        echo "$existing_role_arn"
+        return
+    fi
+    
+    # Get cluster OIDC issuer
+    local oidc_issuer
+    oidc_issuer=$(get_cluster_oidc_issuer)
+    
+    if [[ -z "$oidc_issuer" ]]; then
+        log_error "Could not determine cluster OIDC issuer. This is required for IAM role creation."
+        log_error "Please ensure the cluster has an OIDC identity provider configured."
+        exit 1
+    fi
+    
+    log_info "Using cluster OIDC issuer: $oidc_issuer"
+    
+    # Create trust policy
+    local trust_policy
+    trust_policy=$(cat <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::$(aws sts get-caller-identity --query 'Account' --output text):oidc-provider/${oidc_issuer#https://}"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "${oidc_issuer#https://}:sub": "system:serviceaccount:kube-system:efs-csi-controller-sa",
+          "${oidc_issuer#https://}:aud": "sts.amazonaws.com"
+        }
+      }
+    }
+  ]
+}
+EOF
+)
+    
+    # Create IAM role
+    log_info "Creating IAM role: $role_name"
+    local role_arn
+    role_arn=$(aws iam create-role \
+        --role-name "$role_name" \
+        --assume-role-policy-document "$trust_policy" \
+        --description "IAM role for EFS CSI driver in cluster $CLUSTER_NAME" \
+        --query 'Role.Arn' \
+        --output text)
+    
+    if [[ -z "$role_arn" ]]; then
+        log_error "Failed to create IAM role"
+        exit 1
+    fi
+    
+    log_success "Created IAM role: $role_arn"
+    
+    # Create and attach EFS policy
+    local policy_name="${role_name}_Policy"
+    local policy_document
+    policy_document=$(cat <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "elasticfilesystem:CreateAccessPoint",
+        "elasticfilesystem:DeleteAccessPoint",
+        "elasticfilesystem:DescribeAccessPoints",
+        "elasticfilesystem:DescribeFileSystems",
+        "elasticfilesystem:DescribeMountTargets",
+        "elasticfilesystem:TagResource",
+        "elasticfilesystem:ListTagsForResource"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+EOF
+)
+    
+    # Create policy
+    log_info "Creating IAM policy: $policy_name"
+    local policy_arn
+    policy_arn=$(aws iam create-policy \
+        --policy-name "$policy_name" \
+        --policy-document "$policy_document" \
+        --description "Policy for EFS CSI driver in cluster $CLUSTER_NAME" \
+        --query 'Policy.Arn' \
+        --output text 2>/dev/null || echo "")
+    
+    if [[ -z "$policy_arn" ]]; then
+        # Policy might already exist, try to get it
+        local account_id
+        account_id=$(aws sts get-caller-identity --query 'Account' --output text)
+        policy_arn="arn:aws:iam::${account_id}:policy/${policy_name}"
+        
+        # Check if policy exists
+        if ! aws iam get-policy --policy-arn "$policy_arn" &>/dev/null; then
+            log_error "Failed to create or find IAM policy: $policy_name"
+            exit 1
+        fi
+        log_info "Using existing IAM policy: $policy_arn"
+    else
+        log_success "Created IAM policy: $policy_arn"
+    fi
+    
+    # Attach policy to role
+    log_info "Attaching policy to role..."
+    aws iam attach-role-policy \
+        --role-name "$role_name" \
+        --policy-arn "$policy_arn"
+    
+    log_success "IAM role setup completed: $role_arn"
+    echo "$role_arn"
+}
+
+# Function to get cluster OIDC issuer
+get_cluster_oidc_issuer() {
+    # Try multiple methods to get OIDC issuer
+    
+    # Method 1: From OpenShift cluster authentication
+    local oidc_issuer
+    oidc_issuer=$($KUBECTL get authentication cluster -o jsonpath='{.spec.serviceAccountIssuer}' 2>/dev/null || echo "")
+    
+    if [[ -n "$oidc_issuer" ]]; then
+        echo "$oidc_issuer"
+        return
+    fi
+    
+    # Method 2: From cluster endpoint (for EKS)
+    local cluster_endpoint
+    cluster_endpoint=$($KUBECTL cluster-info | grep 'Kubernetes control plane' | sed -E 's/.*https:\/\/([^:]+).*/\1/' || echo "")
+    
+    if [[ -n "$cluster_endpoint" ]]; then
+        # Try to construct OIDC issuer for EKS
+        local potential_oidc="https://oidc.eks.${AWS_REGION}.amazonaws.com/id/${cluster_endpoint##*.}"
+        
+        # Validate by checking if OIDC provider exists
+        if aws iam list-open-id-connect-providers --query "OpenIDConnectProviderList[?contains(Arn, '$potential_oidc')]" --output text | grep -q "$potential_oidc"; then
+            echo "$potential_oidc"
+            return
+        fi
+    fi
+    
+    # Method 3: Try to find OIDC provider associated with cluster
+    local oidc_providers
+    oidc_providers=$(aws iam list-open-id-connect-providers --query 'OpenIDConnectProviderList[].Arn' --output text 2>/dev/null || echo "")
+    
+    if [[ -n "$oidc_providers" ]]; then
+        # For now, use the first one (this is a fallback)
+        local first_provider
+        first_provider=$(echo "$oidc_providers" | head -n1)
+        if [[ -n "$first_provider" ]]; then
+            # Extract the issuer URL from the ARN
+            echo "https://${first_provider##*/}"
+            return
+        fi
+    fi
+    
+    # No OIDC issuer found
+    echo ""
+}
+
+# Function to validate EFS CSI role permissions
+validate_efs_csi_role_permissions() {
+    local role_arn="$1"
+    local role_name
+    role_name=$(basename "$role_arn")
+    
+    log_info "Validating IAM role permissions: $role_name"
+    
+    # Get attached policies
+    local attached_policies
+    attached_policies=$(aws iam list-attached-role-policies --role-name "$role_name" --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null || echo "")
+    
+    if [[ -z "$attached_policies" ]]; then
+        log_warning "No policies attached to IAM role: $role_name"
+        return
+    fi
+    
+    # Check for required EFS permissions
+    local required_permissions=(
+        "elasticfilesystem:CreateAccessPoint"
+        "elasticfilesystem:DeleteAccessPoint"
+        "elasticfilesystem:DescribeAccessPoints"
+        "elasticfilesystem:DescribeFileSystems"
+        "elasticfilesystem:DescribeMountTargets"
+    )
+    
+    local missing_permissions=()
+    
+    for permission in "${required_permissions[@]}"; do
+        local has_permission=false
+        
+        for policy_arn in $attached_policies; do
+            # Get policy document
+            local policy_version
+            policy_version=$(aws iam get-policy --policy-arn "$policy_arn" --query 'Policy.DefaultVersionId' --output text 2>/dev/null || echo "")
+            
+            if [[ -n "$policy_version" ]]; then
+                local policy_document
+                policy_document=$(aws iam get-policy-version --policy-arn "$policy_arn" --version-id "$policy_version" --query 'PolicyVersion.Document' --output json 2>/dev/null || echo "")
+                
+                if echo "$policy_document" | grep -q "$permission" || echo "$policy_document" | grep -q "elasticfilesystem:\*"; then
+                    has_permission=true
+                    break
+                fi
+            fi
+        done
+        
+        if [[ "$has_permission" == "false" ]]; then
+            missing_permissions+=("$permission")
+        fi
+    done
+    
+    if [[ ${#missing_permissions[@]} -eq 0 ]]; then
+        log_success "IAM role has all required EFS permissions"
+    else
+        log_warning "IAM role missing some EFS permissions:"
+        for perm in "${missing_permissions[@]}"; do
+            log_warning "  - $perm"
+        done
+        log_info "The EFS CSI driver may not function properly without these permissions"
+    fi
+}
+
+# Function to test EFS CSI driver credentials
+test_efs_csi_credentials() {
+    log_info "Testing EFS CSI driver AWS credentials..."
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[DRY RUN] Would test EFS CSI driver credentials"
+        return
+    fi
+    
+    # Create a test PVC to trigger EFS access point creation
+    local test_pvc_name="efs-csi-test-$(date +%s)"
+    
+    log_info "Creating test PVC to validate EFS CSI driver credentials..."
+    
+    cat <<EOF | $KUBECTL apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: $test_pvc_name
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: $STORAGE_CLASS_NAME
+  resources:
+    requests:
+      storage: 1Gi
+EOF
+    
+    # Wait for PVC to be provisioned or fail
+    local max_attempts=30
+    local attempt=0
+    local test_result="unknown"
+    
+    while [[ $attempt -lt $max_attempts ]]; do
+        local pvc_status
+        pvc_status=$($KUBECTL get pvc "$test_pvc_name" -n default -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+        
+        if [[ "$pvc_status" == "Bound" ]]; then
+            test_result="success"
+            break
+        elif [[ "$pvc_status" == "Failed" ]]; then
+            test_result="failed"
+            break
+        fi
+        
+        # Check for events indicating credential issues
+        local pvc_events
+        pvc_events=$($KUBECTL get events -n default --field-selector involvedObject.name="$test_pvc_name" -o json 2>/dev/null | jq -r '.items[].message' 2>/dev/null || echo "")
+        
+        if echo "$pvc_events" | grep -qi "credential\|permission\|unauthorized\|access.*denied"; then
+            test_result="credential_error"
+            break
+        fi
+        
+        sleep 5
+        ((attempt++))
+    done
+    
+    # Clean up test PVC
+    $KUBECTL delete pvc "$test_pvc_name" -n default --ignore-not-found=true
+    
+    case "$test_result" in
+        "success")
+            log_success "EFS CSI driver credentials are working correctly"
+            ;;
+        "credential_error")
+            log_error "EFS CSI driver credential validation failed"
+            log_error "Check the service account IAM role configuration and permissions"
+            exit 1
+            ;;
+        "failed")
+            log_warning "Test PVC failed to provision (may be due to other issues)"
+            log_info "Check PVC events for more details"
+            ;;
+        *)
+            log_warning "Could not determine EFS CSI driver credential status within timeout"
+            ;;
+    esac
 }
 
 # Function to auto-detect cluster name
@@ -1152,6 +1613,9 @@ main() {
     # Install or verify EFS CSI driver
     install_or_verify_efs_csi_driver
     
+    # Check and configure EFS CSI service account IAM role
+    check_efs_csi_service_account
+    
     # Determine EFS filesystem ID
     local efs_id=""
     if [[ "$CREATE_EFS" == "true" ]]; then
@@ -1172,6 +1636,9 @@ main() {
     
     # Create StorageClass
     create_storage_class "$efs_id"
+    
+    # Test EFS CSI driver credentials
+    test_efs_csi_credentials
     
     # Show summary
     if [[ "$DRY_RUN" != "true" ]]; then

@@ -71,6 +71,206 @@ log_auto_fix() {
     echo "[AUTO-FIX] $1"
 }
 
+# Function to check required tools
+check_tools() {
+    log_info "Checking required tools..."
+    
+    # Auto-detect kubectl or oc command
+    if [[ -z "$KUBECTL" ]]; then
+        if command -v oc &> /dev/null; then
+            KUBECTL="oc"
+            log_info "Detected OpenShift CLI: oc"
+        elif command -v kubectl &> /dev/null; then
+            KUBECTL="kubectl" 
+            log_info "Detected Kubernetes CLI: kubectl"
+        else
+            log_error "Neither 'oc' nor 'kubectl' command found"
+            log_error "Please install OpenShift CLI (oc) or Kubernetes CLI (kubectl)"
+            exit 1
+        fi
+    fi
+    
+    local missing_tools=()
+    
+    if ! command -v aws &> /dev/null; then
+        missing_tools+=("aws")
+    fi
+    
+    if ! command -v $KUBECTL &> /dev/null; then
+        missing_tools+=("$KUBECTL")
+    fi
+    
+    if ! command -v jq &> /dev/null; then
+        missing_tools+=("jq")
+    fi
+    
+    if [[ ${#missing_tools[@]} -gt 0 ]]; then
+        log_error "Missing required tools: ${missing_tools[*]}"
+        exit 1
+    fi
+    
+    log_success "All required tools are available"
+}
+
+# Function to show usage information
+show_usage() {
+    cat << EOF
+Usage: $0 [OPTIONS]
+
+This script sets up EFS-based shared storage for OpenShift/Kubernetes clusters.
+It creates an EFS filesystem, configures networking (VPC, subnets, security groups,
+mount targets), installs the EFS CSI driver, and creates a StorageClass.
+
+For OpenShift on AWS, this script also configures the proper IAM roles and 
+service account annotations required for the EFS CSI driver to access AWS APIs.
+
+OPTIONS:
+    --create-efs                Create a new EFS filesystem (default: true)
+    --no-create-efs            Use existing EFS filesystem (requires --filesystem-id)
+    --filesystem-id FSID       Use existing EFS filesystem with ID FSID
+    --efs-name NAME            Name for the EFS filesystem (default: sbd-efs-CLUSTER_NAME)
+    --storage-class-name NAME  Name for the StorageClass (default: sbd-efs-sc)
+    --cluster-name NAME        Override cluster name detection
+    --aws-region REGION        Override AWS region detection
+    --efs-csi-role-name NAME   Specify EFS CSI IAM role name (default: auto-detect)
+    --create-iam-role          Create EFS CSI IAM role if missing (default: true)
+    --no-create-iam-role       Skip IAM role creation
+    --cleanup                  Clean up all created resources
+    --update-mode              Force update/recreation of StorageClass even if identical
+    --dry-run                  Show what would be done without executing
+    --verbose                  Enable verbose logging
+    --help                     Show this help message
+
+EXAMPLES:
+    # Create new EFS with auto-detection (recommended)
+    $0
+
+    # Override auto-detected values if needed
+    $0 --cluster-name my-cluster --aws-region us-east-1
+
+    # Use existing EFS filesystem
+    $0 --no-create-efs --filesystem-id fs-1234567890abcdef0
+
+    # Clean up everything
+    $0 --cleanup --efs-name sbd-efs-mycluster
+
+    # Preview changes without executing
+    $0 --dry-run
+
+REQUIREMENTS:
+    • OpenShift/Kubernetes cluster with AWS provider
+    • AWS CLI configured with appropriate permissions
+    • kubectl/oc CLI tools
+    • Cluster admin permissions
+    • IAM permissions for role creation (if --create-iam-role)
+
+The script automatically detects cluster name and AWS region, creates all required
+AWS resources, and configures a ReadWriteMany (RWX) capable StorageClass.
+
+EOF
+}
+
+# Parse command line arguments
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -s|--storage-class|--storage-class-name)
+                STORAGE_CLASS_NAME="$2"
+                shift 2
+                ;;
+            -f|--filesystem-id)
+                EFS_FILESYSTEM_ID="$2"
+                CREATE_EFS="false"  # Disable EFS creation when using existing filesystem
+                shift 2
+                ;;
+            -n|--efs-name)
+                EFS_NAME="$2"
+                shift 2
+                ;;
+            -r|--region|--aws-region)
+                AWS_REGION="$2"
+                shift 2
+                ;;
+            -k|--cluster-name)
+                CLUSTER_NAME="$2"
+                shift 2
+                ;;
+            --performance-mode)
+                PERFORMANCE_MODE="$2"
+                shift 2
+                ;;
+            --throughput-mode)
+                THROUGHPUT_MODE="$2"
+                shift 2
+                ;;
+            --provisioned-tp)
+                PROVISIONED_THROUGHPUT="$2"
+                shift 2
+                ;;
+            --create-efs)
+                CREATE_EFS="true"
+                shift
+                ;;
+            --no-create-efs)
+                CREATE_EFS="false"
+                shift
+                ;;
+            --cleanup)
+                CLEANUP="true"
+                shift
+                ;;
+            --skip-csi-install)
+                SKIP_CSI_INSTALL="true"
+                shift
+                ;;
+            --efs-csi-role-name)
+                EFS_CSI_ROLE_NAME="$2"
+                shift 2
+                ;;
+            --create-iam-role)
+                CREATE_IAM_ROLE="true"
+                shift
+                ;;
+            --no-create-iam-role)
+                CREATE_IAM_ROLE="false"
+                shift
+                ;;
+            --update-mode)
+                UPDATE_MODE="true"
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN="true"
+                shift
+                ;;
+            --verbose)
+                set -x  # Enable verbose mode
+                shift
+                ;;
+            -h|--help)
+                show_usage
+                exit 0
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                show_usage
+                exit 1
+                ;;
+        esac
+    done
+    
+    # Validate inputs
+    if [[ "$PERFORMANCE_MODE" != "generalPurpose" && "$PERFORMANCE_MODE" != "maxIO" ]]; then
+        log_error "Invalid performance mode: $PERFORMANCE_MODE. Must be 'generalPurpose' or 'maxIO'"
+        exit 1
+    fi
+    
+    if [[ "$THROUGHPUT_MODE" != "provisioned" && "$THROUGHPUT_MODE" != "burstingThroughput" ]]; then
+        log_error "Invalid throughput mode: $THROUGHPUT_MODE. Must be 'provisioned' or 'burstingThroughput'"
+        exit 1
+    fi
+}
+
 # Function to compare StorageClass configurations
 compare_storage_class_config() {
     local new_efs_id="$1"
@@ -2313,6 +2513,9 @@ check_aws_permissions() {
 
 # Main execution
 main() {
+    # Parse command line arguments first
+    parse_arguments "$@"
+    
     log_info "Starting EFS StorageClass management for OpenShift with intelligent resource reuse"
     
     # Check tools

@@ -80,7 +80,7 @@ func (m *Manager) InstallEFSCSIDriver(ctx context.Context) error {
 	return m.waitForEFSCSIDriver(ctx)
 }
 
-// ConfigureServiceAccount configures the EFS CSI service account with IAM role
+// ConfigureServiceAccount configures the EFS CSI driver service account with IAM role
 func (m *Manager) ConfigureServiceAccount(ctx context.Context, roleARN string) error {
 	// Get or create service account
 	serviceAccount, err := m.clientset.CoreV1().ServiceAccounts("kube-system").Get(ctx, "efs-csi-controller-sa", metav1.GetOptions{})
@@ -104,6 +104,11 @@ func (m *Manager) ConfigureServiceAccount(ctx context.Context, roleARN string) e
 	}
 
 	log.Printf("🔗 Configured service account with IAM role: %s", roleARN)
+
+	// Fix EFS CSI controller deployment if needed
+	if err := m.fixEFSCSIController(ctx); err != nil {
+		log.Printf("⚠️ Warning: failed to fix EFS CSI controller: %v", err)
+	}
 
 	// Restart EFS CSI controller to pick up new credentials
 	return m.restartEFSCSIController(ctx)
@@ -166,6 +171,8 @@ func (m *Manager) TestCredentials(ctx context.Context, storageClassName string) 
 	testPVCName := fmt.Sprintf("sbd-test-pvc-%d", time.Now().Unix())
 	testNamespace := "default"
 
+	log.Printf("🧪 Creating test PVC %s to verify EFS CSI driver credentials", testPVCName)
+
 	// Create test PVC
 	testPVC := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
@@ -195,16 +202,37 @@ func (m *Manager) TestCredentials(ctx context.Context, storageClassName string) 
 		return false, fmt.Errorf("failed to create test PVC: %w", err)
 	}
 
-	// Wait for PVC to be bound (with timeout)
+	// Wait for PVC to be bound (with timeout and better error reporting)
 	success := false
+	var lastStatus corev1.PersistentVolumeClaimPhase
+	var lastMessage string
+
 	for i := 0; i < 60; i++ { // Wait up to 5 minutes
 		pvc, err := m.clientset.CoreV1().PersistentVolumeClaims(testNamespace).Get(ctx, testPVCName, metav1.GetOptions{})
 		if err != nil {
+			log.Printf("⚠️ Failed to get test PVC status: %v", err)
 			break
+		}
+
+		lastStatus = pvc.Status.Phase
+
+		// Get any events related to the PVC for better error reporting
+		if i%6 == 0 { // Check events every 30 seconds
+			events, err := m.clientset.CoreV1().Events(testNamespace).List(ctx, metav1.ListOptions{
+				FieldSelector: fmt.Sprintf("involvedObject.name=%s", testPVCName),
+			})
+			if err == nil && len(events.Items) > 0 {
+				lastEvent := events.Items[len(events.Items)-1]
+				lastMessage = lastEvent.Message
+				log.Printf("🔍 Test PVC status: %s - %s", lastStatus, lastMessage)
+			} else {
+				log.Printf("🔍 Test PVC status: %s", lastStatus)
+			}
 		}
 
 		if pvc.Status.Phase == corev1.ClaimBound {
 			success = true
+			log.Printf("✅ Test PVC successfully bound")
 			break
 		}
 
@@ -212,9 +240,18 @@ func (m *Manager) TestCredentials(ctx context.Context, storageClassName string) 
 	}
 
 	// Clean up test PVC
-	_ = m.clientset.CoreV1().PersistentVolumeClaims(testNamespace).Delete(ctx, testPVCName, metav1.DeleteOptions{})
+	deleteErr := m.clientset.CoreV1().PersistentVolumeClaims(testNamespace).Delete(ctx, testPVCName, metav1.DeleteOptions{})
+	if deleteErr != nil {
+		log.Printf("⚠️ Warning: failed to clean up test PVC: %v", deleteErr)
+	} else {
+		log.Printf("🧹 Cleaned up test PVC")
+	}
 
-	return success, nil
+	if !success {
+		return false, fmt.Errorf("test PVC failed to bind (final status: %s, last message: %s)", lastStatus, lastMessage)
+	}
+
+	return true, nil
 }
 
 // Cleanup removes all Kubernetes resources created by this manager
@@ -723,23 +760,138 @@ func (m *Manager) waitForEFSCSIDriver(ctx context.Context) error {
 }
 
 func (m *Manager) restartEFSCSIController(ctx context.Context) error {
-	// Restart EFS CSI controller deployment
-	deployment, err := m.clientset.AppsV1().Deployments("kube-system").Get(ctx, "efs-csi-controller", metav1.GetOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to get EFS CSI controller deployment: %w", err)
+	// Restart EFS CSI controller deployment with retry logic for conflicts
+	for attempt := 0; attempt < 3; attempt++ {
+		deployment, err := m.clientset.AppsV1().Deployments("kube-system").Get(ctx, "efs-csi-controller", metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to get EFS CSI controller deployment: %w", err)
+		}
+
+		// Add restart annotation
+		if deployment.Spec.Template.ObjectMeta.Annotations == nil {
+			deployment.Spec.Template.ObjectMeta.Annotations = make(map[string]string)
+		}
+		deployment.Spec.Template.ObjectMeta.Annotations["kubectl.kubernetes.io/restartedAt"] = time.Now().Format(time.RFC3339)
+
+		_, err = m.clientset.AppsV1().Deployments("kube-system").Update(ctx, deployment, metav1.UpdateOptions{})
+		if err != nil {
+			// Handle conflict errors by retrying
+			if strings.Contains(err.Error(), "object has been modified") || strings.Contains(err.Error(), "conflict") {
+				log.Printf("⚠️ Deployment conflict detected (attempt %d/3), retrying...", attempt+1)
+				time.Sleep(time.Duration(attempt+1) * time.Second) // Exponential backoff
+				continue
+			}
+			return fmt.Errorf("failed to restart EFS CSI controller: %w", err)
+		}
+
+		log.Println("🔄 Restarted EFS CSI controller")
+		return nil
 	}
 
-	// Add restart annotation
-	if deployment.Spec.Template.ObjectMeta.Annotations == nil {
-		deployment.Spec.Template.ObjectMeta.Annotations = make(map[string]string)
-	}
-	deployment.Spec.Template.ObjectMeta.Annotations["kubectl.kubernetes.io/restartedAt"] = time.Now().Format(time.RFC3339)
+	return fmt.Errorf("failed to restart EFS CSI controller after 3 attempts due to conflicts")
+}
 
-	_, err = m.clientset.AppsV1().Deployments("kube-system").Update(ctx, deployment, metav1.UpdateOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to restart EFS CSI controller: %w", err)
+// fixEFSCSIController fixes common issues with the EFS CSI controller deployment
+func (m *Manager) fixEFSCSIController(ctx context.Context) error {
+	// Retry logic for handling deployment conflicts
+	for attempt := 0; attempt < 3; attempt++ {
+		deployment, err := m.clientset.AppsV1().Deployments("kube-system").Get(ctx, "efs-csi-controller", metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to get EFS CSI controller deployment: %w", err)
+		}
+
+		// Check if the deployment has the socket directory issue
+		needsUpdate := false
+
+		// Find the efs-plugin container
+		for i, container := range deployment.Spec.Template.Spec.Containers {
+			if container.Name == "efs-plugin" {
+				// Check if there are multiple AWS_ROLE_ARN environment variables
+				cleanEnvVars := []corev1.EnvVar{}
+				roleARNSeen := false
+
+				for _, env := range container.Env {
+					if env.Name == "AWS_ROLE_ARN" {
+						if !roleARNSeen {
+							// Keep only the first AWS_ROLE_ARN (which should be empty to use IRSA)
+							cleanEnvVars = append(cleanEnvVars, corev1.EnvVar{
+								Name:  "AWS_ROLE_ARN",
+								Value: "", // Empty to use IRSA
+							})
+							roleARNSeen = true
+						}
+						needsUpdate = true
+					} else {
+						cleanEnvVars = append(cleanEnvVars, env)
+					}
+				}
+
+				if needsUpdate {
+					deployment.Spec.Template.Spec.Containers[i].Env = cleanEnvVars
+					log.Printf("🔧 Cleaned up duplicate AWS_ROLE_ARN environment variables")
+				}
+
+				// Ensure the socket directory volume mount is correct
+				for j, mount := range container.VolumeMounts {
+					if mount.Name == "socket-dir" && mount.MountPath != "/var/lib/csi/sockets/pluginproxy/" {
+						deployment.Spec.Template.Spec.Containers[i].VolumeMounts[j].MountPath = "/var/lib/csi/sockets/pluginproxy/"
+						needsUpdate = true
+						log.Printf("🔧 Fixed socket directory mount path")
+					}
+				}
+				break
+			}
+		}
+
+		// Add an init container to ensure the socket directory exists
+		hasInitContainer := false
+		for _, initContainer := range deployment.Spec.Template.Spec.InitContainers {
+			if initContainer.Name == "socket-dir-init" {
+				hasInitContainer = true
+				break
+			}
+		}
+
+		if !hasInitContainer {
+			initContainer := corev1.Container{
+				Name:  "socket-dir-init",
+				Image: "busybox:1.35",
+				Command: []string{
+					"sh", "-c",
+					"mkdir -p /var/lib/csi/sockets/pluginproxy && chmod 755 /var/lib/csi/sockets/pluginproxy",
+				},
+				VolumeMounts: []corev1.VolumeMount{
+					{
+						Name:      "socket-dir",
+						MountPath: "/var/lib/csi/sockets/pluginproxy/",
+					},
+				},
+				SecurityContext: &corev1.SecurityContext{
+					RunAsUser:  &[]int64{0}[0],
+					RunAsGroup: &[]int64{0}[0],
+				},
+			}
+			deployment.Spec.Template.Spec.InitContainers = append(deployment.Spec.Template.Spec.InitContainers, initContainer)
+			needsUpdate = true
+			log.Printf("🔧 Added init container to create socket directory")
+		}
+
+		if needsUpdate {
+			_, err = m.clientset.AppsV1().Deployments("kube-system").Update(ctx, deployment, metav1.UpdateOptions{})
+			if err != nil {
+				// Handle conflict errors by retrying
+				if strings.Contains(err.Error(), "object has been modified") || strings.Contains(err.Error(), "conflict") {
+					log.Printf("⚠️ Deployment conflict detected during fix (attempt %d/3), retrying...", attempt+1)
+					time.Sleep(time.Duration(attempt+1) * time.Second) // Exponential backoff
+					continue
+				}
+				return fmt.Errorf("failed to update EFS CSI controller deployment: %w", err)
+			}
+			log.Printf("🔧 Fixed EFS CSI controller deployment")
+		}
+
+		return nil // Success or no update needed
 	}
 
-	log.Println("🔄 Restarted EFS CSI controller")
-	return nil
+	return fmt.Errorf("failed to fix EFS CSI controller deployment after 3 attempts due to conflicts")
 }

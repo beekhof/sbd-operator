@@ -20,23 +20,321 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Default values
-STORAGE_CLASS_NAME="sbd-efs-sc"
-EFS_FILESYSTEM_ID=""
-EFS_NAME="sbd-operator-shared-storage"
-AWS_REGION="${AWS_REGION:-}"
 CLUSTER_NAME=""
-PERFORMANCE_MODE="generalPurpose"  # generalPurpose or maxIO
-THROUGHPUT_MODE="provisioned"      # provisioned or burstingThroughput
-PROVISIONED_THROUGHPUT="100"       # MiB/s (only for provisioned mode)
-KUBECTL="${KUBECTL:-kubectl}"
-CLEANUP="false"
-DRY_RUN="false"
+STORAGE_CLASS_NAME=""
+EFS_NAME=""
+EFS_FILESYSTEM_ID=""
+AWS_REGION=""
 CREATE_EFS="true"
-SKIP_CSI_INSTALL="false"
-SKIP_PERMISSION_CHECKS="false"
-SKIP_IAM_ROLE_CHECK="false"
-EFS_CSI_ROLE_NAME=""  # Auto-detected or specified
-CREATE_IAM_ROLE="true"
+DRY_RUN="false"
+CLEANUP="false"
+PERFORMANCE_MODE="generalPurpose"
+THROUGHPUT_MODE="provisioned"
+PROVISIONED_THROUGHPUT="10"
+KUBECTL=""
+
+# New flags for better resource management
+FORCE_RECREATE="false"
+UPDATE_MODE="false"
+SKIP_VALIDATION="false"
+
+# Function to compare StorageClass configurations
+compare_storage_class_config() {
+    local new_efs_id="$1"
+    local existing_sc_yaml
+    
+    # Get existing StorageClass
+    existing_sc_yaml=$($KUBECTL get storageclass "$STORAGE_CLASS_NAME" -o yaml 2>/dev/null || echo "")
+    
+    if [[ -z "$existing_sc_yaml" ]]; then
+        echo "missing"
+        return
+    fi
+    
+    # Extract current EFS filesystem ID from existing StorageClass
+    local current_efs_id
+    current_efs_id=$(echo "$existing_sc_yaml" | grep "fileSystemId:" | awk '{print $2}' || echo "")
+    
+    # Compare key parameters
+    local current_provisioner
+    current_provisioner=$(echo "$existing_sc_yaml" | grep "provisioner:" | awk '{print $2}' || echo "")
+    
+    local current_provisioning_mode
+    current_provisioning_mode=$(echo "$existing_sc_yaml" | grep "provisioningMode:" | awk '{print $2}' || echo "")
+    
+    # Check for differences
+    if [[ "$current_efs_id" != "$new_efs_id" ]]; then
+        echo "efs_id_changed"
+        return
+    fi
+    
+    if [[ "$current_provisioner" != "efs.csi.aws.com" ]]; then
+        echo "provisioner_changed"
+        return
+    fi
+    
+    if [[ "$current_provisioning_mode" != "efs-ap" ]]; then
+        echo "provisioning_mode_changed"
+        return
+    fi
+    
+    echo "identical"
+}
+
+# Function to detect and reuse existing IAM role
+detect_existing_iam_role() {
+    local role_name="$1"
+    
+    log_info "Checking for existing IAM role: $role_name"
+    
+    # Check if role exists
+    local role_arn
+    role_arn=$(aws iam get-role --role-name "$role_name" --query 'Role.Arn' --output text 2>/dev/null || echo "")
+    
+    if [[ -n "$role_arn" && "$role_arn" != "None" ]]; then
+        log_info "Found existing IAM role: $role_arn"
+        
+        # Validate role has required policies
+        if validate_efs_csi_role_permissions "$role_arn"; then
+            log_success "Existing IAM role has required permissions"
+            echo "$role_arn"
+            return
+        else
+            log_warning "Existing IAM role missing required permissions"
+            if [[ "$FORCE_RECREATE" == "true" ]]; then
+                log_info "Force recreate enabled - will recreate IAM role with correct permissions"
+                delete_iam_role "$role_name"
+                echo ""
+                return
+            else
+                log_error "IAM role exists but has incorrect permissions. Use --force-recreate to fix."
+                exit 1
+            fi
+        fi
+    fi
+    
+    echo ""
+}
+
+# Function to delete IAM role and associated policies
+delete_iam_role() {
+    local role_name="$1"
+    local policy_name="${role_name}_Policy"
+    
+    log_info "Deleting IAM role and associated policies: $role_name"
+    
+    # Get account ID for policy ARN
+    local account_id
+    account_id=$(aws sts get-caller-identity --query 'Account' --output text 2>/dev/null || echo "")
+    
+    if [[ -n "$account_id" ]]; then
+        local policy_arn="arn:aws:iam::${account_id}:policy/${policy_name}"
+        
+        # Detach policy from role
+        aws iam detach-role-policy --role-name "$role_name" --policy-arn "$policy_arn" >/dev/null 2>&1 || true
+        
+        # Delete policy
+        aws iam delete-policy --policy-arn "$policy_arn" >/dev/null 2>&1 || true
+        log_info "Deleted IAM policy: $policy_name"
+    fi
+    
+    # Delete role
+    aws iam delete-role --role-name "$role_name" >/dev/null 2>&1 || true
+    log_info "Deleted IAM role: $role_name"
+}
+
+# Function to compare EFS filesystem configuration
+compare_efs_config() {
+    local efs_id="$1"
+    
+    log_info "Validating EFS filesystem configuration: $efs_id"
+    
+    # Get EFS filesystem details
+    local efs_info
+    efs_info=$(aws efs describe-file-systems \
+        --region "$AWS_REGION" \
+        --file-system-id "$efs_id" \
+        --query 'FileSystems[0]' \
+        --output json 2>/dev/null || echo "")
+    
+    if [[ -z "$efs_info" || "$efs_info" == "null" ]]; then
+        echo "missing"
+        return
+    fi
+    
+    # Extract current configuration
+    local current_performance_mode
+    current_performance_mode=$(echo "$efs_info" | jq -r '.PerformanceMode // "generalPurpose"')
+    
+    local current_throughput_mode
+    current_throughput_mode=$(echo "$efs_info" | jq -r '.ThroughputMode // "provisioned"')
+    
+    local current_provisioned_throughput
+    current_provisioned_throughput=$(echo "$efs_info" | jq -r '.ProvisionedThroughputInMibps // 0')
+    
+    # Compare with desired configuration
+    local config_changed="false"
+    
+    if [[ "$current_performance_mode" != "$PERFORMANCE_MODE" ]]; then
+        log_warning "EFS performance mode differs: current=$current_performance_mode, desired=$PERFORMANCE_MODE"
+        config_changed="true"
+    fi
+    
+    if [[ "$current_throughput_mode" != "$THROUGHPUT_MODE" ]]; then
+        log_warning "EFS throughput mode differs: current=$current_throughput_mode, desired=$THROUGHPUT_MODE"
+        config_changed="true"
+    fi
+    
+    if [[ "$THROUGHPUT_MODE" == "provisioned" && "$current_provisioned_throughput" != "$PROVISIONED_THROUGHPUT" ]]; then
+        log_warning "EFS provisioned throughput differs: current=$current_provisioned_throughput, desired=$PROVISIONED_THROUGHPUT"
+        config_changed="true"
+    fi
+    
+    if [[ "$config_changed" == "true" ]]; then
+        echo "config_changed"
+    else
+        echo "valid"
+    fi
+}
+
+# Function to handle StorageClass updates
+handle_storage_class_update() {
+    local efs_id="$1"
+    
+    log_info "Checking StorageClass update requirements..."
+    
+    local comparison_result
+    comparison_result=$(compare_storage_class_config "$efs_id")
+    
+    case "$comparison_result" in
+        "missing")
+            log_info "StorageClass does not exist - will create new one"
+            return 0
+            ;;
+        "identical")
+            log_success "StorageClass configuration is up to date"
+            if [[ "$UPDATE_MODE" != "true" && "$FORCE_RECREATE" != "true" ]]; then
+                log_info "Skipping StorageClass recreation (use --update-mode to force update)"
+                return 1
+            fi
+            log_info "Update mode enabled - will recreate StorageClass"
+            ;;
+        *)
+            log_warning "StorageClass configuration differs: $comparison_result"
+            log_info "StorageClasses cannot be updated - will delete and recreate"
+            ;;
+    esac
+    
+    # Delete existing StorageClass
+    log_info "Deleting existing StorageClass: $STORAGE_CLASS_NAME"
+    $KUBECTL delete storageclass "$STORAGE_CLASS_NAME" --ignore-not-found=true
+    
+    # Wait for deletion to complete
+    local max_wait=30
+    local wait_count=0
+    while [[ $wait_count -lt $max_wait ]]; do
+        if ! $KUBECTL get storageclass "$STORAGE_CLASS_NAME" >/dev/null 2>&1; then
+            break
+        fi
+        log_info "Waiting for StorageClass deletion... (${wait_count}/${max_wait})"
+        sleep 2
+        ((wait_count++))
+    done
+    
+    if [[ $wait_count -ge $max_wait ]]; then
+        log_warning "StorageClass deletion timeout - proceeding anyway"
+    else
+        log_success "StorageClass deleted successfully"
+    fi
+    
+    return 0
+}
+
+# Function to check for existing AWS resources and determine reuse strategy
+check_existing_resources() {
+    log_info "Checking for existing AWS resources to reuse..."
+    
+    local reuse_summary=""
+    local resources_to_create=""
+    
+    # Check EFS filesystem
+    if [[ "$CREATE_EFS" == "true" ]]; then
+        local existing_efs
+        existing_efs=$(find_efs_by_name "$EFS_NAME")
+        
+        if [[ -n "$existing_efs" && "$existing_efs" != "None" ]]; then
+            local efs_status
+            efs_status=$(compare_efs_config "$existing_efs")
+            
+            case "$efs_status" in
+                "valid")
+                    log_success "Found compatible EFS filesystem: $existing_efs"
+                    reuse_summary="${reuse_summary}✅ EFS Filesystem: $existing_efs (reusing)\n"
+                    ;;
+                "config_changed")
+                    if [[ "$FORCE_RECREATE" == "true" ]]; then
+                        log_warning "EFS configuration differs - will recreate due to --force-recreate"
+                        resources_to_create="${resources_to_create}🔄 EFS Filesystem (recreate)\n"
+                    else
+                        log_error "EFS filesystem exists but has different configuration. Use --force-recreate to recreate."
+                        exit 1
+                    fi
+                    ;;
+                "missing")
+                    resources_to_create="${resources_to_create}🆕 EFS Filesystem\n"
+                    ;;
+            esac
+        else
+            resources_to_create="${resources_to_create}🆕 EFS Filesystem\n"
+        fi
+    fi
+    
+    # Check IAM role
+    local role_name="AmazonEKS_EFS_CSI_DriverRole_${CLUSTER_NAME}"
+    local existing_role
+    existing_role=$(detect_existing_iam_role "$role_name")
+    
+    if [[ -n "$existing_role" ]]; then
+        reuse_summary="${reuse_summary}✅ IAM Role: $role_name (reusing)\n"
+    else
+        resources_to_create="${resources_to_create}🆕 IAM Role: $role_name\n"
+    fi
+    
+    # Check StorageClass
+    local sc_status
+    sc_status=$(compare_storage_class_config "placeholder")
+    
+    if [[ "$sc_status" == "identical" && "$UPDATE_MODE" != "true" && "$FORCE_RECREATE" != "true" ]]; then
+        reuse_summary="${reuse_summary}✅ StorageClass: $STORAGE_CLASS_NAME (unchanged)\n"
+    else
+        case "$sc_status" in
+            "missing")
+                resources_to_create="${resources_to_create}🆕 StorageClass: $STORAGE_CLASS_NAME\n"
+                ;;
+            *)
+                resources_to_create="${resources_to_create}🔄 StorageClass: $STORAGE_CLASS_NAME (recreate)\n"
+                ;;
+        esac
+    fi
+    
+    # Display summary
+    echo
+    log_info "📋 Resource Reuse Summary:"
+    if [[ -n "$reuse_summary" ]]; then
+        echo -e "$reuse_summary"
+    fi
+    
+    if [[ -n "$resources_to_create" ]]; then
+        log_info "🚧 Resources to Create/Update:"
+        echo -e "$resources_to_create"
+    fi
+    
+    if [[ -z "$reuse_summary" && -z "$resources_to_create" ]]; then
+        log_info "ℹ️  No resource operations needed"
+    fi
+    
+    echo
+}
 
 # Functions
 log_info() {
@@ -80,6 +378,9 @@ OPTIONS:
     --cleanup                  Clean up all created resources
     --skip-permission-checks   Skip AWS permission validation (use with caution)
     --skip-iam-role-check      Skip EFS CSI service account IAM role validation
+    --force-recreate           Force recreation of existing resources even if compatible
+    --update-mode              Force update/recreation of StorageClass even if identical
+    --skip-validation          Skip resource validation checks (use with caution)
     --dry-run                  Show what would be done without executing
     --verbose                  Enable verbose logging
     --help                     Show this help message
@@ -98,8 +399,14 @@ OPENSHIFT INTEGRATION:
     • Validates CSI driver credential access to AWS APIs
 
 EXAMPLES:
-    # Create new EFS with automatic IAM role setup
+    # Create new EFS with intelligent resource reuse
     $0
+
+    # Force recreation of existing resources
+    $0 --force-recreate
+
+    # Update StorageClass configuration even if identical
+    $0 --update-mode
 
     # Use existing EFS filesystem with existing IAM role
     $0 --no-create-efs --filesystem-id fs-1234567890abcdef0 --efs-csi-role-name MyEFSRole
@@ -107,11 +414,14 @@ EXAMPLES:
     # Create with custom names and skip IAM role creation
     $0 --efs-name my-shared-storage --storage-class-name my-efs-sc --no-create-iam-role
 
-    # Preview changes without executing
+    # Preview changes without executing (shows resource reuse plan)
     $0 --dry-run
 
     # Clean up everything
     $0 --cleanup --efs-name sbd-efs-mycluster
+
+    # Skip all validation checks (not recommended)
+    $0 --skip-validation
 
 REQUIREMENTS:
     • OpenShift/Kubernetes cluster with AWS provider
@@ -123,12 +433,14 @@ REQUIREMENTS:
 The script automatically:
     1. Detects cluster name and AWS region
     2. Validates AWS permissions for EFS and EC2 operations
-    3. Installs/verifies EFS CSI driver
-    4. Creates and configures IAM roles for EFS CSI service account
-    5. Creates EFS filesystem with proper tags
-    6. Sets up complete networking (VPC, subnets, security groups, mount targets)
-    7. Creates StorageClass with EFS Access Point provisioning for ReadWriteMany (RWX) access
-    8. Provides comprehensive cleanup functionality
+    3. Intelligently detects and reuses existing compatible AWS resources
+    4. Installs/verifies EFS CSI driver
+    5. Creates and configures IAM roles for EFS CSI service account (with smart reuse)
+    6. Creates EFS filesystem with proper tags (or reuses existing compatible ones)
+    7. Sets up complete networking (VPC, subnets, security groups, mount targets)
+    8. Creates/updates StorageClass with EFS Access Point provisioning for ReadWriteMany (RWX) access
+    9. Handles StorageClass updates by deleting and recreating (since they cannot be updated)
+    10. Provides comprehensive cleanup functionality and resource validation
 
 EOF
 }
@@ -203,6 +515,18 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-create-iam-role)
             CREATE_IAM_ROLE="false"
+            shift
+            ;;
+        --force-recreate)
+            FORCE_RECREATE="true"
+            shift
+            ;;
+        --update-mode)
+            UPDATE_MODE="true"
+            shift
+            ;;
+        --skip-validation)
+            SKIP_VALIDATION="true"
             shift
             ;;
         --dry-run)
@@ -572,13 +896,12 @@ setup_efs_csi_iam_role() {
     
     log_info "Setting up IAM role for EFS CSI driver: $role_name"
     
-    # Check if role already exists
+    # Use enhanced role detection that handles validation and recreation
     local existing_role_arn
-    existing_role_arn=$(aws iam get-role --role-name "$role_name" --query 'Role.Arn' --output text 2>/dev/null || echo "")
+    existing_role_arn=$(detect_existing_iam_role "$role_name")
     
     if [[ -n "$existing_role_arn" && "$existing_role_arn" != "None" ]]; then
-        log_info "IAM role already exists: $existing_role_arn"
-        validate_efs_csi_role_permissions "$existing_role_arn"
+        log_success "Using existing compatible IAM role: $existing_role_arn"
         echo "$existing_role_arn"
         return
     fi
@@ -1592,7 +1915,7 @@ show_summary() {
 
 # Main execution
 main() {
-    log_info "Starting EFS StorageClass management for OpenShift"
+    log_info "Starting EFS StorageClass management for OpenShift with intelligent resource reuse"
     
     # Check tools
     check_tools
@@ -1602,7 +1925,11 @@ main() {
     detect_aws_region
     
     # Check AWS permissions (after region is detected)
-    check_aws_permissions
+    if [[ "$SKIP_VALIDATION" != "true" ]]; then
+        check_aws_permissions
+    else
+        log_warning "Skipping AWS permission validation due to --skip-validation"
+    fi
     
     # Handle cleanup
     if [[ "$CLEANUP" == "true" ]]; then
@@ -1610,20 +1937,100 @@ main() {
         exit 0
     fi
     
+    # Check for existing resources before proceeding
+    if [[ "$SKIP_VALIDATION" != "true" ]]; then
+        check_existing_resources
+    fi
+    
     # Install or verify EFS CSI driver
     install_or_verify_efs_csi_driver
     
     # Check and configure EFS CSI service account IAM role
-    check_efs_csi_service_account
+    if [[ "$SKIP_IAM_ROLE_CHECK" != "true" ]]; then
+        check_efs_csi_service_account
+    else
+        log_warning "Skipping IAM role check due to --skip-iam-role-check"
+    fi
     
-    # Determine EFS filesystem ID
+    # Determine EFS filesystem ID with intelligent reuse
     local efs_id=""
     if [[ "$CREATE_EFS" == "true" ]]; then
-        efs_id=$(create_efs_filesystem)
+        # Check for existing EFS filesystem first
+        local existing_efs
+        existing_efs=$(find_efs_by_name "$EFS_NAME")
+        
+        if [[ -n "$existing_efs" && "$existing_efs" != "None" ]]; then
+            if [[ "$FORCE_RECREATE" == "true" ]]; then
+                log_info "Force recreate enabled - deleting existing EFS filesystem"
+                # Clean up existing EFS in cleanup_resources style
+                local vpc_info
+                vpc_info=$(detect_cluster_vpc_and_subnets)
+                local vpc_id
+                vpc_id=$(echo "$vpc_info" | cut -d'|' -f1)
+                
+                # Delete mount targets first
+                local mount_targets
+                mount_targets=$(aws efs describe-mount-targets \
+                    --region "$AWS_REGION" \
+                    --file-system-id "$existing_efs" \
+                    --query 'MountTargets[].MountTargetId' \
+                    --output text 2>/dev/null || echo "")
+                
+                if [[ -n "$mount_targets" && "$mount_targets" != "None" ]]; then
+                    log_info "Deleting existing mount targets..."
+                    for mt_id in $mount_targets; do
+                        aws efs delete-mount-target --region "$AWS_REGION" --mount-target-id "$mt_id" >/dev/null 2>&1 || true
+                    done
+                    sleep 15
+                fi
+                
+                # Delete EFS filesystem
+                aws efs delete-file-system --region "$AWS_REGION" --file-system-id "$existing_efs" >/dev/null 2>&1 || \
+                    log_warning "Could not delete existing EFS filesystem"
+                
+                # Create new one
+                efs_id=$(create_efs_filesystem)
+            else
+                # Validate existing EFS configuration
+                local efs_status
+                efs_status=$(compare_efs_config "$existing_efs")
+                
+                case "$efs_status" in
+                    "valid")
+                        log_success "Reusing existing compatible EFS filesystem: $existing_efs"
+                        efs_id="$existing_efs"
+                        ;;
+                    "config_changed")
+                        log_error "Existing EFS filesystem has incompatible configuration. Use --force-recreate to recreate."
+                        exit 1
+                        ;;
+                    "missing")
+                        log_info "EFS filesystem not found - creating new one"
+                        efs_id=$(create_efs_filesystem)
+                        ;;
+                esac
+            fi
+        else
+            efs_id=$(create_efs_filesystem)
+        fi
     else
         if [[ -n "$EFS_FILESYSTEM_ID" ]]; then
             efs_id="$EFS_FILESYSTEM_ID"
             log_info "Using specified EFS filesystem: $efs_id"
+            
+            # Validate specified EFS exists and is compatible
+            if [[ "$SKIP_VALIDATION" != "true" ]]; then
+                local efs_status
+                efs_status=$(compare_efs_config "$efs_id")
+                
+                if [[ "$efs_status" == "missing" ]]; then
+                    log_error "Specified EFS filesystem not found: $efs_id"
+                    exit 1
+                elif [[ "$efs_status" == "config_changed" ]]; then
+                    log_warning "Specified EFS filesystem has different configuration than requested"
+                    log_warning "Proceeding anyway since --filesystem-id was explicitly specified"
+                fi
+            fi
         else
             log_error "EFS filesystem ID is required when not creating new EFS"
             show_usage
@@ -1631,14 +2038,22 @@ main() {
         fi
     fi
     
-    # Setup EFS networking
+    # Setup EFS networking (this function already handles existing mount targets)
     setup_efs_networking "$efs_id"
     
-    # Create StorageClass
-    create_storage_class "$efs_id"
+    # Handle StorageClass creation/update intelligently
+    if handle_storage_class_update "$efs_id"; then
+        create_storage_class "$efs_id"
+    else
+        log_success "StorageClass is up to date - no changes needed"
+    fi
     
     # Test EFS CSI driver credentials
-    test_efs_csi_credentials
+    if [[ "$SKIP_VALIDATION" != "true" ]]; then
+        test_efs_csi_credentials
+    else
+        log_warning "Skipping EFS CSI credentials test due to --skip-validation"
+    fi
     
     # Show summary
     if [[ "$DRY_RUN" != "true" ]]; then

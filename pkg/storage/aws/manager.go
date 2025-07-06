@@ -10,7 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
-	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/efs"
 	efstypes "github.com/aws/aws-sdk-go-v2/service/efs/types"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
@@ -82,6 +82,331 @@ func (m *Manager) ValidatePermissions(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// ValidateAWSPermissions checks if the required AWS permissions are available
+func (m *Manager) ValidateAWSPermissions(ctx context.Context) error {
+	log.Println("🔐 Validating required AWS permissions...")
+
+	requiredPermissions := []struct {
+		name        string
+		description string
+		testFn      func() error
+	}{
+		{
+			name:        "ec2:DescribeVpcs",
+			description: "List VPCs in the region",
+			testFn:      m.testDescribeVpcs,
+		},
+		{
+			name:        "ec2:DescribeSubnets",
+			description: "List subnets for EFS mount targets",
+			testFn:      m.testDescribeSubnets,
+		},
+		{
+			name:        "ec2:DescribeSecurityGroups",
+			description: "List security groups for EFS access",
+			testFn:      m.testDescribeSecurityGroups,
+		},
+		{
+			name:        "ec2:CreateSecurityGroup",
+			description: "Create security group for EFS access",
+			testFn:      m.testCreateSecurityGroup,
+		},
+		{
+			name:        "ec2:AuthorizeSecurityGroupIngress",
+			description: "Configure security group rules for EFS",
+			testFn:      m.testAuthorizeSecurityGroupIngress,
+		},
+		{
+			name:        "efs:CreateFileSystem",
+			description: "Create EFS filesystem",
+			testFn:      m.testCreateFileSystem,
+		},
+		{
+			name:        "efs:DescribeFileSystems",
+			description: "List and check EFS filesystems",
+			testFn:      m.testDescribeFileSystems,
+		},
+		{
+			name:        "efs:CreateMountTarget",
+			description: "Create EFS mount targets in subnets",
+			testFn:      m.testCreateMountTarget,
+		},
+		{
+			name:        "efs:DescribeMountTargets",
+			description: "List EFS mount targets",
+			testFn:      m.testDescribeMountTargets,
+		},
+		{
+			name:        "iam:CreateRole",
+			description: "Create IAM role for EFS CSI driver",
+			testFn:      m.testCreateRole,
+		},
+		{
+			name:        "iam:GetRole",
+			description: "Check existing IAM roles",
+			testFn:      m.testGetRole,
+		},
+		{
+			name:        "iam:AttachRolePolicy",
+			description: "Attach policies to IAM roles",
+			testFn:      m.testAttachRolePolicy,
+		},
+		{
+			name:        "iam:ListOpenIDConnectProviders",
+			description: "List OIDC providers for IRSA setup",
+			testFn:      m.testListOpenIDConnectProviders,
+		},
+	}
+
+	var missingPermissions []string
+	var permissionErrors []string
+
+	for _, perm := range requiredPermissions {
+		if err := perm.testFn(); err != nil {
+			if isPermissionDeniedError(err) {
+				log.Printf("❌ Missing permission: %s (%s)", perm.name, perm.description)
+				missingPermissions = append(missingPermissions, perm.name)
+				permissionErrors = append(permissionErrors, fmt.Sprintf("%s: %v", perm.name, err))
+			} else if isInputValidationError(err) {
+				// Input validation errors mean we have permission but used invalid parameters
+				log.Printf("✅ Permission validated: %s (got expected validation error)", perm.name)
+			} else {
+				// Unexpected error - could be network, service unavailable, etc.
+				log.Printf("⚠️ Unexpected error testing %s: %v", perm.name, err)
+				permissionErrors = append(permissionErrors, fmt.Sprintf("%s: unexpected error: %v", perm.name, err))
+			}
+		} else {
+			log.Printf("✅ Permission validated: %s", perm.name)
+		}
+	}
+
+	if len(missingPermissions) > 0 {
+		log.Printf("❌ Missing %d required AWS permissions:", len(missingPermissions))
+		for _, perm := range missingPermissions {
+			log.Printf("   - %s", perm)
+		}
+
+		return fmt.Errorf("missing required AWS permissions: %s\n\nTo fix this, ensure your AWS credentials have the following permissions:\n%s\n\nFor more details:\n%s",
+			strings.Join(missingPermissions, ", "),
+			strings.Join(missingPermissions, "\n"),
+			strings.Join(permissionErrors, "\n"))
+	}
+
+	if len(permissionErrors) > 0 {
+		return fmt.Errorf("AWS permission validation encountered errors:\n%s", strings.Join(permissionErrors, "\n"))
+	}
+
+	log.Printf("✅ All required AWS permissions validated successfully")
+	return nil
+}
+
+// isPermissionDeniedError checks if an error is specifically about missing permissions
+func isPermissionDeniedError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := strings.ToLower(err.Error())
+
+	// AWS permission-related error patterns
+	permissionPatterns := []string{
+		"unauthorizedoperation",
+		"access denied",
+		"accessdenied",
+		"forbidden",
+		"user: arn:aws:",
+		"is not authorized to perform",
+		"does not have permission",
+		"insufficient privileges",
+		"permission denied",
+		"accessdeniedexception",
+		"unauthorizedexception",
+	}
+
+	for _, pattern := range permissionPatterns {
+		if strings.Contains(errStr, pattern) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isInputValidationError checks if an error is about invalid input parameters (not permissions)
+func isInputValidationError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := strings.ToLower(err.Error())
+
+	// AWS input validation error patterns - these indicate we have permission but used bad parameters
+	validationPatterns := []string{
+		"invalidparametervalue",
+		"invalidparameter",
+		"invalidgroupid",
+		"invalidinstanceid",
+		"invalidvolumeid",
+		"invalidvpcid",
+		"invalidsubnetid",
+		"invalidfilesystemid",
+		"invalidrolename",
+		"invalidpolicyarn",
+		"missingparameter",
+		"validationexception",
+		"validationerror",
+		"malformedpolicyexception",
+		"malformedpolicydocument",
+		"invalidinput",
+		"badrequest",
+		"does not exist",
+		"not found",
+		"notfound",
+		"already exists",
+		"alreadyexists",
+		"duplicate",
+		"conflict",
+		"entityalreadyexists",
+		"nosuchentity",
+	}
+
+	for _, pattern := range validationPatterns {
+		if strings.Contains(errStr, pattern) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// Permission test functions with better error handling
+
+func (m *Manager) testDescribeVpcs() error {
+	_, err := m.ec2Client.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{
+		MaxResults: aws.Int32(5),
+	})
+	return err
+}
+
+func (m *Manager) testDescribeSubnets() error {
+	_, err := m.ec2Client.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{
+		MaxResults: aws.Int32(5),
+	})
+	return err
+}
+
+func (m *Manager) testDescribeSecurityGroups() error {
+	_, err := m.ec2Client.DescribeSecurityGroups(context.Background(), &ec2.DescribeSecurityGroupsInput{
+		MaxResults: aws.Int32(5),
+	})
+	return err
+}
+
+func (m *Manager) testCreateSecurityGroup() error {
+	// Use a clearly invalid VPC ID to trigger validation error (not permission error)
+	_, err := m.ec2Client.CreateSecurityGroup(context.Background(), &ec2.CreateSecurityGroupInput{
+		GroupName:   aws.String("test-permission-check"),
+		Description: aws.String("Test permission check"),
+		VpcId:       aws.String("vpc-nonexistent123"), // Invalid VPC ID
+	})
+	return err
+}
+
+func (m *Manager) testAuthorizeSecurityGroupIngress() error {
+	// Use invalid security group ID to trigger validation error
+	_, err := m.ec2Client.AuthorizeSecurityGroupIngress(context.Background(), &ec2.AuthorizeSecurityGroupIngressInput{
+		GroupId: aws.String("sg-nonexistent123"), // Invalid SG ID
+		IpPermissions: []ec2types.IpPermission{
+			{
+				IpProtocol: aws.String("tcp"),
+				FromPort:   aws.Int32(2049),
+				ToPort:     aws.Int32(2049),
+				IpRanges: []ec2types.IpRange{
+					{CidrIp: aws.String("10.0.0.0/8")},
+				},
+			},
+		},
+	})
+	return err
+}
+
+func (m *Manager) testCreateFileSystem() error {
+	// Use invalid parameters to trigger validation error
+	_, err := m.efsClient.CreateFileSystem(context.Background(), &efs.CreateFileSystemInput{
+		CreationToken:                aws.String("test-permission-check-" + fmt.Sprintf("%d", time.Now().Unix())),
+		PerformanceMode:              efstypes.PerformanceModeGeneralPurpose,
+		ThroughputMode:               efstypes.ThroughputModeProvisioned,
+		ProvisionedThroughputInMibps: aws.Float64(-1), // Invalid throughput to trigger validation
+	})
+	return err
+}
+
+func (m *Manager) testDescribeFileSystems() error {
+	_, err := m.efsClient.DescribeFileSystems(context.Background(), &efs.DescribeFileSystemsInput{
+		MaxItems: aws.Int32(5),
+	})
+	return err
+}
+
+func (m *Manager) testCreateMountTarget() error {
+	// Use invalid filesystem and subnet IDs to trigger validation error
+	_, err := m.efsClient.CreateMountTarget(context.Background(), &efs.CreateMountTargetInput{
+		FileSystemId: aws.String("fs-nonexistent123"),     // Invalid filesystem ID
+		SubnetId:     aws.String("subnet-nonexistent123"), // Invalid subnet ID
+	})
+	return err
+}
+
+func (m *Manager) testDescribeMountTargets() error {
+	// Use invalid filesystem ID to trigger validation error
+	_, err := m.efsClient.DescribeMountTargets(context.Background(), &efs.DescribeMountTargetsInput{
+		FileSystemId: aws.String("fs-nonexistent123"), // Invalid filesystem ID
+	})
+	return err
+}
+
+func (m *Manager) testCreateRole() error {
+	// Use invalid role name to trigger validation error (not malformed policy)
+	_, err := m.iamClient.CreateRole(context.Background(), &iam.CreateRoleInput{
+		RoleName: aws.String(""), // Empty role name triggers validation error
+		AssumeRolePolicyDocument: aws.String(`{
+			"Version": "2012-10-17",
+			"Statement": [
+				{
+					"Effect": "Allow",
+					"Principal": {
+						"Service": "eks.amazonaws.com"
+					},
+					"Action": "sts:AssumeRole"
+				}
+			]
+		}`),
+	})
+	return err
+}
+
+func (m *Manager) testGetRole() error {
+	// Use invalid role name to trigger validation error
+	_, err := m.iamClient.GetRole(context.Background(), &iam.GetRoleInput{
+		RoleName: aws.String("nonexistent-role-test-permission-check"),
+	})
+	return err
+}
+
+func (m *Manager) testAttachRolePolicy() error {
+	// Use invalid role and policy ARNs to trigger validation error
+	_, err := m.iamClient.AttachRolePolicy(context.Background(), &iam.AttachRolePolicyInput{
+		RoleName:  aws.String("nonexistent-role"),
+		PolicyArn: aws.String("arn:aws:iam::123456789012:policy/nonexistent-policy"),
+	})
+	return err
+}
+
+func (m *Manager) testListOpenIDConnectProviders() error {
+	_, err := m.iamClient.ListOpenIDConnectProviders(context.Background(), &iam.ListOpenIDConnectProvidersInput{})
+	return err
 }
 
 // CreateEFS creates a new EFS filesystem
@@ -295,7 +620,7 @@ type VPCInfo struct {
 func (m *Manager) detectClusterVPC(ctx context.Context) (*VPCInfo, error) {
 	// Find VPC tagged with cluster name
 	result, err := m.ec2Client.DescribeVpcs(ctx, &ec2.DescribeVpcsInput{
-		Filters: []types.Filter{
+		Filters: []ec2types.Filter{
 			{
 				Name:   aws.String(fmt.Sprintf("tag:kubernetes.io/cluster/%s", m.config.ClusterName)),
 				Values: []string{"shared", "owned"},
@@ -314,7 +639,7 @@ func (m *Manager) detectClusterVPC(ctx context.Context) (*VPCInfo, error) {
 
 	// Find subnets in this VPC
 	subnetsResult, err := m.ec2Client.DescribeSubnets(ctx, &ec2.DescribeSubnetsInput{
-		Filters: []types.Filter{
+		Filters: []ec2types.Filter{
 			{
 				Name:   aws.String("vpc-id"),
 				Values: []string{vpcID},
@@ -349,7 +674,7 @@ func (m *Manager) ensureEFSSecurityGroup(ctx context.Context, vpcID string) (str
 
 	// Check if security group already exists
 	result, err := m.ec2Client.DescribeSecurityGroups(ctx, &ec2.DescribeSecurityGroupsInput{
-		Filters: []types.Filter{
+		Filters: []ec2types.Filter{
 			{
 				Name:   aws.String("group-name"),
 				Values: []string{groupName},
@@ -373,10 +698,10 @@ func (m *Manager) ensureEFSSecurityGroup(ctx context.Context, vpcID string) (str
 		GroupName:   aws.String(groupName),
 		Description: aws.String("Security group for EFS access"),
 		VpcId:       aws.String(vpcID),
-		TagSpecifications: []types.TagSpecification{
+		TagSpecifications: []ec2types.TagSpecification{
 			{
-				ResourceType: types.ResourceTypeSecurityGroup,
-				Tags: []types.Tag{
+				ResourceType: ec2types.ResourceTypeSecurityGroup,
+				Tags: []ec2types.Tag{
 					{
 						Key:   aws.String("Name"),
 						Value: aws.String(groupName),
@@ -398,12 +723,12 @@ func (m *Manager) ensureEFSSecurityGroup(ctx context.Context, vpcID string) (str
 	// Add inbound rule for NFS (port 2049)
 	_, err = m.ec2Client.AuthorizeSecurityGroupIngress(ctx, &ec2.AuthorizeSecurityGroupIngressInput{
 		GroupId: aws.String(securityGroupID),
-		IpPermissions: []types.IpPermission{
+		IpPermissions: []ec2types.IpPermission{
 			{
 				IpProtocol: aws.String("tcp"),
 				FromPort:   aws.Int32(2049),
 				ToPort:     aws.Int32(2049),
-				IpRanges: []types.IpRange{
+				IpRanges: []ec2types.IpRange{
 					{
 						CidrIp:      aws.String("10.0.0.0/8"),
 						Description: aws.String("NFS access from private networks"),

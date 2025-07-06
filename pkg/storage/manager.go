@@ -105,9 +105,9 @@ func (m *Manager) SetupSharedStorage(ctx context.Context) (*SetupResult, error) 
 
 	log.Println("🚀 Starting shared storage setup...")
 
-	// Step 1: Check AWS permissions
-	log.Println("📋 Checking AWS permissions...")
-	if err := m.awsManager.ValidatePermissions(ctx); err != nil {
+	// Step 1: Validate AWS permissions
+	log.Println("📋 Step 1: Validating AWS permissions...")
+	if err := m.awsManager.ValidateAWSPermissions(ctx); err != nil {
 		return nil, fmt.Errorf("AWS permission validation failed: %w", err)
 	}
 	log.Println("✅ AWS permissions validated")

@@ -199,6 +199,13 @@ build-agent: manifests generate fmt vet ## Build SBD agent binary.
 		-X 'github.com/medik8s/sbd-operator/pkg/version.BuildDate=$(BUILD_DATE)'" \
 		-o bin/sbd-agent cmd/sbd-agent/main.go
 
+.PHONY: build-storage-tool
+build-storage-tool: manifests generate fmt vet ## Build setup-shared-storage tool binary.
+	go build -ldflags="-X 'github.com/medik8s/sbd-operator/pkg/version.GitCommit=$(GIT_COMMIT)' \
+		-X 'github.com/medik8s/sbd-operator/pkg/version.GitDescribe=$(GIT_DESCRIBE)' \
+		-X 'github.com/medik8s/sbd-operator/pkg/version.BuildDate=$(BUILD_DATE)'" \
+		-o bin/setup-shared-storage cmd/setup-shared-storage/main.go
+
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
 	go run ./cmd/main.go

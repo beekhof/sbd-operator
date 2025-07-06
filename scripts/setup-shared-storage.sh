@@ -3,7 +3,7 @@
 # EFS Storage Management Script for OpenShift
 # This script manages AWS EFS filesystems and Kubernetes StorageClass for SBD operator
 
-set -e
+set -ex
 
 # Disable AWS CLI pager to prevent hanging
 export AWS_PAGER=""
@@ -770,25 +770,30 @@ EOF
 )
         fi
     fi
-    
-    # Create IAM role
-    log_info "Creating IAM role: $role_name"
-    local role_arn
-    role_arn=$(aws iam create-role \
-        --role-name "$role_name" \
-        --assume-role-policy-document "$trust_policy" \
-        --description "EFS CSI driver role for cluster $CLUSTER_NAME" \
-        --query 'Role.Arn' \
-        --output text 2>/dev/null)
-    
-    if [[ -z "$role_arn" || "$role_arn" == "None" ]]; then
-        log_error "Failed to create IAM role. Check IAM permissions:"
-        log_error "  - iam:CreateRole"
-        log_error "  - iam:AttachRolePolicy"
-            exit 1
-        fi
-    
-    log_success "Created IAM role: $role_arn"
+    # Check if IAM role already exists
+    log_info "Checking if IAM role already exists: $role_name"
+    if aws iam get-role --role-name "$role_name" >/dev/null 2>&1; then
+        log_warning "IAM role $role_name already exists"
+    else
+        # Create IAM role
+        log_info "Creating IAM role: $role_name"
+        local role_arn
+        role_arn=$(aws iam create-role \
+            --role-name "$role_name" \
+            --assume-role-policy-document "$trust_policy" \
+            --description "EFS CSI driver role for cluster $CLUSTER_NAME" \
+            --query 'Role.Arn' \
+            --output text 2>/dev/null)
+        
+        if [[ -z "$role_arn" || "$role_arn" == "None" ]]; then
+            log_error "Failed to create IAM role. Check IAM permissions:"
+            log_error "  - iam:CreateRole"
+            log_error "  - iam:AttachRolePolicy"
+                exit 1
+            fi
+        
+        log_success "Created IAM role: $role_arn"
+    fi
     
     # Attach AWS managed EFS policy
     log_info "Attaching EFS policy to IAM role..."

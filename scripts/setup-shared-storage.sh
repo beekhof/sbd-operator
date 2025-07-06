@@ -576,6 +576,21 @@ fi
 check_tools() {
     log_info "Checking required tools..."
     
+    # Auto-detect kubectl or oc command
+    if [[ -z "$KUBECTL" ]]; then
+        if command -v oc &> /dev/null; then
+            KUBECTL="oc"
+            log_info "Detected OpenShift CLI: oc"
+        elif command -v kubectl &> /dev/null; then
+            KUBECTL="kubectl" 
+            log_info "Detected Kubernetes CLI: kubectl"
+        else
+            log_error "Neither 'oc' nor 'kubectl' command found"
+            log_error "Please install OpenShift CLI (oc) or Kubernetes CLI (kubectl)"
+            exit 1
+        fi
+    fi
+    
     local missing_tools=()
     
     if ! command -v aws &> /dev/null; then
@@ -1237,26 +1252,70 @@ detect_cluster_name() {
     
     # Method 1: OpenShift Infrastructure object (most reliable for OpenShift)
     if [[ -z "$detected_name" ]]; then
-        detected_name=$($KUBECTL get infrastructure cluster -o jsonpath='{.status.infrastructureName}' 2>/dev/null || echo "")
-        if [[ -n "$detected_name" ]]; then
+        local infra_name
+        infra_name=$($KUBECTL get infrastructure cluster -o jsonpath='{.status.infrastructureName}' 2>/dev/null || echo "")
+
+        if [[ -n "$infra_name" ]]; then
+            # Extract cluster name from infrastructure name (e.g., "clustername-abc123" -> "clustername")
+            # Remove common suffixes like -xxxxx where x is alphanumeric
+            detected_name=$(echo "$infra_name" | sed -E 's/-[a-z0-9]{5,}$//')
             detection_method="infrastructure.status.infrastructureName"
-            log_info "Detected cluster name from OpenShift infrastructure: $detected_name"
+            log_info "Detected cluster name from OpenShift infrastructure: $infra_name -> $detected_name"
         fi
     fi
     
-    # Method 2: OpenShift cluster domain from Infrastructure spec
+    # Method 2: kubectl cluster config (works for any Kubernetes cluster)
+    if [[ -z "$detected_name" ]]; then
+        local cluster_config_name
+        cluster_config_name=$($KUBECTL config view --minify -o jsonpath='{.clusters[0].name}' 2>/dev/null || echo "")
+
+        if [[ -n "$cluster_config_name" ]]; then
+            detected_name="$cluster_config_name"
+            detection_method="kubectl cluster config name"
+            log_info "Detected cluster name from kubectl cluster config: $detected_name"
+        fi
+    fi
+    
+    # Method 3: API server URL parsing (robust fallback)
+    if [[ -z "$detected_name" ]]; then
+        local api_server
+        api_server=$($KUBECTL config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || echo "")
+        if [[ -n "$api_server" ]]; then
+            # Extract cluster name from API server URL patterns:
+            # https://api.clustername.domain.com -> clustername
+            # https://clustername-api.domain.com -> clustername  
+            # https://api-clustername.domain.com -> clustername
+            if [[ "$api_server" =~ https?://api\.([^.]+)\. ]]; then
+                detected_name="${BASH_REMATCH[1]}"
+                detection_method="API server URL (api.clustername pattern)"
+                log_info "Detected cluster name from API server URL: $api_server -> $detected_name"
+            elif [[ "$api_server" =~ https?://([^.-]+)-api\. ]]; then
+                detected_name="${BASH_REMATCH[1]}"
+                detection_method="API server URL (clustername-api pattern)"
+                log_info "Detected cluster name from API server URL: $api_server -> $detected_name"
+            elif [[ "$api_server" =~ https?://api-([^.]+)\. ]]; then
+                detected_name="${BASH_REMATCH[1]}"
+                detection_method="API server URL (api-clustername pattern)"
+                log_info "Detected cluster name from API server URL: $api_server -> $detected_name"
+            fi
+        fi
+    fi
+    
+    # Method 4: OpenShift cluster domain from Infrastructure spec
     if [[ -z "$detected_name" ]]; then
         local cluster_domain
         cluster_domain=$($KUBECTL get infrastructure cluster -o jsonpath='{.spec.cloudConfig.name}' 2>/dev/null || echo "")
         if [[ -n "$cluster_domain" ]]; then
             # Extract cluster name from domain (e.g., mycluster-12345 from mycluster-12345.example.com)
             detected_name=$(echo "$cluster_domain" | cut -d'.' -f1)
+            # Remove suffixes if present
+            detected_name=$(echo "$detected_name" | sed -E 's/-[a-z0-9]{5,}$//')
             detection_method="infrastructure.spec.cloudConfig.name"
             log_info "Detected cluster name from cloud config: $detected_name"
         fi
     fi
     
-    # Method 3: OpenShift DNS configuration
+    # Method 5: OpenShift DNS configuration
     if [[ -z "$detected_name" ]]; then
         local dns_domain
         dns_domain=$($KUBECTL get dns cluster -o jsonpath='{.spec.baseDomain}' 2>/dev/null || echo "")
@@ -1271,7 +1330,7 @@ detect_cluster_name() {
         fi
     fi
     
-    # Method 4: OpenShift Console URL
+    # Method 6: OpenShift Console URL
     if [[ -z "$detected_name" ]]; then
         local console_url
         console_url=$($KUBECTL get route console -n openshift-console -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
@@ -1285,7 +1344,7 @@ detect_cluster_name() {
         fi
     fi
     
-    # Method 5: Node labels (for OpenShift/EKS clusters)
+    # Method 7: Node labels (for OpenShift/EKS clusters)
     if [[ -z "$detected_name" ]]; then
         # Check for cluster-specific node labels
         local cluster_label
@@ -1297,7 +1356,7 @@ detect_cluster_name() {
         fi
     fi
     
-    # Method 6: EKS cluster name from node provider ID
+    # Method 8: EKS cluster name from node provider ID
     if [[ -z "$detected_name" ]]; then
         local provider_id
         provider_id=$($KUBECTL get nodes -o jsonpath='{.items[0].spec.providerID}' 2>/dev/null || echo "")
@@ -1323,7 +1382,7 @@ detect_cluster_name() {
         fi
     fi
     
-    # Method 7: Current kubectl context (fallback)
+    # Method 9: Current kubectl context (fallback)
     if [[ -z "$detected_name" ]]; then
         local context_name
         context_name=$($KUBECTL config current-context 2>/dev/null || echo "")
@@ -1350,7 +1409,7 @@ detect_cluster_name() {
         fi
     fi
     
-    # Method 8: ClusterVersion for OpenShift (additional validation)
+    # Method 10: ClusterVersion for OpenShift (additional validation)
     if [[ -n "$detected_name" ]]; then
         local cluster_id
         cluster_id=$($KUBECTL get clusterversion version -o jsonpath='{.spec.clusterID}' 2>/dev/null || echo "")
@@ -1375,14 +1434,19 @@ detect_cluster_name() {
         log_error "Could not auto-detect cluster name from any available source."
         log_error "Available detection methods attempted:"
         log_error "  1. OpenShift Infrastructure object"
-        log_error "  2. OpenShift DNS configuration"
-        log_error "  3. OpenShift Console route"
-        log_error "  4. Kubernetes node labels"
-        log_error "  5. AWS EC2 instance tags"
-        log_error "  6. kubectl current context"
+        log_error "  2. kubectl cluster config name"
+        log_error "  3. API server URL parsing"
+        log_error "  4. OpenShift cloud config"
+        log_error "  5. OpenShift DNS configuration"
+        log_error "  6. OpenShift Console route"
+        log_error "  7. Kubernetes node labels"
+        log_error "  8. AWS EC2 instance tags"
+        log_error "  9. kubectl current context"
         log_error ""
-        log_error "Please specify cluster name manually with --cluster-name"
-        log_error "Example: $0 --cluster-name my-openshift-cluster"
+        log_error "This should never happen - cluster detection is designed to be bulletproof."
+        log_error "Please report this as a bug with the output of:"
+        log_error "  kubectl config view --minify"
+        log_error "  kubectl get infrastructure cluster -o yaml 2>/dev/null || echo 'No infrastructure object'"
         exit 1
     fi
 }
@@ -1517,6 +1581,41 @@ detect_aws_region() {
         log_error "Example: $0 --aws-region us-west-2"
         exit 1
     fi
+}
+
+# Function to set default values after cluster detection
+set_default_values() {
+    log_info "Setting default values based on detected cluster configuration..."
+    
+    # Set default storage class name if not specified
+    if [[ -z "$STORAGE_CLASS_NAME" ]]; then
+        STORAGE_CLASS_NAME="sbd-efs-sc"
+        log_info "Using default StorageClass name: $STORAGE_CLASS_NAME"
+    fi
+    
+    # Set default EFS name if not specified
+    if [[ -z "$EFS_NAME" ]]; then
+        EFS_NAME="sbd-efs-${CLUSTER_NAME}"
+        log_info "Using default EFS name: $EFS_NAME"
+    fi
+    
+    # Validate that required values are now set
+    if [[ -z "$CLUSTER_NAME" ]]; then
+        log_error "CLUSTER_NAME is not set - this should not happen after cluster detection"
+        exit 1
+    fi
+    
+    if [[ -z "$STORAGE_CLASS_NAME" ]]; then
+        log_error "STORAGE_CLASS_NAME is not set - this should not happen after setting defaults"
+        exit 1
+    fi
+    
+    if [[ -z "$EFS_NAME" ]]; then
+        log_error "EFS_NAME is not set - this should not happen after setting defaults"
+        exit 1
+    fi
+    
+    log_success "Default values configured successfully"
 }
 
 # Function to install or verify EFS CSI driver
@@ -2166,6 +2265,9 @@ main() {
     # Auto-detect cluster and region
     detect_cluster_name
     detect_aws_region
+    
+    # Set default values after cluster detection
+    set_default_values
     
     # Check AWS permissions (after region is detected)
     if [[ "$SKIP_VALIDATION" != "true" ]]; then

@@ -170,95 +170,95 @@ EOF
 
 # Parse command line arguments
 parse_arguments() {
-    while [[ $# -gt 0 ]]; do
-        case $1 in
+while [[ $# -gt 0 ]]; do
+    case $1 in
             -s|--storage-class|--storage-class-name)
-                STORAGE_CLASS_NAME="$2"
-                shift 2
-                ;;
-            -f|--filesystem-id)
-                EFS_FILESYSTEM_ID="$2"
-                CREATE_EFS="false"  # Disable EFS creation when using existing filesystem
-                shift 2
-                ;;
-            -n|--efs-name)
-                EFS_NAME="$2"
-                shift 2
-                ;;
+            STORAGE_CLASS_NAME="$2"
+            shift 2
+            ;;
+        -f|--filesystem-id)
+            EFS_FILESYSTEM_ID="$2"
+            CREATE_EFS="false"  # Disable EFS creation when using existing filesystem
+            shift 2
+            ;;
+        -n|--efs-name)
+            EFS_NAME="$2"
+            shift 2
+            ;;
             -r|--region|--aws-region)
-                AWS_REGION="$2"
-                shift 2
-                ;;
-            -k|--cluster-name)
-                CLUSTER_NAME="$2"
-                shift 2
-                ;;
-            --performance-mode)
-                PERFORMANCE_MODE="$2"
-                shift 2
-                ;;
-            --throughput-mode)
-                THROUGHPUT_MODE="$2"
-                shift 2
-                ;;
-            --provisioned-tp)
-                PROVISIONED_THROUGHPUT="$2"
-                shift 2
-                ;;
-            --create-efs)
-                CREATE_EFS="true"
-                shift
-                ;;
-            --no-create-efs)
-                CREATE_EFS="false"
-                shift
-                ;;
-            --cleanup)
-                CLEANUP="true"
-                shift
-                ;;
-            --skip-csi-install)
-                SKIP_CSI_INSTALL="true"
-                shift
-                ;;
+            AWS_REGION="$2"
+            shift 2
+            ;;
+        -k|--cluster-name)
+            CLUSTER_NAME="$2"
+            shift 2
+            ;;
+        --performance-mode)
+            PERFORMANCE_MODE="$2"
+            shift 2
+            ;;
+        --throughput-mode)
+            THROUGHPUT_MODE="$2"
+            shift 2
+            ;;
+        --provisioned-tp)
+            PROVISIONED_THROUGHPUT="$2"
+            shift 2
+            ;;
+        --create-efs)
+            CREATE_EFS="true"
+            shift
+            ;;
+        --no-create-efs)
+            CREATE_EFS="false"
+            shift
+            ;;
+        --cleanup)
+            CLEANUP="true"
+            shift
+            ;;
+        --skip-csi-install)
+            SKIP_CSI_INSTALL="true"
+            shift
+            ;;
             --efs-csi-role-name)
                 EFS_CSI_ROLE_NAME="$2"
                 shift 2
                 ;;
             --update-mode)
                 UPDATE_MODE="true"
-                shift
-                ;;
-            --dry-run)
-                DRY_RUN="true"
-                shift
-                ;;
-            --verbose)
-                set -x  # Enable verbose mode
-                shift
-                ;;
-            -h|--help)
-                show_usage
-                exit 0
-                ;;
-            *)
-                log_error "Unknown option: $1"
-                show_usage
-                exit 1
-                ;;
-        esac
-    done
-    
-    # Validate inputs
-    if [[ "$PERFORMANCE_MODE" != "generalPurpose" && "$PERFORMANCE_MODE" != "maxIO" ]]; then
-        log_error "Invalid performance mode: $PERFORMANCE_MODE. Must be 'generalPurpose' or 'maxIO'"
-        exit 1
-    fi
-    
-    if [[ "$THROUGHPUT_MODE" != "provisioned" && "$THROUGHPUT_MODE" != "burstingThroughput" ]]; then
-        log_error "Invalid throughput mode: $THROUGHPUT_MODE. Must be 'provisioned' or 'burstingThroughput'"
-        exit 1
-    fi
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN="true"
+            shift
+            ;;
+        --verbose)
+            set -x  # Enable verbose mode
+            shift
+            ;;
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        *)
+            log_error "Unknown option: $1"
+            show_usage
+            exit 1
+            ;;
+    esac
+done
+
+# Validate inputs
+if [[ "$PERFORMANCE_MODE" != "generalPurpose" && "$PERFORMANCE_MODE" != "maxIO" ]]; then
+    log_error "Invalid performance mode: $PERFORMANCE_MODE. Must be 'generalPurpose' or 'maxIO'"
+    exit 1
+fi
+
+if [[ "$THROUGHPUT_MODE" != "provisioned" && "$THROUGHPUT_MODE" != "burstingThroughput" ]]; then
+    log_error "Invalid throughput mode: $THROUGHPUT_MODE. Must be 'provisioned' or 'burstingThroughput'"
+    exit 1
+fi
 }
 
 # Function to compare StorageClass configurations
@@ -326,7 +326,7 @@ detect_existing_iam_role() {
             log_warning "Existing IAM role missing required permissions - will recreate with correct permissions"
             delete_iam_role "$role_name"
             echo ""
-            return
+        return
         fi
     fi
     
@@ -920,8 +920,8 @@ EOF
                 if [[ -n "$line" ]]; then
                     log_error "   $line"
                 fi
-            done
-            echo
+        done
+        echo
             log_error "💡 DIAGNOSIS: The IAM role cannot be assumed because the OIDC provider"
             log_error "              trust policy doesn't match your cluster's actual OIDC issuer."
             echo
@@ -938,7 +938,7 @@ EOF
             echo
             log_error "   3. Update the IAM role trust policy with the correct OIDC provider URL"
             log_error "   4. Ensure the OIDC provider exists in your AWS account"
-            exit 1
+        exit 1
             ;;
         "credential_error")
             log_error "❌ EFS CSI driver credential validation failed" 
@@ -1066,7 +1066,7 @@ check_efs_csi_service_account() {
 
 # Function to auto-detect cluster name from OpenShift/Kubernetes cluster
 detect_cluster_name() {
-    if [[ -n "$CLUSTER_NAME" ]]; then
+        if [[ -n "$CLUSTER_NAME" ]]; then
         log_info "Using specified cluster name: $CLUSTER_NAME"
         return
     fi

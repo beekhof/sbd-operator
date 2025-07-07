@@ -207,8 +207,61 @@ build-storage-tool: manifests generate fmt vet ## Build setup-shared-storage too
 		-o bin/setup-shared-storage cmd/setup-shared-storage/main.go
 
 .PHONY: run
-run: manifests generate fmt vet ## Run a controller from your host.
+run: manifests generate fmt vet webhook-certs ## Run a controller from your host.
 	go run ./cmd/main.go
+
+.PHONY: run-dev
+run-dev: manifests generate fmt vet webhook-certs-staging ## Run a controller from your host with staging certificates.
+	@echo "Starting controller with Let's Encrypt staging certificates..."
+	@echo "Set LETSENCRYPT_EMAIL environment variable for your email"
+	go run ./cmd/main.go --leader-elect=false
+
+.PHONY: run-prod
+run-prod: manifests generate fmt vet webhook-certs-letsencrypt ## Run a controller from your host with production certificates.
+	@echo "Starting controller with Let's Encrypt production certificates..."
+	@echo "Set LETSENCRYPT_EMAIL environment variable for your email"
+	go run ./cmd/main.go
+
+.PHONY: webhook-certs
+webhook-certs: ## Generate certificates for webhook development (uses Let's Encrypt by default).
+	@echo "Generating webhook certificates for development..."
+	@chmod +x scripts/generate-webhook-certs.sh
+	@scripts/generate-webhook-certs.sh
+
+.PHONY: webhook-certs-letsencrypt
+webhook-certs-letsencrypt: ## Generate Let's Encrypt certificates for webhook development.
+	@echo "Generating Let's Encrypt certificates for webhook development..."
+	@echo "Using domain: sbd-webhook.aws.validatedpatterns.io"
+	@chmod +x scripts/generate-webhook-certs.sh
+	@USE_LETSENCRYPT=true \
+	 WEBHOOK_DOMAIN=sbd-webhook.aws.validatedpatterns.io \
+	 LETSENCRYPT_EMAIL=$(LETSENCRYPT_EMAIL) \
+	 LETSENCRYPT_STAGING=false \
+	 scripts/generate-webhook-certs.sh
+
+.PHONY: webhook-certs-staging
+webhook-certs-staging: ## Generate Let's Encrypt staging certificates for webhook development.
+	@echo "Generating Let's Encrypt staging certificates for webhook development..."
+	@echo "Using domain: sbd-webhook.aws.validatedpatterns.io"
+	@chmod +x scripts/generate-webhook-certs.sh
+	@USE_LETSENCRYPT=true \
+	 WEBHOOK_DOMAIN=sbd-webhook.aws.validatedpatterns.io \
+	 LETSENCRYPT_EMAIL=$(LETSENCRYPT_EMAIL) \
+	 LETSENCRYPT_STAGING=true \
+	 scripts/generate-webhook-certs.sh
+
+.PHONY: webhook-certs-self-signed
+webhook-certs-self-signed: ## Generate self-signed certificates for webhook development.
+	@echo "Generating self-signed certificates for webhook development..."
+	@chmod +x scripts/generate-webhook-certs.sh
+	@USE_LETSENCRYPT=false scripts/generate-webhook-certs.sh
+
+.PHONY: clean-webhook-certs
+clean-webhook-certs: ## Clean up generated webhook certificates.
+	@echo "Cleaning up webhook certificates..."
+	@rm -rf /tmp/k8s-webhook-server/serving-certs
+	@rm -rf /tmp/letsencrypt
+	@echo "✅ Webhook certificates cleaned up."
 
 ##@ Container Images
 

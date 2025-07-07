@@ -21,11 +21,12 @@ type Config struct {
 	StorageClassName string
 
 	// Behavior flags
-	CreateEFS  bool
-	DryRun     bool
-	Cleanup    bool
-	UpdateMode bool
-	Verbose    bool
+	CreateEFS         bool
+	DryRun            bool
+	Cleanup           bool
+	UpdateMode        bool
+	Verbose           bool
+	GenerateIAMPolicy bool
 
 	// EFS Configuration
 	PerformanceMode       string
@@ -43,6 +44,12 @@ func main() {
 	// Setup logging
 	if config.Verbose {
 		log.SetFlags(log.LstdFlags | log.Lshortfile)
+	}
+
+	// Handle IAM policy generation
+	if config.GenerateIAMPolicy {
+		printIAMPolicy()
+		return
 	}
 
 	// Create storage manager
@@ -89,6 +96,7 @@ func parseFlags() *Config {
 	flag.BoolVar(&config.Cleanup, "cleanup", false, "Clean up all created resources")
 	flag.BoolVar(&config.UpdateMode, "update-mode", false, "Force update/recreation of StorageClass")
 	flag.BoolVar(&config.Verbose, "verbose", false, "Enable verbose logging")
+	flag.BoolVar(&config.GenerateIAMPolicy, "generate-iam-policy", false, "Generate and print the required IAM policy for the EFS CSI driver")
 
 	// EFS Configuration
 	flag.StringVar(&config.PerformanceMode, "performance-mode", "generalPurpose", "EFS performance mode (generalPurpose|maxIO)")
@@ -198,9 +206,55 @@ func printResults(result *storage.SetupResult) {
 
 	fmt.Println("\n✅ Your cluster now has ReadWriteMany (RWX) storage capability!")
 	fmt.Printf("   Use StorageClass '%s' in your PVCs for shared storage.\n", result.StorageClassName)
+}
 
-	if !result.TestPassed {
-		fmt.Println("\n⚠️  Note: Credential testing failed, but resources were created.")
-		fmt.Println("   The EFS CSI driver may need a few minutes to become ready.")
-	}
+// printIAMPolicy generates and prints the required IAM policy for the EFS CSI driver
+func printIAMPolicy() {
+	policy := `{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeVpcs",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeSecurityGroups",
+        "ec2:CreateSecurityGroup",
+        "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:CreateTags"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "efs:CreateFileSystem",
+        "efs:DescribeFileSystems",
+        "efs:CreateMountTarget",
+        "efs:DescribeMountTargets",
+        "efs:CreateTags",
+        "efs:DescribeTags"
+      ],
+      "Resource": "*"
+    }
+  ]
+}`
+
+	fmt.Println("📋 Required IAM Policy for OpenShift EFS CSI Driver Setup")
+	fmt.Println("========================================================")
+	fmt.Println()
+	fmt.Println("This policy grants the minimum required permissions for the")
+	fmt.Println("setup-shared-storage tool to create and configure EFS resources")
+	fmt.Println("for OpenShift clusters.")
+	fmt.Println()
+	fmt.Println("USAGE:")
+	fmt.Println("1. Save this policy as 'efs-setup-policy.json'")
+	fmt.Println("2. Create IAM policy: aws iam create-policy --policy-name EFS-Setup-Policy --policy-document file://efs-setup-policy.json")
+	fmt.Println("3. Attach to user/role: aws iam attach-user-policy --user-name YOUR_USER --policy-arn arn:aws:iam::ACCOUNT:policy/EFS-Setup-Policy")
+	fmt.Println()
+	fmt.Println("POLICY JSON:")
+	fmt.Println(policy)
+	fmt.Println()
+	fmt.Println("NOTE: This policy is for the setup tool only. The EFS CSI driver itself")
+	fmt.Println("uses AWS credentials from the 'aws-creds' secret in OpenShift clusters.")
 }

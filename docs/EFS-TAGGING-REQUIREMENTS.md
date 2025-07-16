@@ -13,17 +13,64 @@
 
 The following AWS permissions are **MANDATORY** for proper operation:
 
-### EFS Tagging Permissions
+### Secure IAM Policy (v2)
+The tool now generates a **security-improved policy** with 5 granular statements:
+
 ```json
 {
-  "Effect": "Allow", 
-  "Action": [
-    "efs:DescribeTags",   // CRITICAL: Required to detect existing EFS by name
-    "efs:CreateTags"      // CRITICAL: Required to tag new EFS for future reuse
-  ],
-  "Resource": "*"
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EC2ReadOnlyPermissions",
+      "Effect": "Allow",
+      "Action": ["ec2:DescribeVpcs", "ec2:DescribeSubnets", "ec2:DescribeSecurityGroups"],
+      "Resource": "*"  // Required for region-wide discovery
+    },
+    {
+      "Sid": "EC2SecurityGroupManagement", 
+      "Effect": "Allow",
+      "Action": ["ec2:CreateSecurityGroup", "ec2:AuthorizeSecurityGroupIngress"],
+      "Resource": ["arn:aws:ec2:*:*:security-group/*", "arn:aws:ec2:*:*:vpc/*"]
+    },
+    {
+      "Sid": "EC2Tagging",
+      "Effect": "Allow", 
+      "Action": ["ec2:CreateTags"],
+      "Resource": "arn:aws:ec2:*:*:security-group/*",
+      "Condition": {"StringEquals": {"ec2:CreateAction": "CreateSecurityGroup"}}
+    },
+    {
+      "Sid": "EFSReadOperations",
+      "Effect": "Allow",
+      "Action": ["efs:DescribeFileSystems", "efs:DescribeMountTargets", "efs:DescribeTags"],  
+      "Resource": "*"  // Required to discover existing EFS filesystems
+    },
+    {
+      "Sid": "EFSWriteOperations",
+      "Effect": "Allow", 
+      "Action": ["efs:CreateFileSystem", "efs:CreateMountTarget", "efs:CreateTags"],
+      "Resource": ["arn:aws:efs:*:*:file-system/*", "arn:aws:efs:*:*:mount-target/*"]
+    }
+  ]
 }
 ```
+
+### Critical EFS Tagging Permissions
+```json
+"efs:DescribeTags"   // CRITICAL: Required to detect existing EFS by name
+"efs:CreateTags"     // CRITICAL: Required to tag new EFS for future reuse
+```
+
+### Security Improvements (v2)
+
+**BEFORE:** Two broad statements with `"Resource": "*"` for everything  
+**AFTER:** Five granular statements with proper resource scoping
+
+- ✅ **Read operations**: Use `"*"` only where necessary for discovery
+- ✅ **Write operations**: Scoped to specific ARN patterns  
+- ✅ **Conditional tagging**: Only during resource creation
+- ✅ **Principle of least privilege**: Each statement has minimal required permissions
+- ✅ **Sid identifiers**: Clear statement purposes for auditing
 
 ### Why These Permissions Are Critical
 

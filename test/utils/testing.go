@@ -1005,7 +1005,7 @@ func SuiteSetup(namespace string) (*TestNamespace, error) {
 	By("verifying the controller-manager is deployed")
 	deployment := &appsv1.Deployment{}
 	err = testClients.Client.Get(testClients.Context, client.ObjectKey{
-		Name:      "sbd-operator-controller-manager",
+		Name:      "controller-manager",
 		Namespace: "sbd-operator-system",
 	}, deployment)
 	Expect(err).NotTo(HaveOccurred(), "Expected controller-manager to be deployed (should be done by Makefile setup)")

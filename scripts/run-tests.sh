@@ -673,10 +673,42 @@ update_webhook_ca_bundle() {
     
     log_info "Generated CA bundle (${#ca_bundle} chars)"
     
+    # Check if caBundle field already exists
+    local patch_op="add"
+    if $KUBECTL get validatingwebhookconfiguration "$webhook_config_name" -o jsonpath='{.webhooks[0].clientConfig.caBundle}' >/dev/null 2>&1; then
+        if [[ -n "$($KUBECTL get validatingwebhookconfiguration "$webhook_config_name" -o jsonpath='{.webhooks[0].clientConfig.caBundle}' 2>/dev/null)" ]]; then
+            patch_op="replace"
+        fi
+    fi
+    
     # Update the ValidatingWebhookConfiguration with the CA bundle
-    if $KUBECTL patch validatingwebhookconfiguration "$webhook_config_name" \
-        --type='json' \
-        -p="[{'op': 'add', 'path': '/webhooks/0/clientConfig/caBundle', 'value': '$ca_bundle'}]" 2>/dev/null; then
+    # Use kubectl edit with a temporary file to avoid shell expansion issues with long base64 strings
+    local temp_webhook_file="/tmp/webhook-config-$$.yaml"
+    
+    # Get the current webhook configuration
+    if ! $KUBECTL get validatingwebhookconfiguration "$webhook_config_name" -o yaml > "$temp_webhook_file"; then
+        log_error "Failed to get webhook configuration"
+        exit 1
+    fi
+    
+    # Update the caBundle field using yq or sed
+    if command -v yq >/dev/null 2>&1; then
+        # Use yq if available (more robust)
+        yq eval ".webhooks[0].clientConfig.caBundle = \"$ca_bundle\"" -i "$temp_webhook_file"
+    else
+        # Fallback to sed (less robust but more widely available)
+        if grep -q "caBundle:" "$temp_webhook_file"; then
+            # Replace existing caBundle
+            sed -i.bak "s|caBundle:.*|caBundle: $ca_bundle|" "$temp_webhook_file"
+        else
+            # Add caBundle after service section
+            sed -i.bak "/service:/a\\
+      caBundle: $ca_bundle" "$temp_webhook_file"
+        fi
+    fi
+    
+    # Apply the updated configuration
+    if $KUBECTL apply -f "$temp_webhook_file" >/dev/null 2>&1; then
         log_success "Webhook configuration updated with CA bundle"
     else
         log_error "Failed to update webhook configuration with CA bundle"
@@ -684,6 +716,9 @@ update_webhook_ca_bundle() {
         $KUBECTL get validatingwebhookconfiguration "$webhook_config_name" -o jsonpath='{.webhooks[0].clientConfig}' 2>/dev/null || true
         exit 1
     fi
+    
+    # Clean up temporary file
+    rm -f "$temp_webhook_file" "$temp_webhook_file.bak"
 }
 
 # Function to deploy operator

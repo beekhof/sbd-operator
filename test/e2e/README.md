@@ -76,47 +76,71 @@ Create an IAM policy with the above permissions and attach it to:
 
 ## Running E2E Tests
 
-### Default: Webhooks Disabled (Recommended)
+### Recommended: Complete Deployment Pipeline
 
 ```bash
-# Run e2e tests without webhooks (simplest, avoids certificate issues)
+# Run e2e tests with complete deployment and environment setup
 make test-e2e
 ```
 
-**Why disabled by default?**
-- Avoids TLS certificate complexity in test environments  
-- Focuses on core operator functionality
-- Webhooks primarily provide validation, not core SBD functionality
-- Faster test setup and execution
+This uses the comprehensive `scripts/run-tests.sh` pipeline that:
+- **Auto-detects environment** (existing cluster, CRC, Kind)
+- **Builds and deploys images** appropriately for the environment
+- **Deploys the operator** with proper configuration
+- **Generates webhook certificates** automatically
+- **Creates test namespaces** with proper security contexts
+- **Runs the tests** with ginkgo
+- **Cleans up resources** after completion (preserves on failure for debugging)
 
-### Advanced: With Webhooks Enabled
-
-If you need to test webhook validation specifically:
+### Alternative: With Webhooks Enabled
 
 ```bash
-# Run e2e tests with webhooks enabled (requires certificate setup)
+# Run e2e tests with explicit webhook validation
 make test-e2e-with-webhooks
 ```
 
-This automatically:
-1. Generates self-signed certificates 
-2. Temporarily enables webhooks in test configuration
-3. Runs tests with webhook validation 
-4. Restores webhook-disabled state after tests
+This uses the same comprehensive pipeline but emphasizes webhook testing.
 
-**Note:** Webhook testing requires additional setup time for certificate generation.
+### Local/Quick Testing (Assumes Operator Deployed)
 
-### Manual Execution
+If you already have the operator deployed and just want to run the test suite:
 
 ```bash
-# Set environment variables
-export KUBECONFIG=/path/to/your/kubeconfig
-export AWS_REGION=us-west-2  # Optional - will be auto-detected
-
-# Run tests directly
-cd test/e2e
-ginkgo -v .
+# Run e2e tests locally (operator must be already deployed)
+make test-e2e-local
 ```
+
+**Warning:** This assumes:
+- Operator is already deployed and running
+- Images are already available in the cluster
+- Webhook certificates are configured (if webhooks enabled)
+- Test namespaces exist with proper permissions
+
+### Manual Execution with Full Control
+
+```bash
+# Use the script directly with custom options
+scripts/run-tests.sh --type e2e --env cluster -v
+
+# Or with specific environment
+scripts/run-tests.sh --type e2e --env crc -v
+
+# Cleanup only (no tests)
+scripts/run-tests.sh --cleanup-only --env cluster
+
+# Build images and run tests
+scripts/run-tests.sh --type e2e --env cluster --build -v
+```
+
+### Environment Auto-Detection
+
+The test script automatically detects and uses the best available environment:
+
+1. **KUBECONFIG set and cluster accessible** → uses existing cluster
+2. **CRC running** → uses CRC (OpenShift local)
+3. **Kind cluster exists** → uses Kind
+4. **Any cluster accessible** → uses existing cluster
+5. **Default** → uses existing cluster for e2e tests
 
 ## Test Validation Process
 

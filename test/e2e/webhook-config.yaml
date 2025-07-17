@@ -11,8 +11,8 @@ webhooks:
   - v1
   clientConfig:
     service:
-      name: webhook-service
-      namespace: system
+      name: sbd-operator-webhook-service
+      namespace: sbd-operator-system
       path: /validate-medik8s-medik8s-io-v1alpha1-sbdconfig
     # caBundle will be injected by the test script
   failurePolicy: Fail

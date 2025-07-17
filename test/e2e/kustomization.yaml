@@ -4,8 +4,8 @@ kind: Kustomization
 # Set namespace for all resources
 namespace: sbd-operator-system
 
-# Add namePrefix to match RBAC expectations (ClusterRoleBinding expects prefixed service account name)
-namePrefix: sbd-operator-
+# Remove namePrefix since webhook config and service now use explicit full names
+# This prevents double-prefixing while keeping RBAC names consistent
 
 resources:
 # Include individual components to avoid webhook conflicts with OpenShift service-ca
@@ -24,6 +24,11 @@ patches:
     name: controller-manager
 # Enable webhook patch for e2e tests - configures certificate mounting
 - path: webhook-patch.yaml
+  target:
+    kind: Deployment
+    name: controller-manager
+# Update manager deployment to use correct prefixed service account name
+- path: manager-serviceaccount-patch.yaml
   target:
     kind: Deployment
     name: controller-manager

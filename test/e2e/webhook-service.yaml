@@ -1,8 +1,8 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: webhook-service
-  namespace: system
+  name: sbd-operator-webhook-service
+  namespace: sbd-operator-system
   labels:
     app.kubernetes.io/name: sbd-operator
     app.kubernetes.io/component: e2e-test

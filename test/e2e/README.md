@@ -193,7 +193,19 @@ illegal base64 data at input byte 72
 
 **Solution**: E2E tests use dedicated `e2e-webhook-configuration` that doesn't conflict with service-ca managed webhooks.
 
-**4. Webhook Certificate Not Found**
+**4. TLS Certificate Name Mismatch**
+```
+http: TLS handshake error from 10.128.0.31:60266: remote error: tls: bad certificate
+```
+
+**Root Cause**: Certificate Subject Alternative Names (SAN) don't match the actual service name.
+
+**Solution**: 
+- Certificate generation now uses correct SERVICE_NAME=sbd-operator-webhook-service
+- SAN includes all required DNS names: sbd-operator-webhook-service, sbd-operator-webhook-service.sbd-operator-system, etc.
+- CN field shortened to avoid 64-character OpenSSL limit
+
+**5. Webhook Certificate Not Found**
 ```
 open /tmp/k8s-webhook-server/serving-certs/tls.crt: no such file or directory
 ```

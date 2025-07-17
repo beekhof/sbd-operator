@@ -161,7 +161,7 @@ ST=CA
 L=San Francisco
 O=Development
 OU=SBD Operator
-CN=$SERVICE_NAME.$NAMESPACE.svc.cluster.local
+CN=$SERVICE_NAME
 
 [v3_req]
 basicConstraints = CA:FALSE

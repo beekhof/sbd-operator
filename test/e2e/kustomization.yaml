@@ -4,10 +4,14 @@ kind: Kustomization
 # Set namespace for all resources
 namespace: sbd-operator-system
 
+# Add namePrefix to match RBAC expectations (ClusterRoleBinding expects prefixed service account name)
+namePrefix: sbd-operator-
+
 resources:
 # Include individual components to avoid webhook conflicts with OpenShift service-ca
 - ../../config/crd
-- ../../config/rbac
+# Use consolidated RBAC file to avoid kustomize security restrictions and double-prefixing
+- rbac.yaml
 - ../../config/manager
 - webhook-service.yaml
 # Add e2e-specific webhook configuration that doesn't conflict with service-ca

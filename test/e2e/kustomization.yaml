@@ -5,9 +5,8 @@ kind: Kustomization
 namespace: sbd-operator-system
 
 resources:
-- ../../config/openshift-default
-# Disable webhooks for e2e tests to avoid certificate issues
-# - ../../config/webhook  # Enable webhook configuration
+# Use generic Kubernetes config instead of OpenShift to avoid service-ca conflicts with manual certificates
+- ../../config/default
 
 #images:
 #- name: controller:latest
@@ -19,9 +18,8 @@ patches:
   target:
     kind: Deployment
     name: controller-manager
-# Disable webhook patch since webhooks are disabled for e2e tests
-# [WEBHOOK] Enable webhook patch - local file to avoid kustomize security restrictions
-# - path: webhook-patch.yaml
-#   target:
-#     kind: Deployment
-#     name: controller-manager
+# Enable webhook patch for e2e tests - configures certificate mounting
+- path: webhook-patch.yaml
+  target:
+    kind: Deployment
+    name: controller-manager

@@ -48,7 +48,7 @@ The tool now generates a **security-improved policy** with 5 granular statements
     {
       "Sid": "EFSWriteOperations",
       "Effect": "Allow", 
-      "Action": ["elasticfilesystem:CreateFileSystem", "elasticfilesystem:CreateMountTarget", "elasticfilesystem:CreateTags"],
+      "Action": ["elasticfilesystem:CreateFileSystem", "elasticfilesystem:CreateMountTarget", "elasticfilesystem:CreateTags", "elasticfilesystem:TagResource"],
       "Resource": ["arn:aws:elasticfilesystem:*:*:file-system/*", "arn:aws:elasticfilesystem:*:*:mount-target/*"]
     }
   ]
@@ -58,7 +58,8 @@ The tool now generates a **security-improved policy** with 5 granular statements
 ### Critical EFS Tagging Permissions
 ```json
 "elasticfilesystem:DescribeTags"   // CRITICAL: Required to detect existing EFS by name
-"elasticfilesystem:CreateTags"     // CRITICAL: Required to tag new EFS for future reuse
+"elasticfilesystem:TagResource"    // CRITICAL: Required to tag EFS during creation (CreateFileSystem)
+"elasticfilesystem:CreateTags"     // Legacy API: For tagging existing resources
 ```
 
 ### Security Improvements (v2)
@@ -79,10 +80,14 @@ The tool now generates a **security-improved policy** with 5 granular statements
    - **Without it:** Tool cannot find existing EFS → creates duplicates
    - **Impact:** Wasted money, resource sprawl, cleanup difficulties
 
-2. **`elasticfilesystem:CreateTags`**  
-   - **Purpose:** Tags new EFS filesystems with proper `Name`, `Cluster`, and `Purpose` tags
-   - **Without it:** New EFS cannot be found in future runs → more duplicates
-   - **Impact:** Exponential resource growth with each run
+2. **`elasticfilesystem:TagResource`**  
+   - **Purpose:** Tags new EFS filesystems during creation (CreateFileSystem with tags)
+   - **Without it:** EFS creation fails with AccessDeniedException
+   - **Impact:** Tool cannot create EFS with required tags → complete failure
+
+3. **`elasticfilesystem:CreateTags` (Legacy)**  
+   - **Purpose:** Tags existing EFS filesystems after creation (legacy API)
+   - **Note:** Not used when creating EFS with tags inline, but may be needed for other operations
 
 ## Detection Logic
 
@@ -129,7 +134,7 @@ func (m *Manager) findEFSByName(ctx context.Context, name string) (string, error
 ## Solution Implemented
 
 ### 1. **Mandatory Permission Validation**
-Added `elasticfilesystem:DescribeTags` and `elasticfilesystem:CreateTags` to required permissions:
+Added `elasticfilesystem:DescribeTags`, `elasticfilesystem:TagResource`, and `elasticfilesystem:CreateTags` to required permissions:
 
 ```go
 // pkg/storage/aws/manager.go - ValidateAWSPermissions()

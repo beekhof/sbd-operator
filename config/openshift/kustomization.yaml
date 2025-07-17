@@ -3,6 +3,7 @@ kind: Kustomization
 
 resources:
 - sbd-agent-scc.yaml
+- webhook-service-ca.yaml
 
 # Labels to add to all resources
 labels:

@@ -76,15 +76,35 @@ Create an IAM policy with the above permissions and attach it to:
 
 ## Running E2E Tests
 
-### Using the Makefile (Recommended)
+### Default: Webhooks Disabled (Recommended)
 
 ```bash
-# Run all e2e tests with automatic setup
-make test-e2e KUBECONFIG=/path/to/kubeconfig
-
-# Run with specific AWS region (optional)
-AWS_REGION=us-west-2 make test-e2e KUBECONFIG=/path/to/kubeconfig
+# Run e2e tests without webhooks (simplest, avoids certificate issues)
+make test-e2e
 ```
+
+**Why disabled by default?**
+- Avoids TLS certificate complexity in test environments  
+- Focuses on core operator functionality
+- Webhooks primarily provide validation, not core SBD functionality
+- Faster test setup and execution
+
+### Advanced: With Webhooks Enabled
+
+If you need to test webhook validation specifically:
+
+```bash
+# Run e2e tests with webhooks enabled (requires certificate setup)
+make test-e2e-with-webhooks
+```
+
+This automatically:
+1. Generates self-signed certificates 
+2. Temporarily enables webhooks in test configuration
+3. Runs tests with webhook validation 
+4. Restores webhook-disabled state after tests
+
+**Note:** Webhook testing requires additional setup time for certificate generation.
 
 ### Manual Execution
 

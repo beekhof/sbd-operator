@@ -93,9 +93,19 @@ sync-test-files: ## Sync shared configuration files to test directories.
 	@scripts/sync-test-files.sh
 
 .PHONY: test-e2e
-test-e2e: sync-test-files ## Run e2e tests using the test runner script (auto-detects environment).
-	@echo "Running e2e tests using test runner script..."
-	@scripts/run-tests.sh --type e2e -v --env cluster
+test-e2e: ginkgo ## Run e2e tests (webhooks disabled for simplicity).
+	$(GINKGO) -v test/e2e
+
+.PHONY: test-e2e-with-webhooks  
+test-e2e-with-webhooks: ginkgo webhook-certs-self-signed ## Run e2e tests with webhooks enabled (requires certificates).
+	@echo "Enabling webhooks for e2e tests..."
+	@# Temporarily enable webhooks in e2e kustomization
+	@sed -i.bak 's|^# - ../../config/webhook|  - ../../config/webhook|' test/e2e/kustomization.yaml
+	@sed -i.bak 's|^# - path: webhook-patch.yaml|- path: webhook-patch.yaml|; s|^#   target:|  target:|; s|^#     kind:|    kind:|; s|^#     name:|    name:|' test/e2e/kustomization.yaml
+	@echo "Running e2e tests with webhooks enabled..."
+	$(GINKGO) -v test/e2e || (echo "Restoring webhook disabled state..." && mv test/e2e/kustomization.yaml.bak test/e2e/kustomization.yaml && exit 1)
+	@echo "Restoring webhook disabled state..."
+	@mv test/e2e/kustomization.yaml.bak test/e2e/kustomization.yaml
 
 .PHONY: test-smoke
 test-smoke: sync-test-files ## Run smoke tests with building images.

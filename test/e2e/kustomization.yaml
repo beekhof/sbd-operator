@@ -6,7 +6,8 @@ namespace: sbd-operator-system
 
 resources:
 - ../../config/openshift-default
-- ../../config/webhook  # Enable webhook configuration
+# Disable webhooks for e2e tests to avoid certificate issues
+# - ../../config/webhook  # Enable webhook configuration
 
 #images:
 #- name: controller:latest
@@ -18,8 +19,9 @@ patches:
   target:
     kind: Deployment
     name: controller-manager
+# Disable webhook patch since webhooks are disabled for e2e tests
 # [WEBHOOK] Enable webhook patch - local file to avoid kustomize security restrictions
-- path: webhook-patch.yaml
-  target:
-    kind: Deployment
-    name: controller-manager
+# - path: webhook-patch.yaml
+#   target:
+#     kind: Deployment
+#     name: controller-manager

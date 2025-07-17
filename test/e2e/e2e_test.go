@@ -283,6 +283,9 @@ func testBasicSBDConfiguration(cluster ClusterInfo) {
 		config.Spec.StaleNodeTimeout = &metav1.Duration{Duration: 2 * time.Hour}
 		config.Spec.WatchdogTimeout = &metav1.Duration{Duration: 90 * time.Second}
 	})
+	if err != nil {
+		GinkgoWriter.Printf("Error creating SBDConfig: %v\n", err)
+	}
 	Expect(err).NotTo(HaveOccurred())
 
 	validator := testNamespace.NewSBDAgentValidator()

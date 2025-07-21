@@ -44,3 +44,4 @@ cluster/
 dist/
 config/manager/kustomization.yaml
 deploy/sbd-agent-daemonset-*.yaml
+.conversation-context.txt

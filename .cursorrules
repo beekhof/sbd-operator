@@ -105,7 +105,7 @@ PROJECT-SPECIFIC GUIDELINES:
 - Agent communication needs retry logic with exponential backoff
 - Status updates should reflect actual system state
 - Consider split-brain scenarios in remediation logic
-- Use concise summaries for commit messages
+- Use concise summaries for commit messages, and include a list of all prompts specified by the user since the last commit 
 - Run All aws commands with AWS_PAGER=""
 
 DEPENDENCIES:

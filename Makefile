@@ -95,7 +95,7 @@ sync-test-files: ## Sync shared configuration files to test directories.
 .PHONY: test-e2e
 test-e2e: sync-test-files ## Run e2e tests with complete deployment pipeline.
 	@echo "Running e2e tests with complete deployment and environment setup..."
-	@scripts/run-tests.sh --type e2e --env cluster -v
+	@scripts/run-tests.sh --type e2e --env cluster -v --no-webhook
 
 .PHONY: test-e2e-local
 test-e2e-local: ginkgo ## Run e2e tests locally (assumes operator already deployed).
@@ -106,7 +106,7 @@ test-e2e-local: ginkgo ## Run e2e tests locally (assumes operator already deploy
 test-e2e-with-webhooks: sync-test-files ## Run e2e tests with webhooks enabled using deployment pipeline.
 	@echo "Running e2e tests with webhooks enabled via deployment pipeline..."
 	@# The run-tests.sh script handles webhook certificate generation automatically
-	@scripts/run-tests.sh --type e2e --env cluster -v
+	@scripts/run-tests.sh --type e2e --env cluster -v  --webhook
 
 .PHONY: test-smoke
 test-smoke: sync-test-files ## Run smoke tests with building images.

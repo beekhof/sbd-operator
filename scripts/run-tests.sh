@@ -554,7 +554,7 @@ build_installer() {
             kustomize_target="test/smoke"
         else
             log_info "Building OpenShift installer with SecurityContextConstraints but no webhooks"
-            kustomize_target="test/smoke/kustomization-no-webhook.yaml"
+            kustomize_target="test/smoke-no-webhook"
         fi
     elif [[ "$TEST_ENVIRONMENT" == "kind" ]]; then
         if [[ "$ENABLE_WEBHOOK" == "true" ]]; then
@@ -562,7 +562,7 @@ build_installer() {
             kustomize_target="config/default"
         else
             log_info "Building Kubernetes installer for Kind without webhooks"
-            kustomize_target="config/default/kustomization-no-webhook.yaml"
+            kustomize_target="config/default-no-webhook"
         fi
     else
         log_info "Building installer for existing cluster"
@@ -572,7 +572,7 @@ build_installer() {
                 kustomize_target="test/smoke"
             else
                 log_info "Building smoke test installer without webhooks"
-                kustomize_target="test/smoke/kustomization-no-webhook.yaml"
+                kustomize_target="test/smoke-no-webhook"
             fi
         else
             if [[ "$ENABLE_WEBHOOK" == "true" ]]; then
@@ -580,7 +580,7 @@ build_installer() {
                 kustomize_target="test/e2e"
             else
                 log_info "Building e2e test installer without webhooks"
-                kustomize_target="test/e2e/kustomization-no-webhook.yaml"
+                kustomize_target="test/e2e-no-webhook"
             fi
         fi
     fi

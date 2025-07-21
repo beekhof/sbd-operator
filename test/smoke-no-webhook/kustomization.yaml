@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Set namespace for all resources
+namespace: sbd-operator-system
+
+resources:
+- ../config/openshift-default
+# NOTE: Deliberately NOT including ../../config/webhook
+
+patches:
+- path: ../test/smoke/image-pull-policy-patch.yaml
+  target:
+    kind: Deployment
+    name: controller-manager
+# NOTE: Deliberately NOT including webhook-patch.yaml 

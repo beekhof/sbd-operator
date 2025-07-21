@@ -26,6 +26,7 @@ CLEANUP_ONLY="false"
 SKIP_BUILD="true"
 SKIP_DEPLOY="false"
 VERBOSE="false"
+ENABLE_WEBHOOK="true"
 CRC_CLUSTER="sbd-operator-test"
 test_namespace="sbd-test"
 
@@ -78,6 +79,8 @@ OPTIONS:
     --cleanup-only          Only perform cleanup, don't run tests
     -b, --build             Build container images (default: skip building, use existing images)
     -d, --skip-deploy       Skip deploying operator (assumes already deployed)
+    -w, --webhook           Enable admission webhooks and certificate generation (default)
+    --no-webhook            Disable admission webhooks (faster testing, reduced validation)
     -v, --verbose           Enable verbose output
     -h, --help              Show this help message
 
@@ -94,6 +97,20 @@ TEST ENVIRONMENTS:
     kind                  Kind (Kubernetes in Docker)  
     cluster               Existing Kubernetes/OpenShift cluster
 
+WEBHOOK MODES:
+    --webhook             Enable admission webhooks (default)
+                         • Full validation of SBDConfig resources
+                         • Prevents overlapping node selectors 
+                         • Validates configuration parameters
+                         • Requires certificate generation (~10s setup time)
+                         • Production-equivalent testing
+    
+    --no-webhook         Disable admission webhooks  
+                         • Faster test startup (no certificate generation)
+                         • Reduced cluster validation
+                         • Useful for basic functionality testing
+                         • ⚠️  Skips critical safety validations
+
 AUTO-DETECTION PRIORITY (when --env is not specified):
     1. If KUBECONFIG is set and cluster is accessible → cluster
     2. If CRC is running → crc
@@ -105,14 +122,17 @@ EXAMPLES:
     # Run smoke tests with auto-detected environment (uses existing images)
     $0
 
-    # Run e2e tests on existing cluster
-    $0 --type e2e --env cluster
+    # Run e2e tests on existing cluster with webhooks enabled (default)
+    $0 --type e2e --env cluster --webhook
 
-    # Run smoke tests on CRC without cleanup (for debugging)
-    $0 --type smoke --env crc --no-cleanup
+    # Run smoke tests WITHOUT webhooks (faster testing, reduced validation)
+    $0 --type smoke --no-webhook
 
-    # Build images and run tests
-    $0 --build
+    # Run smoke tests on CRC without cleanup and without webhooks (for debugging)
+    $0 --type smoke --env crc --no-cleanup --no-webhook
+
+    # Build images and run tests with webhooks disabled
+    $0 --build --no-webhook
 
     # Clean up test resources only (no tests)
     $0 --cleanup-only
@@ -120,11 +140,11 @@ EXAMPLES:
     # Clean up test resources from specific environment
     $0 --cleanup-only --env crc
 
-    # Run tests with custom registry
-    QUAY_REGISTRY=my-registry.io QUAY_ORG=myorg $0
+    # Run tests with custom registry and without webhooks
+    QUAY_REGISTRY=my-registry.io QUAY_ORG=myorg $0 --no-webhook
 
-    # Run tests with specific kubeconfig (auto-detects cluster environment)
-    KUBECONFIG=/path/to/kubeconfig $0 --type e2e
+    # Run e2e tests with specific kubeconfig and webhooks enabled
+    KUBECONFIG=/path/to/kubeconfig $0 --type e2e --webhook
 
 EOF
 }
@@ -154,6 +174,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         -d|--skip-deploy)
             SKIP_DEPLOY="true"
+            shift
+            ;;
+        -w|--webhook)
+            ENABLE_WEBHOOK="true"
+            shift
+            ;;
+        --no-webhook)
+            ENABLE_WEBHOOK="false"
             shift
             ;;
         -v|--verbose)
@@ -231,6 +259,7 @@ else
     log_info "  Test Environment: $TEST_ENVIRONMENT"
     log_info "  Operator Image: $QUAY_OPERATOR_IMG:$TAG"
     log_info "  Agent Image: $QUAY_AGENT_IMG:$TAG"
+    log_info "  Admission Webhooks: $(if [[ "$ENABLE_WEBHOOK" == "true" ]]; then echo "enabled (with certificates)"; else echo "disabled (faster testing)"; fi)"
     log_info "  Cleanup After Test: $CLEANUP_AFTER_TEST"
     log_info "  Build Images: $(if [[ "$SKIP_BUILD" == "true" ]]; then echo "false (using existing)"; else echo "true"; fi)"
     log_info "  Skip Deploy: $SKIP_DEPLOY"
@@ -382,8 +411,18 @@ cleanup_environment() {
     $KUBECTL delete clusterrolebinding -l app.kubernetes.io/managed-by=sbd-operator --ignore-not-found=true || true
     $KUBECTL delete clusterrole -l app.kubernetes.io/managed-by=sbd-operator --ignore-not-found=true || true
     
-    # Clean up webhook certificates secret
-    $KUBECTL delete secret webhook-server-certs -n sbd-operator-system --ignore-not-found=true || true
+    # Clean up webhook configuration and certificates (if webhooks were enabled)
+    if [[ "${ENABLE_WEBHOOK:-true}" == "true" || "$cleanup_reason" == "test environment" || "$cleanup_reason" == "test resources (cleanup-only mode)" ]]; then
+        log_info "Cleaning up webhook configurations and certificates"
+        $KUBECTL delete validatingwebhookconfiguration sbd-operator-validating-webhook-configuration --ignore-not-found=true || true
+        $KUBECTL delete validatingwebhookconfiguration validating-webhook-configuration --ignore-not-found=true || true
+        $KUBECTL delete validatingwebhookconfiguration sbd-operator-e2e-webhook-configuration --ignore-not-found=true || true
+        $KUBECTL delete validatingwebhookconfiguration e2e-webhook-configuration --ignore-not-found=true || true
+        $KUBECTL delete secret webhook-server-certs -n sbd-operator-system --ignore-not-found=true || true
+        $KUBECTL delete service sbd-operator-webhook-service -n sbd-operator-system --ignore-not-found=true || true
+    else
+        log_info "Skipping webhook cleanup (webhooks were disabled)"
+    fi
     
     $KUBECTL delete ns sbd-operator-system --ignore-not-found=true || true
     $KUBECTL delete ns $test_namespace --ignore-not-found=true || true
@@ -399,11 +438,15 @@ cleanup_environment() {
     # Clean up CRDs
     $KUBECTL kustomize config/crd | $KUBECTL delete --ignore-not-found=true -f - || true
     
-    # Clean up local webhook certificates if this is a complete cleanup
+    # Clean up local webhook certificates if this is a complete cleanup and webhooks were used
     if [[ "$cleanup_reason" == "test environment" || "$cleanup_reason" == "test resources (cleanup-only mode)" ]]; then
-        log_info "Cleaning up local webhook certificates"
-        rm -rf /tmp/k8s-webhook-server/serving-certs || true
-        rm -rf /tmp/letsencrypt || true
+        if [[ "${ENABLE_WEBHOOK:-true}" == "true" ]]; then
+            log_info "Cleaning up local webhook certificates"
+            rm -rf /tmp/k8s-webhook-server/serving-certs || true
+            rm -rf /tmp/letsencrypt || true
+        else
+            log_info "Skipping local webhook certificate cleanup (webhooks were disabled)"
+        fi
     fi
     
     # Clean up Kind cluster if requested (only for post-test cleanup)
@@ -503,20 +546,42 @@ build_installer() {
     ./../../bin/kustomize edit set image controller=$QUAY_OPERATOR_IMG:$TAG
     cd ../..
     
-    # Build installer based on environment and test type
+    # Build installer based on environment, test type, and webhook setting
     local kustomize_target=""
     if [[ "$TEST_ENVIRONMENT" == "crc" ]]; then
-        log_info "Building OpenShift installer with SecurityContextConstraints"
-        kustomize_target="test/smoke"
+        if [[ "$ENABLE_WEBHOOK" == "true" ]]; then
+            log_info "Building OpenShift installer with SecurityContextConstraints and webhooks"
+            kustomize_target="test/smoke"
+        else
+            log_info "Building OpenShift installer with SecurityContextConstraints but no webhooks"
+            kustomize_target="test/smoke/kustomization-no-webhook.yaml"
+        fi
     elif [[ "$TEST_ENVIRONMENT" == "kind" ]]; then
-        log_info "Building Kubernetes installer for Kind"
-        kustomize_target="config/default"
+        if [[ "$ENABLE_WEBHOOK" == "true" ]]; then
+            log_info "Building Kubernetes installer for Kind with webhooks"
+            kustomize_target="config/default"
+        else
+            log_info "Building Kubernetes installer for Kind without webhooks"
+            kustomize_target="config/default/kustomization-no-webhook.yaml"
+        fi
     else
         log_info "Building installer for existing cluster"
         if [[ "$TEST_TYPE" == "smoke" ]]; then
-            kustomize_target="test/smoke"
+            if [[ "$ENABLE_WEBHOOK" == "true" ]]; then
+                log_info "Building smoke test installer with webhooks"
+                kustomize_target="test/smoke"
+            else
+                log_info "Building smoke test installer without webhooks"
+                kustomize_target="test/smoke/kustomization-no-webhook.yaml"
+            fi
         else
-            kustomize_target="test/e2e"
+            if [[ "$ENABLE_WEBHOOK" == "true" ]]; then
+                log_info "Building e2e test installer with webhooks"
+                kustomize_target="test/e2e"
+            else
+                log_info "Building e2e test installer without webhooks"
+                kustomize_target="test/e2e/kustomization-no-webhook.yaml"
+            fi
         fi
     fi
     
@@ -527,6 +592,11 @@ build_installer() {
 
 # Function to generate webhook certificates for tests
 generate_webhook_certificates() {
+    if [[ "$ENABLE_WEBHOOK" != "true" ]]; then
+        log_info "Webhooks disabled: skipping certificate generation"
+        return 0
+    fi
+    
     log_info "Generating webhook certificates for tests"
     
     # For tests, we use self-signed certificates to avoid external dependencies
@@ -567,6 +637,11 @@ generate_webhook_certificates() {
 
 # Function to create webhook certificate secret in cluster
 create_webhook_secret() {
+    if [[ "$ENABLE_WEBHOOK" != "true" ]]; then
+        log_info "Webhooks disabled: skipping certificate secret creation"
+        return 0
+    fi
+    
     log_info "Creating webhook certificate secret in cluster"
     
     local cert_dir="/tmp/k8s-webhook-server/serving-certs"
@@ -617,6 +692,11 @@ create_webhook_secret() {
 
 # Function to update webhook configuration with CA bundle
 update_webhook_ca_bundle() {
+    if [[ "$ENABLE_WEBHOOK" != "true" ]]; then
+        log_info "Webhooks disabled: skipping CA bundle update"
+        return 0
+    fi
+    
     local cert_file="$1"
     log_info "Updating webhook configuration with CA bundle"
     
@@ -743,9 +823,14 @@ deploy_operator() {
             ;;
     esac
     
-    # Generate and create webhook certificates before deploying
-    generate_webhook_certificates
-    create_webhook_secret
+    # Generate and create webhook certificates before deploying (only if webhooks are enabled)
+    if [[ "$ENABLE_WEBHOOK" == "true" ]]; then
+        log_info "Webhooks enabled: generating certificates and creating secrets"
+        generate_webhook_certificates
+        create_webhook_secret
+    else
+        log_info "Webhooks disabled: skipping certificate generation"
+    fi
     
     $KUBECTL apply -f dist/install.yaml --server-side=true --force-conflicts=true
     

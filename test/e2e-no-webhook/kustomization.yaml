@@ -21,4 +21,9 @@ patches:
 - path: manager-serviceaccount-patch.yaml
   target:
     kind: Deployment
+    name: controller-manager
+# Disable webhooks via command line flag
+- path: manager-disable-webhooks-patch.yaml
+  target:
+    kind: Deployment
     name: controller-manager 

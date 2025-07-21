@@ -52,4 +52,7 @@ patchesStrategicMerge:
 # - ../default/manager_webhook_patch.yaml
 
 # [CERTMANAGER] To enable cert-manager, uncomment the following line
-# - ../default/webhookcainjection_patch.yaml 
+# - ../default/webhookcainjection_patch.yaml
+
+# Disable webhooks via command line flag
+- manager-disable-webhooks-patch.yaml 

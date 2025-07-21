@@ -13,4 +13,9 @@ patches:
   target:
     kind: Deployment
     name: controller-manager
-# NOTE: Deliberately NOT including webhook-patch.yaml 
+# NOTE: Deliberately NOT including webhook-patch.yaml
+# Disable webhooks via command line flag
+- path: manager-disable-webhooks-patch.yaml
+  target:
+    kind: Deployment
+    name: controller-manager 

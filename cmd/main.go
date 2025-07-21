@@ -64,6 +64,7 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+	var enableWebhooks bool
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -85,6 +86,8 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.BoolVar(&enableWebhooks, "enable-webhooks", true,
+		"If set, admission webhooks will be enabled. Set to false to disable webhooks for testing.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -263,11 +266,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Set up admission webhooks
-	sbdConfigValidator := &medik8sv1alpha1.SBDConfigValidator{}
-	if err := sbdConfigValidator.SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create webhook", "webhook", "SBDConfig")
-		os.Exit(1)
+	// Set up admission webhooks (conditionally)
+	if enableWebhooks {
+		setupLog.Info("Admission webhooks enabled - registering webhook validators")
+		sbdConfigValidator := &medik8sv1alpha1.SBDConfigValidator{}
+		if err := sbdConfigValidator.SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "SBDConfig")
+			os.Exit(1)
+		}
+	} else {
+		setupLog.Info("Admission webhooks disabled - skipping webhook registration")
 	}
 	// +kubebuilder:scaffold:builder
 

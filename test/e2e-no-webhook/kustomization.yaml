@@ -6,19 +6,19 @@ namespace: sbd-operator-system
 
 resources:
 # Include individual components but exclude webhook-related resources
-- ../config/crd
-- ../test/e2e/rbac.yaml
-- ../config/manager
+- ../../config/crd
+- rbac.yaml
+- ../../config/manager
 # NOTE: Deliberately NOT including webhook-service.yaml and webhook-config.yaml
 
 patches:
-- path: ../test/e2e/image-pull-policy-patch.yaml
+- path: image-pull-policy-patch.yaml
   target:
     kind: Deployment
     name: controller-manager
 # NOTE: Deliberately NOT including webhook-patch.yaml
 # Update manager deployment to use correct prefixed service account name
-- path: ../test/e2e/manager-serviceaccount-patch.yaml
+- path: manager-serviceaccount-patch.yaml
   target:
     kind: Deployment
     name: controller-manager 

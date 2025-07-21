@@ -5,11 +5,11 @@ kind: Kustomization
 namespace: sbd-operator-system
 
 resources:
-- ../config/openshift-default
+- ../../config/openshift-default
 # NOTE: Deliberately NOT including ../../config/webhook
 
 patches:
-- path: ../test/smoke/image-pull-policy-patch.yaml
+- path: image-pull-policy-patch.yaml
   target:
     kind: Deployment
     name: controller-manager

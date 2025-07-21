@@ -64,9 +64,19 @@ commit_with_context() {
         exit 1
     fi
     
+    # Write the commit message to a temp file
+    TEMP_MSG=$(mktemp)
+    echo "$*" > "$TEMP_MSG"
+    
     git add -A
-    git commit -m "$*"
-    echo "✓ Committed with context (context will be auto-cleared by Git hook)"
+    
+    # Use git commit with -F to read from file, which will trigger prepare-commit-msg hook
+    git commit -F "$TEMP_MSG"
+    
+    # Clean up temp file
+    rm "$TEMP_MSG"
+    
+    echo "✓ Committed with context (context auto-appended by Git hook)"
 }
 
 case "$1" in

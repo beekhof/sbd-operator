@@ -31,8 +31,8 @@ const (
 	// SBD_MAGIC is the magic string used to identify valid SBD messages
 	SBD_MAGIC = "SBDMSG01"
 
-	// SBD_HEADER_SIZE is the size in bytes of the SBD message header
-	SBD_HEADER_SIZE = 33 // 8 + 2 + 1 + 2 + 8 + 8 + 4 = 33 bytes
+	// SBD_HEADER_MIN_SIZE is the minimum size in bytes of the SBD message header (with empty node name)
+	SBD_HEADER_MIN_SIZE = 34 // 8 + 2 + 1 + 2 + 1 + 8 + 8 + 4 = 34 bytes (includes 1 byte for node name length)
 
 	// SBD_SLOT_SIZE is the size in bytes of a single SBD slot on the device
 	SBD_SLOT_SIZE = 512
@@ -78,6 +78,9 @@ type SBDMessageHeader struct {
 	// NodeID is the unique identifier of the sending node
 	NodeID uint16
 
+	// NodeName is the human-readable name of the sending node
+	NodeName string
+
 	// Timestamp contains the Unix timestamp (nanoseconds) when the message was created
 	Timestamp uint64
 
@@ -109,11 +112,12 @@ type SBDFenceMessage struct {
 //
 // Parameters:
 //   - nodeID: Unique identifier of the sending node
+//   - nodeName: Human-readable name of the sending node
 //   - sequence: Incremental sequence number for message ordering
 //
 // Returns:
 //   - SBDMessageHeader: Initialized heartbeat message header
-func NewHeartbeat(nodeID uint16, sequence uint64) SBDMessageHeader {
+func NewHeartbeat(nodeID uint16, nodeName string, sequence uint64) SBDMessageHeader {
 	var magic [8]byte
 	copy(magic[:], SBD_MAGIC)
 
@@ -122,6 +126,7 @@ func NewHeartbeat(nodeID uint16, sequence uint64) SBDMessageHeader {
 		Version:   1,
 		Type:      SBD_MSG_TYPE_HEARTBEAT,
 		NodeID:    nodeID,
+		NodeName:  nodeName,
 		Timestamp: uint64(time.Now().UnixNano()),
 		Sequence:  sequence,
 		Checksum:  0, // Will be calculated during marshaling
@@ -133,13 +138,14 @@ func NewHeartbeat(nodeID uint16, sequence uint64) SBDMessageHeader {
 //
 // Parameters:
 //   - nodeID: Unique identifier of the sending node
+//   - nodeName: Human-readable name of the sending node
 //   - targetNodeID: Unique identifier of the node to be fenced
 //   - sequence: Incremental sequence number for message ordering
 //   - reason: Reason code for the fencing request
 //
 // Returns:
 //   - SBDMessageHeader: Initialized fence message header
-func NewFence(nodeID, targetNodeID uint16, sequence uint64, reason uint8) SBDMessageHeader {
+func NewFence(nodeID uint16, nodeName string, targetNodeID uint16, sequence uint64, reason uint8) SBDMessageHeader {
 	var magic [8]byte
 	copy(magic[:], SBD_MAGIC)
 
@@ -148,6 +154,7 @@ func NewFence(nodeID, targetNodeID uint16, sequence uint64, reason uint8) SBDMes
 		Version:   1,
 		Type:      SBD_MSG_TYPE_FENCE,
 		NodeID:    nodeID,
+		NodeName:  nodeName,
 		Timestamp: uint64(time.Now().UnixNano()),
 		Sequence:  sequence,
 		Checksum:  0, // Will be calculated during marshaling
@@ -158,7 +165,7 @@ func NewFence(nodeID, targetNodeID uint16, sequence uint64, reason uint8) SBDMes
 // It calculates and includes the CRC32 checksum of the message for validation.
 //
 // The marshaled format uses little-endian byte order for consistency across
-// different architectures.
+// different architectures. NodeName is stored as length-prefixed string.
 //
 // Parameters:
 //   - msg: The SBD message header to serialize
@@ -182,6 +189,19 @@ func Marshal(msg SBDMessageHeader) ([]byte, error) {
 	if err := binary.Write(buf, binary.LittleEndian, msg.NodeID); err != nil {
 		return nil, fmt.Errorf("failed to write node ID: %w", err)
 	}
+
+	// Write NodeName as length-prefixed string
+	nodeNameBytes := []byte(msg.NodeName)
+	if len(nodeNameBytes) > 255 {
+		return nil, fmt.Errorf("node name too long: %d bytes, maximum 255", len(nodeNameBytes))
+	}
+	if err := binary.Write(buf, binary.LittleEndian, uint8(len(nodeNameBytes))); err != nil {
+		return nil, fmt.Errorf("failed to write node name length: %w", err)
+	}
+	if _, err := buf.Write(nodeNameBytes); err != nil {
+		return nil, fmt.Errorf("failed to write node name: %w", err)
+	}
+
 	if err := binary.Write(buf, binary.LittleEndian, msg.Timestamp); err != nil {
 		return nil, fmt.Errorf("failed to write timestamp: %w", err)
 	}
@@ -211,8 +231,9 @@ func Marshal(msg SBDMessageHeader) ([]byte, error) {
 //   - *SBDMessageHeader: Pointer to the deserialized message header
 //   - error: Error if unmarshaling fails or validation fails
 func Unmarshal(data []byte) (*SBDMessageHeader, error) {
-	if len(data) < SBD_HEADER_SIZE {
-		return nil, fmt.Errorf("data too short: expected at least %d bytes, got %d", SBD_HEADER_SIZE, len(data))
+	minSize := 8 + 2 + 1 + 2 + 1 + 8 + 8 + 4 // magic + version + type + nodeID + nodeNameLen + timestamp + sequence + checksum
+	if len(data) < minSize {
+		return nil, fmt.Errorf("data too short: expected at least %d bytes, got %d", minSize, len(data))
 	}
 
 	buf := bytes.NewReader(data)
@@ -231,6 +252,18 @@ func Unmarshal(data []byte) (*SBDMessageHeader, error) {
 	if err := binary.Read(buf, binary.LittleEndian, &msg.NodeID); err != nil {
 		return nil, fmt.Errorf("failed to read node ID: %w", err)
 	}
+
+	// Read NodeName as length-prefixed string
+	var nodeNameLength uint8
+	if err := binary.Read(buf, binary.LittleEndian, &nodeNameLength); err != nil {
+		return nil, fmt.Errorf("failed to read node name length: %w", err)
+	}
+	nodeNameBytes := make([]byte, nodeNameLength)
+	if _, err := buf.Read(nodeNameBytes); err != nil {
+		return nil, fmt.Errorf("failed to read node name: %w", err)
+	}
+	msg.NodeName = string(nodeNameBytes)
+
 	if err := binary.Read(buf, binary.LittleEndian, &msg.Timestamp); err != nil {
 		return nil, fmt.Errorf("failed to read timestamp: %w", err)
 	}
@@ -333,12 +366,14 @@ func UnmarshalHeartbeat(data []byte) (*SBDHeartbeatMessage, error) {
 //   - *SBDFenceMessage: Pointer to the deserialized fence message
 //   - error: Error if unmarshaling fails
 func UnmarshalFence(data []byte) (*SBDFenceMessage, error) {
-	if len(data) < SBD_HEADER_SIZE+3 { // Header + TargetNodeID (2) + Reason (1)
-		return nil, fmt.Errorf("data too short for fence message: expected at least %d bytes, got %d", SBD_HEADER_SIZE+3, len(data))
+	minSize := SBD_HEADER_MIN_SIZE + 3 // Header + TargetNodeID (2) + Reason (1)
+	if len(data) < minSize {
+		return nil, fmt.Errorf("data too short for fence message: expected at least %d bytes, got %d", minSize, len(data))
 	}
 
-	// First unmarshal the header
-	header, err := Unmarshal(data[:SBD_HEADER_SIZE])
+	// First unmarshal the header - we need to find where it ends
+	// by parsing it to determine the variable header length
+	header, err := Unmarshal(data)
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal header: %w", err)
 	}
@@ -347,8 +382,19 @@ func UnmarshalFence(data []byte) (*SBDFenceMessage, error) {
 		return nil, fmt.Errorf("invalid message type for fence: expected %d, got %d", SBD_MSG_TYPE_FENCE, header.Type)
 	}
 
-	// Read fence-specific fields
-	buf := bytes.NewReader(data[SBD_HEADER_SIZE:])
+	// Calculate the actual header size by marshaling it
+	headerData, err := Marshal(*header)
+	if err != nil {
+		return nil, fmt.Errorf("failed to determine header size: %w", err)
+	}
+	headerSize := len(headerData) - 4 // Exclude checksum from header size
+
+	// Read fence-specific fields from after the header
+	if len(data) < headerSize+3 {
+		return nil, fmt.Errorf("data too short for fence fields: expected at least %d bytes, got %d", headerSize+3, len(data))
+	}
+
+	buf := bytes.NewReader(data[headerSize:])
 	msg := &SBDFenceMessage{Header: *header}
 
 	if err := binary.Read(buf, binary.LittleEndian, &msg.TargetNodeID); err != nil {

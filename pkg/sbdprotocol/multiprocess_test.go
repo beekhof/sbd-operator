@@ -516,7 +516,7 @@ func runNodeProcess(config MultiProcessTestConfig) (*MultiProcessTestResult, err
 
 // writeTestHeartbeat writes a test heartbeat to the specified slot
 func writeTestHeartbeat(device SBDDevice, nodeID uint16, sequence uint64) error {
-	header := NewHeartbeat(nodeID, sequence)
+	header := NewHeartbeat(nodeID, fmt.Sprintf("node-%d", nodeID), sequence)
 	msg := SBDHeartbeatMessage{Header: header}
 
 	msgBytes, err := MarshalHeartbeat(msg)
@@ -547,7 +547,7 @@ func readTestHeartbeat(device SBDDevice, nodeID uint16) bool {
 		return false
 	}
 
-	header, err := Unmarshal(slotData[:SBD_HEADER_SIZE])
+	header, err := Unmarshal(slotData)
 	if err != nil {
 		return false
 	}
@@ -651,7 +651,7 @@ func validateMessageProtocol(t *testing.T, results []*MultiProcessTestResult, de
 			continue
 		}
 
-		header, err := Unmarshal(slotData[:SBD_HEADER_SIZE])
+		header, err := Unmarshal(slotData)
 		if err != nil {
 			t.Errorf("Failed to unmarshal header from slot %d: %v", result.NodeID, err)
 			continue

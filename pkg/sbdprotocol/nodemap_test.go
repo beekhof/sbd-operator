@@ -584,7 +584,7 @@ func TestBinaryProtocolEndianness(t *testing.T) {
 	sequence := uint64(12345)
 
 	// Create heartbeat message
-	msg := NewHeartbeat(nodeID, sequence)
+	msg := NewHeartbeat(nodeID, "test-node", sequence)
 
 	// Marshal the message
 	data, err := Marshal(msg)

@@ -222,7 +222,7 @@ func runSingleConcurrentNode(t *testing.T, devicePath, nodeName string, fileLock
 
 // writeTestHeartbeatMessage writes a properly formatted heartbeat message
 func writeTestHeartbeatMessage(device SBDDevice, nodeID uint16, sequence uint64) error {
-	header := NewHeartbeat(nodeID, sequence)
+	header := NewHeartbeat(nodeID, fmt.Sprintf("node-%d", nodeID), sequence)
 	msg := SBDHeartbeatMessage{Header: header}
 
 	msgBytes, err := MarshalHeartbeat(msg)
@@ -253,7 +253,7 @@ func readTestHeartbeatMessage(device SBDDevice, nodeID uint16) bool {
 		return false
 	}
 
-	header, err := Unmarshal(slotData[:SBD_HEADER_SIZE])
+	header, err := Unmarshal(slotData)
 	if err != nil {
 		return false
 	}

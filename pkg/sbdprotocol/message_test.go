@@ -29,8 +29,8 @@ func TestConstants(t *testing.T) {
 		t.Errorf("Expected SBD_MAGIC to be 'SBDMSG01', got %q", SBD_MAGIC)
 	}
 
-	if SBD_HEADER_SIZE != 33 {
-		t.Errorf("Expected SBD_HEADER_SIZE to be 33, got %d", SBD_HEADER_SIZE)
+	if SBD_HEADER_MIN_SIZE != 34 {
+		t.Errorf("Expected SBD_HEADER_MIN_SIZE to be 34, got %d", SBD_HEADER_MIN_SIZE)
 	}
 
 	if SBD_SLOT_SIZE != 512 {
@@ -52,10 +52,11 @@ func TestConstants(t *testing.T) {
 
 func TestNewHeartbeat(t *testing.T) {
 	nodeID := uint16(42)
+	nodeName := "test-node"
 	sequence := uint64(123)
 
 	before := time.Now().UnixNano()
-	msg := NewHeartbeat(nodeID, sequence)
+	msg := NewHeartbeat(nodeID, nodeName, sequence)
 	after := time.Now().UnixNano()
 
 	// Check magic string
@@ -99,7 +100,7 @@ func TestNewFence(t *testing.T) {
 	reason := uint8(FENCE_REASON_HEARTBEAT_TIMEOUT)
 
 	before := time.Now().UnixNano()
-	msg := NewFence(nodeID, targetNodeID, sequence, reason)
+	msg := NewFence(nodeID, "test-node", targetNodeID, sequence, reason)
 	after := time.Now().UnixNano()
 
 	// Check magic string
@@ -176,11 +177,11 @@ func TestMarshalUnmarshal(t *testing.T) {
 	}{
 		{
 			name:     "heartbeat message",
-			original: NewHeartbeat(1, 100),
+			original: NewHeartbeat(1, "node1", 100),
 		},
 		{
 			name:     "fence message",
-			original: NewFence(2, 3, 200, FENCE_REASON_MANUAL),
+			original: NewFence(2, "node2", 3, 200, FENCE_REASON_MANUAL),
 		},
 		{
 			name: "message with max values",
@@ -205,8 +206,8 @@ func TestMarshalUnmarshal(t *testing.T) {
 			}
 
 			// Check that data has expected size
-			if len(data) != SBD_HEADER_SIZE {
-				t.Errorf("Expected marshaled data size %d, got %d", SBD_HEADER_SIZE, len(data))
+			if len(data) < SBD_HEADER_MIN_SIZE {
+				t.Errorf("Expected marshaled data size at least %d, got %d", SBD_HEADER_MIN_SIZE, len(data))
 			}
 
 			// Unmarshal the data
@@ -255,7 +256,7 @@ func TestUnmarshalErrors(t *testing.T) {
 		},
 		{
 			name:          "invalid magic",
-			data:          bytes.Repeat([]byte{0}, SBD_HEADER_SIZE),
+			data:          bytes.Repeat([]byte{0}, SBD_HEADER_MIN_SIZE),
 			expectedError: "invalid magic string",
 		},
 	}
@@ -277,7 +278,7 @@ func TestUnmarshalErrors(t *testing.T) {
 
 func TestChecksumValidation(t *testing.T) {
 	// Create a valid message
-	msg := NewHeartbeat(1, 100)
+	msg := NewHeartbeat(1, "test-node", 100)
 	data, err := Marshal(msg)
 	if err != nil {
 		t.Fatalf("Marshal failed: %v", err)
@@ -300,7 +301,7 @@ func TestChecksumValidation(t *testing.T) {
 
 func TestMarshalHeartbeat(t *testing.T) {
 	heartbeat := SBDHeartbeatMessage{
-		Header: NewHeartbeat(1, 100),
+		Header: NewHeartbeat(1, "test-node", 100),
 	}
 
 	data, err := MarshalHeartbeat(heartbeat)
@@ -308,8 +309,8 @@ func TestMarshalHeartbeat(t *testing.T) {
 		t.Fatalf("MarshalHeartbeat failed: %v", err)
 	}
 
-	if len(data) != SBD_HEADER_SIZE {
-		t.Errorf("Expected data size %d, got %d", SBD_HEADER_SIZE, len(data))
+	if len(data) != SBD_HEADER_MIN_SIZE {
+		t.Errorf("Expected data size %d, got %d", SBD_HEADER_MIN_SIZE, len(data))
 	}
 
 	// Verify we can unmarshal it as a heartbeat
@@ -325,7 +326,7 @@ func TestMarshalHeartbeat(t *testing.T) {
 
 func TestMarshalFence(t *testing.T) {
 	fence := SBDFenceMessage{
-		Header:       NewFence(1, 2, 100, FENCE_REASON_MANUAL),
+		Header:       NewFence(1, "node1", 2, 100, FENCE_REASON_MANUAL),
 		TargetNodeID: 2,
 		Reason:       FENCE_REASON_MANUAL,
 	}
@@ -335,7 +336,7 @@ func TestMarshalFence(t *testing.T) {
 		t.Fatalf("MarshalFence failed: %v", err)
 	}
 
-	expectedSize := SBD_HEADER_SIZE + 3 // Header + TargetNodeID (2) + Reason (1)
+	expectedSize := SBD_HEADER_MIN_SIZE + 3 // Header + TargetNodeID (2) + Reason (1)
 	if len(data) != expectedSize {
 		t.Errorf("Expected data size %d, got %d", expectedSize, len(data))
 	}
@@ -361,7 +362,7 @@ func TestMarshalFence(t *testing.T) {
 
 func TestUnmarshalHeartbeatErrors(t *testing.T) {
 	// Create a fence message and try to unmarshal as heartbeat
-	fence := NewFence(1, 2, 100, FENCE_REASON_MANUAL)
+	fence := NewFence(1, "node1", 2, 100, FENCE_REASON_MANUAL)
 	data, err := Marshal(fence)
 	if err != nil {
 		t.Fatalf("Marshal failed: %v", err)
@@ -394,7 +395,7 @@ func TestUnmarshalFenceErrors(t *testing.T) {
 			setup: func() []byte {
 				// Create a fence message with correct length, then change the type to heartbeat
 				fence := SBDFenceMessage{
-					Header:       NewFence(1, 2, 100, FENCE_REASON_MANUAL),
+					Header:       NewFence(1, "node1", 2, 100, FENCE_REASON_MANUAL),
 					TargetNodeID: 2,
 					Reason:       FENCE_REASON_MANUAL,
 				}
@@ -511,7 +512,7 @@ func TestGetFenceReasonName(t *testing.T) {
 
 func TestRoundTripConsistency(t *testing.T) {
 	// Test that marshaling and unmarshaling is consistent
-	original := NewHeartbeat(42, 12345)
+	original := NewHeartbeat(42, "test-node", 12345)
 	original.Timestamp = 1640995200000000000 // Fixed timestamp for consistency
 
 	// First round trip
@@ -584,7 +585,7 @@ func TestBinaryCompatibility(t *testing.T) {
 }
 
 func BenchmarkMarshal(b *testing.B) {
-	msg := NewHeartbeat(1, 100)
+	msg := NewHeartbeat(1, "test-node", 100)
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
@@ -596,7 +597,7 @@ func BenchmarkMarshal(b *testing.B) {
 }
 
 func BenchmarkUnmarshal(b *testing.B) {
-	msg := NewHeartbeat(1, 100)
+	msg := NewHeartbeat(1, "test-node", 100)
 	data, err := Marshal(msg)
 	if err != nil {
 		b.Fatalf("Setup marshal failed: %v", err)
@@ -624,7 +625,7 @@ func BenchmarkHeartbeatRoundTrip(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		msg := NewHeartbeat(1, uint64(i))
+		msg := NewHeartbeat(1, "test-node", uint64(i))
 		data, err := Marshal(msg)
 		if err != nil {
 			b.Fatalf("Marshal failed: %v", err)
@@ -641,7 +642,7 @@ func TestSBDMarshalUnmarshalRoundtrip(t *testing.T) {
 	// Test heartbeat message roundtrip
 	t.Run("HeartbeatMessage", func(t *testing.T) {
 		originalMsg := SBDHeartbeatMessage{
-			Header: NewHeartbeat(42, 123),
+			Header: NewHeartbeat(42, "test-node", 123),
 		}
 
 		// Marshal
@@ -668,7 +669,7 @@ func TestSBDMarshalUnmarshalRoundtrip(t *testing.T) {
 	// Test fence message roundtrip
 	t.Run("FenceMessage", func(t *testing.T) {
 		originalMsg := SBDFenceMessage{
-			Header:       NewFence(1, 42, 456, FENCE_REASON_HEARTBEAT_TIMEOUT),
+			Header:       NewFence(1, "node1", 42, 456, FENCE_REASON_HEARTBEAT_TIMEOUT),
 			TargetNodeID: 42,
 			Reason:       FENCE_REASON_HEARTBEAT_TIMEOUT,
 		}
@@ -795,7 +796,7 @@ func TestSBDGetFenceReasonName(t *testing.T) {
 
 func TestSBDChecksumValidation(t *testing.T) {
 	// Create a test message
-	msg := NewHeartbeat(1, 100)
+	msg := NewHeartbeat(1, "test-node", 100)
 	data, err := Marshal(msg)
 	if err != nil {
 		t.Fatalf("Marshal failed: %v", err)

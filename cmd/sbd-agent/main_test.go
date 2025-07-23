@@ -161,7 +161,7 @@ func (m *MockBlockDevice) GetData() []byte {
 // WritePeerHeartbeat writes a heartbeat message to a specific peer slot for testing
 func (m *MockBlockDevice) WritePeerHeartbeat(nodeID uint16, timestamp uint64, sequence uint64) error {
 	// Create heartbeat message
-	header := sbdprotocol.NewHeartbeat(nodeID, sequence)
+	header := sbdprotocol.NewHeartbeat(nodeID, fmt.Sprintf("test-node-%d", nodeID), sequence)
 	header.Timestamp = timestamp
 	heartbeatMsg := sbdprotocol.SBDHeartbeatMessage{Header: header}
 
@@ -182,7 +182,7 @@ func (m *MockBlockDevice) WritePeerHeartbeat(nodeID uint16, timestamp uint64, se
 // WriteFenceMessage writes a fence message to a specific slot for testing
 func (m *MockBlockDevice) WriteFenceMessage(nodeID, targetNodeID uint16, sequence uint64, reason uint8) error {
 	// Create fence message header
-	header := sbdprotocol.NewFence(nodeID, targetNodeID, sequence, reason)
+	header := sbdprotocol.NewFence(nodeID, fmt.Sprintf("test-node-%d", nodeID), targetNodeID, sequence, reason)
 	fenceMsg := sbdprotocol.SBDFenceMessage{
 		Header:       header,
 		TargetNodeID: targetNodeID,
@@ -277,7 +277,7 @@ func TestPeerMonitor(t *testing.T) {
 	}
 
 	// Update a peer
-	monitor.UpdatePeer(2, 1000, 1)
+	monitor.UpdatePeer(2, "test-peer-2", 2000, 2)
 
 	// Should have one healthy peer
 	if count := monitor.GetHealthyPeerCount(); count != 1 {
@@ -299,12 +299,12 @@ func TestPeerMonitor(t *testing.T) {
 		t.Errorf("Expected peer NodeID 2, got %d", peer.NodeID)
 	}
 
-	if peer.LastTimestamp != 1000 {
-		t.Errorf("Expected peer timestamp 1000, got %d", peer.LastTimestamp)
+	if peer.LastTimestamp != 2000 {
+		t.Errorf("Expected peer timestamp 2000, got %d", peer.LastTimestamp)
 	}
 
-	if peer.LastSequence != 1 {
-		t.Errorf("Expected peer sequence 1, got %d", peer.LastSequence)
+	if peer.LastSequence != 2 {
+		t.Errorf("Expected peer sequence 2, got %d", peer.LastSequence)
 	}
 
 	if !peer.IsHealthy {
@@ -317,7 +317,7 @@ func TestPeerMonitor_Liveness(t *testing.T) {
 	monitor := NewPeerMonitor(1, 1, logger) // 1 second timeout
 
 	// Update a peer
-	monitor.UpdatePeer(2, 1000, 1)
+	monitor.UpdatePeer(2, "test-peer-2", 1000, 5)
 
 	// Should be healthy initially
 	if count := monitor.GetHealthyPeerCount(); count != 1 {
@@ -336,7 +336,7 @@ func TestPeerMonitor_Liveness(t *testing.T) {
 	}
 
 	// Update peer again
-	monitor.UpdatePeer(2, 2000, 2)
+	monitor.UpdatePeer(2, "test-peer-2", 2000, 2)
 
 	// Should be healthy again
 	if count := monitor.GetHealthyPeerCount(); count != 1 {
@@ -349,7 +349,7 @@ func TestPeerMonitor_SequenceValidation(t *testing.T) {
 	monitor := NewPeerMonitor(30, 1, logger)
 
 	// Update a peer with sequence 5
-	monitor.UpdatePeer(2, 1000, 5)
+	monitor.UpdatePeer(2, "test-peer-2", 1000, 5)
 
 	peers := monitor.GetPeerStatus()
 	peer := peers[2]
@@ -358,7 +358,7 @@ func TestPeerMonitor_SequenceValidation(t *testing.T) {
 	}
 
 	// Update with older sequence (should be ignored)
-	monitor.UpdatePeer(2, 1000, 3)
+	monitor.UpdatePeer(2, "test-peer-2", 1000, 3)
 
 	peers = monitor.GetPeerStatus()
 	peer = peers[2]
@@ -367,7 +367,7 @@ func TestPeerMonitor_SequenceValidation(t *testing.T) {
 	}
 
 	// Update with newer sequence (should be accepted)
-	monitor.UpdatePeer(2, 1000, 7)
+	monitor.UpdatePeer(2, "test-peer-2", 1000, 7)
 
 	peers = monitor.GetPeerStatus()
 	peer = peers[2]
@@ -547,7 +547,7 @@ func TestSBDAgent_ReadPeerHeartbeat_NodeIDMismatch(t *testing.T) {
 	sequence := uint64(100)
 
 	// Create heartbeat with wrong node ID
-	header := sbdprotocol.NewHeartbeat(5, sequence) // Node 5's message
+	header := sbdprotocol.NewHeartbeat(5, "test-node-5", sequence) // Node 5's message
 	header.Timestamp = timestamp
 	heartbeatMsg := sbdprotocol.SBDHeartbeatMessage{Header: header}
 	msgBytes, err := sbdprotocol.MarshalHeartbeat(heartbeatMsg)
@@ -719,7 +719,7 @@ func TestSBDAgent_WriteHeartbeatToSBD(t *testing.T) {
 	}
 
 	// Unmarshal and verify the message
-	header, err := sbdprotocol.Unmarshal(slotData[:sbdprotocol.SBD_HEADER_SIZE])
+	header, err := sbdprotocol.Unmarshal(slotData)
 	if err != nil {
 		t.Fatalf("Failed to unmarshal heartbeat header: %v", err)
 	}
@@ -991,7 +991,7 @@ func BenchmarkPeerMonitor_UpdatePeer(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		monitor.UpdatePeer(2, uint64(i), uint64(i))
+		monitor.UpdatePeer(2, "test-peer-2", uint64(i), uint64(i))
 	}
 }
 

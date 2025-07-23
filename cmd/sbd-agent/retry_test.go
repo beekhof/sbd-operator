@@ -318,13 +318,13 @@ func TestSBDAgent_HeartbeatRetryMechanism(t *testing.T) {
 
 	// Verify heartbeat was written
 	slotOffset := int64(1) * sbdprotocol.SBD_SLOT_SIZE
-	slotData := make([]byte, sbdprotocol.SBD_HEADER_SIZE)
+	slotData := make([]byte, sbdprotocol.SBD_SLOT_SIZE)
 	n, err := mockDevice.ReadAt(slotData, slotOffset)
 	if err != nil {
 		t.Fatalf("Failed to read heartbeat: %v", err)
 	}
-	if n != sbdprotocol.SBD_HEADER_SIZE {
-		t.Fatalf("Expected to read %d bytes, got %d", sbdprotocol.SBD_HEADER_SIZE, n)
+	if n != sbdprotocol.SBD_SLOT_SIZE {
+		t.Fatalf("Expected to read %d bytes, got %d", sbdprotocol.SBD_SLOT_SIZE, n)
 	}
 
 	// Unmarshal and verify

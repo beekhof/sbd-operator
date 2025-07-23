@@ -252,7 +252,7 @@ func NewPeerMonitor(sbdTimeoutSeconds uint, ownNodeID uint16, logger logr.Logger
 }
 
 // UpdatePeer updates the status of a peer node
-func (pm *PeerMonitor) UpdatePeer(nodeID uint16, timestamp, sequence uint64) {
+func (pm *PeerMonitor) UpdatePeer(nodeID uint16, nodeName string, timestamp, sequence uint64) {
 	pm.peersMutex.Lock()
 	defer pm.peersMutex.Unlock()
 
@@ -268,6 +268,7 @@ func (pm *PeerMonitor) UpdatePeer(nodeID uint16, timestamp, sequence uint64) {
 		pm.peers[nodeID] = peer
 		pm.logger.Info("Discovered new peer node",
 			"nodeID", nodeID,
+			"nodeName", nodeName,
 			"timestamp", timestamp,
 			"sequence", sequence)
 	}
@@ -928,7 +929,7 @@ func (s *SBDAgent) writeHeartbeatToSBDInternal() error {
 
 	// Create heartbeat message
 	sequence := s.getNextHeartbeatSequence()
-	heartbeatHeader := sbdprotocol.NewHeartbeat(s.nodeID, sequence)
+	heartbeatHeader := sbdprotocol.NewHeartbeat(s.nodeID, s.nodeName, sequence)
 	heartbeatMsg := sbdprotocol.SBDHeartbeatMessage{Header: heartbeatHeader}
 
 	// Marshal the message
@@ -985,7 +986,7 @@ func (s *SBDAgent) readPeerHeartbeat(peerNodeID uint16) error {
 	}
 
 	// Try to unmarshal the message header
-	header, err := sbdprotocol.Unmarshal(slotData[:sbdprotocol.SBD_HEADER_SIZE])
+	header, err := sbdprotocol.Unmarshal(slotData)
 	if err != nil {
 		// Don't log as error since empty slots are expected
 		logger.V(1).Info("Failed to unmarshal peer heartbeat",
@@ -1018,7 +1019,7 @@ func (s *SBDAgent) readPeerHeartbeat(peerNodeID uint16) error {
 	}
 
 	// Update peer status
-	s.peerMonitor.UpdatePeer(peerNodeID, header.Timestamp, header.Sequence)
+	s.peerMonitor.UpdatePeer(peerNodeID, header.NodeName, header.Timestamp, header.Sequence)
 	return nil
 }
 
@@ -1560,7 +1561,7 @@ func (s *SBDAgent) readOwnSlotForFenceMessage() error {
 	}
 
 	// Try to unmarshal the message header
-	header, err := sbdprotocol.Unmarshal(slotData[:sbdprotocol.SBD_HEADER_SIZE])
+	header, err := sbdprotocol.Unmarshal(slotData)
 	if err != nil {
 		// Not a valid message, could be empty slot or heartbeat we wrote
 		logger.V(1).Info("Failed to unmarshal message from own slot",
@@ -1572,7 +1573,7 @@ func (s *SBDAgent) readOwnSlotForFenceMessage() error {
 	// Check if this is a fence message
 	if header.Type == sbdprotocol.SBD_MSG_TYPE_FENCE {
 		// Try to unmarshal as a fence message to get the target
-		fenceMsg, err := sbdprotocol.UnmarshalFence(slotData[:sbdprotocol.SBD_HEADER_SIZE+3])
+		fenceMsg, err := sbdprotocol.UnmarshalFence(slotData)
 		if err != nil {
 			logger.Error(err, "Failed to unmarshal fence message from own slot",
 				"nodeID", s.nodeID)
@@ -1722,7 +1723,7 @@ func performSBDReadWriteTest(device BlockDevice, nodeID uint16, nodeName string)
 
 	// Create a test heartbeat message
 	sequence := uint64(1) // Use sequence 1 for pre-flight test
-	testHeader := sbdprotocol.NewHeartbeat(nodeID, sequence)
+	testHeader := sbdprotocol.NewHeartbeat(nodeID, nodeName, sequence)
 	testMsg := sbdprotocol.SBDHeartbeatMessage{Header: testHeader}
 
 	// Marshal the test message
@@ -1765,7 +1766,7 @@ func performSBDReadWriteTest(device BlockDevice, nodeID uint16, nodeName string)
 	}
 
 	// Try to unmarshal the read data to ensure it's valid
-	readHeader, err := sbdprotocol.Unmarshal(readBuffer[:sbdprotocol.SBD_HEADER_SIZE])
+	readHeader, err := sbdprotocol.Unmarshal(readBuffer)
 	if err != nil {
 		return fmt.Errorf("failed to unmarshal test message read from SBD device: %w", err)
 	}
@@ -2144,7 +2145,7 @@ func (s *SBDAgent) writeFenceMessage(targetNodeID uint16, reason v1alpha1.SBDRem
 	}
 
 	fenceMsg := sbdprotocol.SBDFenceMessage{
-		Header:       sbdprotocol.NewFence(s.nodeID, targetNodeID, s.getNextHeartbeatSequence(), fenceReason),
+		Header:       sbdprotocol.NewFence(s.nodeID, s.nodeName, targetNodeID, s.getNextHeartbeatSequence(), fenceReason),
 		TargetNodeID: targetNodeID,
 		Reason:       fenceReason,
 	}

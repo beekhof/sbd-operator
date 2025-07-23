@@ -1542,6 +1542,18 @@ func (s *SBDAgent) executeSelfFencing(reason string) {
 
 // readOwnSlotForFenceMessage reads the agent's own slot to check for fence messages
 func (s *SBDAgent) readOwnSlotForFenceMessage() error {
+	if s.nodeManager != nil {
+		// Use NodeManager's file locking for coordination to prevent race conditions with heartbeat writes
+		return s.nodeManager.WriteWithLock("read own slot for fence message", func() error {
+			return s.readOwnSlotForFenceMessageInternal()
+		})
+	}
+	// Fallback for cases without NodeManager (shouldn't happen in normal operation)
+	return s.readOwnSlotForFenceMessageInternal()
+}
+
+// readOwnSlotForFenceMessageInternal performs the actual read operation without locking
+func (s *SBDAgent) readOwnSlotForFenceMessageInternal() error {
 	if s.sbdDevice == nil || s.sbdDevice.IsClosed() {
 		return fmt.Errorf("SBD device is not available")
 	}

@@ -963,6 +963,52 @@ func (s *SBDAgent) writeHeartbeatToSBDInternal() error {
 	return nil
 }
 
+// extractMessageFromSlot extracts the actual SBD message from a 512-byte slot
+// by detecting message boundaries and returning only the message portion
+func extractMessageFromSlot(slotData []byte) ([]byte, error) {
+	// Check minimum size for magic string
+	if len(slotData) < 8 {
+		return nil, fmt.Errorf("slot too small for magic string")
+	}
+
+	// Check if slot starts with SBD magic string
+	if string(slotData[:8]) != sbdprotocol.SBD_MAGIC {
+		return nil, fmt.Errorf("no valid SBD message found in slot")
+	}
+
+	// Parse header to determine message size
+	// We need at least the minimum header size to determine the actual message length
+	minHeaderSize := 8 + 2 + 1 + 2 + 1 + 8 + 8 + 4 // magic + version + type + nodeID + nodeNameLen + timestamp + sequence + checksum
+	if len(slotData) < minHeaderSize {
+		return nil, fmt.Errorf("slot too small for minimum header")
+	}
+
+	// Read node name length to calculate actual header size
+	nodeNameLength := slotData[13]                              // Position after magic(8) + version(2) + type(1) + nodeID(2)
+	actualHeaderSize := minHeaderSize + int(nodeNameLength) - 1 // -1 because nodeNameLen is already counted in minHeaderSize
+
+	// For heartbeat messages, the message is just the header
+	// For fence messages, add 3 bytes (targetNodeID + reason)
+	messageType := slotData[10] // Position after magic(8) + version(2)
+	var messageSize int
+	switch messageType {
+	case sbdprotocol.SBD_MSG_TYPE_HEARTBEAT:
+		messageSize = actualHeaderSize
+	case sbdprotocol.SBD_MSG_TYPE_FENCE:
+		messageSize = actualHeaderSize + 3 // targetNodeID(2) + reason(1)
+	default:
+		return nil, fmt.Errorf("unknown message type: %d", messageType)
+	}
+
+	// Validate message size
+	if messageSize > len(slotData) {
+		return nil, fmt.Errorf("calculated message size %d exceeds slot size %d", messageSize, len(slotData))
+	}
+
+	// Return only the message portion
+	return slotData[:messageSize], nil
+}
+
 // readPeerHeartbeat reads and processes a heartbeat from a peer node's slot
 func (s *SBDAgent) readPeerHeartbeat(peerNodeID uint16) error {
 	if s.sbdDevice == nil || s.sbdDevice.IsClosed() {
@@ -985,8 +1031,18 @@ func (s *SBDAgent) readPeerHeartbeat(peerNodeID uint16) error {
 		return fmt.Errorf("partial read from peer %d slot: read %d bytes, expected %d", peerNodeID, n, sbdprotocol.SBD_SLOT_SIZE)
 	}
 
+	// Find the actual message boundaries and unmarshal only the message portion
+	messageData, err := extractMessageFromSlot(slotData)
+	if err != nil {
+		// Don't log as error since empty slots are expected
+		logger.V(1).Info("Failed to extract message from peer slot",
+			"peerNodeID", peerNodeID,
+			"error", err)
+		return nil
+	}
+
 	// Try to unmarshal the message header
-	header, err := sbdprotocol.Unmarshal(slotData)
+	header, err := sbdprotocol.Unmarshal(messageData)
 	if err != nil {
 		// Don't log as error since empty slots are expected
 		logger.V(1).Info("Failed to unmarshal peer heartbeat",
@@ -1572,8 +1628,18 @@ func (s *SBDAgent) readOwnSlotForFenceMessageInternal() error {
 		return fmt.Errorf("partial read from own slot %d: read %d bytes, expected %d", s.nodeID, n, sbdprotocol.SBD_SLOT_SIZE)
 	}
 
+	// Find the actual message boundaries and unmarshal only the message portion
+	messageData, err := extractMessageFromSlot(slotData)
+	if err != nil {
+		// Not a valid message, could be empty slot or heartbeat we wrote
+		logger.V(1).Info("Failed to extract message from own slot",
+			"nodeID", s.nodeID,
+			"error", err)
+		return nil
+	}
+
 	// Try to unmarshal the message header
-	header, err := sbdprotocol.Unmarshal(slotData)
+	header, err := sbdprotocol.Unmarshal(messageData)
 	if err != nil {
 		// Not a valid message, could be empty slot or heartbeat we wrote
 		logger.V(1).Info("Failed to unmarshal message from own slot",
@@ -1585,7 +1651,7 @@ func (s *SBDAgent) readOwnSlotForFenceMessageInternal() error {
 	// Check if this is a fence message
 	if header.Type == sbdprotocol.SBD_MSG_TYPE_FENCE {
 		// Try to unmarshal as a fence message to get the target
-		fenceMsg, err := sbdprotocol.UnmarshalFence(slotData)
+		fenceMsg, err := sbdprotocol.UnmarshalFence(messageData)
 		if err != nil {
 			logger.Error(err, "Failed to unmarshal fence message from own slot",
 				"nodeID", s.nodeID)
@@ -1777,8 +1843,14 @@ func performSBDReadWriteTest(device BlockDevice, nodeID uint16, nodeName string)
 		}
 	}
 
+	// Extract message from the read buffer and unmarshal to ensure it's valid
+	messageData, err := extractMessageFromSlot(readBuffer)
+	if err != nil {
+		return fmt.Errorf("failed to extract test message from read buffer: %w", err)
+	}
+
 	// Try to unmarshal the read data to ensure it's valid
-	readHeader, err := sbdprotocol.Unmarshal(readBuffer)
+	readHeader, err := sbdprotocol.Unmarshal(messageData)
 	if err != nil {
 		return fmt.Errorf("failed to unmarshal test message read from SBD device: %w", err)
 	}

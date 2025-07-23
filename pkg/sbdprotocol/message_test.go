@@ -300,8 +300,9 @@ func TestChecksumValidation(t *testing.T) {
 }
 
 func TestMarshalHeartbeat(t *testing.T) {
+	nodeName := "test-node"
 	heartbeat := SBDHeartbeatMessage{
-		Header: NewHeartbeat(1, "test-node", 100),
+		Header: NewHeartbeat(1, nodeName, 100),
 	}
 
 	data, err := MarshalHeartbeat(heartbeat)
@@ -309,8 +310,9 @@ func TestMarshalHeartbeat(t *testing.T) {
 		t.Fatalf("MarshalHeartbeat failed: %v", err)
 	}
 
-	if len(data) != SBD_HEADER_MIN_SIZE {
-		t.Errorf("Expected data size %d, got %d", SBD_HEADER_MIN_SIZE, len(data))
+	expectedSize := SBD_HEADER_MIN_SIZE + len(nodeName)
+	if len(data) != expectedSize {
+		t.Errorf("Expected data size %d, got %d", expectedSize, len(data))
 	}
 
 	// Verify we can unmarshal it as a heartbeat
@@ -325,8 +327,9 @@ func TestMarshalHeartbeat(t *testing.T) {
 }
 
 func TestMarshalFence(t *testing.T) {
+	nodeName := "node1"
 	fence := SBDFenceMessage{
-		Header:       NewFence(1, "node1", 2, 100, FENCE_REASON_MANUAL),
+		Header:       NewFence(1, nodeName, 2, 100, FENCE_REASON_MANUAL),
 		TargetNodeID: 2,
 		Reason:       FENCE_REASON_MANUAL,
 	}
@@ -336,7 +339,7 @@ func TestMarshalFence(t *testing.T) {
 		t.Fatalf("MarshalFence failed: %v", err)
 	}
 
-	expectedSize := SBD_HEADER_MIN_SIZE + 3 // Header + TargetNodeID (2) + Reason (1)
+	expectedSize := SBD_HEADER_MIN_SIZE + len(nodeName) + 3 // Header + NodeName + TargetNodeID (2) + Reason (1)
 	if len(data) != expectedSize {
 		t.Errorf("Expected data size %d, got %d", expectedSize, len(data))
 	}

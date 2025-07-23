@@ -1749,3 +1749,385 @@ func TestPreflightChecks_BothFailing(t *testing.T) {
 		t.Errorf("Expected error about both devices being inaccessible, but got: %v", err)
 	}
 }
+
+// TestExtractMessageFromSlot tests the extractMessageFromSlot function that fixes checksum mismatches
+func TestExtractMessageFromSlot(t *testing.T) {
+	tests := []struct {
+		name          string
+		setup         func() []byte
+		expectError   bool
+		expectedSize  int
+		errorContains string
+	}{
+		{
+			name: "valid heartbeat message with short node name",
+			setup: func() []byte {
+				// Create a heartbeat message and embed it in a 512-byte slot
+				nodeID := uint16(42)
+				nodeName := "node1"
+				sequence := uint64(123)
+
+				heartbeat := sbdprotocol.SBDHeartbeatMessage{
+					Header: sbdprotocol.NewHeartbeat(nodeID, nodeName, sequence),
+				}
+
+				msgBytes, _ := sbdprotocol.MarshalHeartbeat(heartbeat)
+
+				// Create 512-byte slot with message at start and zeros at end
+				slot := make([]byte, sbdprotocol.SBD_SLOT_SIZE)
+				copy(slot, msgBytes)
+
+				return slot
+			},
+			expectError:  false,
+			expectedSize: 34 + 5, // SBD_HEADER_MIN_SIZE + len("node1")
+		},
+		{
+			name: "valid heartbeat message with long node name",
+			setup: func() []byte {
+				// Create a heartbeat message with longer node name
+				nodeID := uint16(99)
+				nodeName := "very-long-node-name-for-testing-variable-length-parsing"
+				sequence := uint64(456)
+
+				heartbeat := sbdprotocol.SBDHeartbeatMessage{
+					Header: sbdprotocol.NewHeartbeat(nodeID, nodeName, sequence),
+				}
+
+				msgBytes, _ := sbdprotocol.MarshalHeartbeat(heartbeat)
+
+				// Create 512-byte slot with message at start and zeros at end
+				slot := make([]byte, sbdprotocol.SBD_SLOT_SIZE)
+				copy(slot, msgBytes)
+
+				return slot
+			},
+			expectError:  false,
+			expectedSize: 34 + 58, // SBD_HEADER_MIN_SIZE + len("very-long-node-name-for-testing-variable-length-parsing")
+		},
+		{
+			name: "valid fence message",
+			setup: func() []byte {
+				// Create a fence message
+				nodeID := uint16(1)
+				nodeName := "fencer"
+				targetNodeID := uint16(2)
+				sequence := uint64(789)
+				reason := sbdprotocol.FENCE_REASON_HEARTBEAT_TIMEOUT
+
+				fence := sbdprotocol.SBDFenceMessage{
+					Header:       sbdprotocol.NewFence(nodeID, nodeName, targetNodeID, sequence, reason),
+					TargetNodeID: targetNodeID,
+					Reason:       reason,
+				}
+
+				msgBytes, _ := sbdprotocol.MarshalFence(fence)
+
+				// Create 512-byte slot with message at start and zeros at end
+				slot := make([]byte, sbdprotocol.SBD_SLOT_SIZE)
+				copy(slot, msgBytes)
+
+				return slot
+			},
+			expectError:  false,
+			expectedSize: 34 + 6 + 3, // SBD_HEADER_MIN_SIZE + len("fencer") + fence fields
+		},
+		{
+			name: "empty slot",
+			setup: func() []byte {
+				// Create empty 512-byte slot (all zeros)
+				return make([]byte, sbdprotocol.SBD_SLOT_SIZE)
+			},
+			expectError:   true,
+			errorContains: "no valid SBD message found",
+		},
+		{
+			name: "slot too small",
+			setup: func() []byte {
+				// Create slot smaller than magic string
+				return make([]byte, 4)
+			},
+			expectError:   true,
+			errorContains: "slot too small for magic string",
+		},
+		{
+			name: "invalid magic string",
+			setup: func() []byte {
+				slot := make([]byte, sbdprotocol.SBD_SLOT_SIZE)
+				copy(slot, []byte("BADMAGIC"))
+				return slot
+			},
+			expectError:   true,
+			errorContains: "no valid SBD message found",
+		},
+		{
+			name: "truncated header",
+			setup: func() []byte {
+				slot := make([]byte, sbdprotocol.SBD_SLOT_SIZE)
+				copy(slot, []byte(sbdprotocol.SBD_MAGIC))
+				// Don't provide enough data for full header
+				return slot
+			},
+			expectError:   true,
+			errorContains: "slot too small for minimum header",
+		},
+		{
+			name: "unknown message type",
+			setup: func() []byte {
+				slot := make([]byte, sbdprotocol.SBD_SLOT_SIZE)
+				copy(slot, []byte(sbdprotocol.SBD_MAGIC))
+				// Set version, then invalid message type
+				slot[8] = 1   // version low byte
+				slot[9] = 0   // version high byte
+				slot[10] = 99 // invalid message type
+				slot[11] = 1  // nodeID low byte
+				slot[12] = 0  // nodeID high byte
+				slot[13] = 4  // node name length
+				return slot
+			},
+			expectError:   true,
+			errorContains: "unknown message type",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			slotData := tt.setup()
+
+			result, err := extractMessageFromSlot(slotData)
+
+			if tt.expectError {
+				if err == nil {
+					t.Errorf("Expected error but got none")
+					return
+				}
+				if tt.errorContains != "" && !strings.Contains(err.Error(), tt.errorContains) {
+					t.Errorf("Expected error containing %q, got %q", tt.errorContains, err.Error())
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("Unexpected error: %v", err)
+				return
+			}
+
+			if len(result) != tt.expectedSize {
+				t.Errorf("Expected message size %d, got %d", tt.expectedSize, len(result))
+			}
+
+			// Verify the extracted message can be unmarshaled without checksum errors
+			_, err = sbdprotocol.Unmarshal(result)
+			if err != nil {
+				t.Errorf("Failed to unmarshal extracted message: %v", err)
+			}
+		})
+	}
+}
+
+// TestChecksumMismatchRegression tests that the checksum mismatch issue from commit e33bc22 is fixed
+func TestChecksumMismatchRegression(t *testing.T) {
+	t.Run("regression test for commit e33bc22 checksum mismatch", func(t *testing.T) {
+		// Create a heartbeat message
+		nodeID := uint16(23)
+		nodeName := "test-node-with-variable-length-name"
+		sequence := uint64(100)
+
+		heartbeat := sbdprotocol.SBDHeartbeatMessage{
+			Header: sbdprotocol.NewHeartbeat(nodeID, nodeName, sequence),
+		}
+
+		msgBytes, err := sbdprotocol.MarshalHeartbeat(heartbeat)
+		if err != nil {
+			t.Fatalf("Failed to marshal heartbeat: %v", err)
+		}
+
+		// Create a 512-byte slot with the message at the start and garbage/zeros at the end
+		// This simulates what would be read from an actual SBD device slot
+		slot := make([]byte, sbdprotocol.SBD_SLOT_SIZE)
+		copy(slot, msgBytes)
+		// Add some "garbage" data after the message (simulating old data in slot)
+		for i := len(msgBytes); i < len(slot); i++ {
+			slot[i] = byte(i % 256)
+		}
+
+		// The OLD way (commit e33bc22) - this would cause checksum mismatch
+		// because it includes garbage data in checksum calculation
+		_, err = sbdprotocol.Unmarshal(slot)
+		if err == nil {
+			t.Error("Expected checksum mismatch error with full slot unmarshaling, but got none")
+		} else if !strings.Contains(err.Error(), "checksum mismatch") {
+			t.Errorf("Expected checksum mismatch error, got: %v", err)
+		}
+
+		// The NEW way (our fix) - this should work correctly
+		messageData, err := extractMessageFromSlot(slot)
+		if err != nil {
+			t.Fatalf("Failed to extract message from slot: %v", err)
+		}
+
+		header, err := sbdprotocol.Unmarshal(messageData)
+		if err != nil {
+			t.Fatalf("Failed to unmarshal extracted message: %v", err)
+		}
+
+		// Verify the message was unmarshaled correctly
+		if header.NodeID != nodeID {
+			t.Errorf("Expected nodeID %d, got %d", nodeID, header.NodeID)
+		}
+		if header.NodeName != nodeName {
+			t.Errorf("Expected nodeName %q, got %q", nodeName, header.NodeName)
+		}
+		if header.Sequence != sequence {
+			t.Errorf("Expected sequence %d, got %d", sequence, header.Sequence)
+		}
+	})
+}
+
+// TestReadPeerHeartbeatChecksumFix tests that readPeerHeartbeat now handles checksum validation correctly
+func TestReadPeerHeartbeatChecksumFix(t *testing.T) {
+	// Create mock device with 512-byte slots
+	deviceSize := int(sbdprotocol.SBD_SLOT_SIZE * 10)
+	mockDevice := NewMockBlockDevice("/dev/mock", deviceSize)
+
+	// Create SBD agent with mock device
+	mockWatchdog := &MockWatchdog{path: "/dev/watchdog0"}
+	agent, err := NewSBDAgentWithWatchdog(
+		mockWatchdog,
+		mockDevice.Path(),
+		"test-node",
+		"test-cluster",
+		1,             // nodeID
+		5*time.Second, // petInterval
+		5*time.Second, // sbdUpdateInterval
+		2*time.Second, // heartbeatInterval
+		3*time.Second, // peerCheckInterval
+		30,            // sbdTimeoutSeconds
+		"panic",       // rebootMethod
+		8080,          // metricsPort
+		time.Hour,     // staleNodeTimeout
+		false,         // fileLockingEnabled
+		nil,           // k8sClient
+		nil,           // k8sClientset
+		"",            // watchNamespace
+		false,         // enableFencing
+	)
+	if err != nil {
+		t.Fatalf("Failed to create SBD agent: %v", err)
+	}
+	agent.setSBDDevice(mockDevice)
+
+	// Create a peer heartbeat message in slot 2
+	peerNodeID := uint16(2)
+	peerNodeName := "peer-node-with-long-name-to-test-checksum"
+	peerSequence := uint64(456)
+
+	peerHeartbeat := sbdprotocol.SBDHeartbeatMessage{
+		Header: sbdprotocol.NewHeartbeat(peerNodeID, peerNodeName, peerSequence),
+	}
+
+	msgBytes, err := sbdprotocol.MarshalHeartbeat(peerHeartbeat)
+	if err != nil {
+		t.Fatalf("Failed to marshal peer heartbeat: %v", err)
+	}
+
+	// Write message to slot 2 with garbage after it (simulating real SBD device)
+	slotOffset := int64(peerNodeID) * sbdprotocol.SBD_SLOT_SIZE
+	slotData := make([]byte, sbdprotocol.SBD_SLOT_SIZE)
+	copy(slotData, msgBytes)
+	// Add garbage after the message
+	for i := len(msgBytes); i < len(slotData); i++ {
+		slotData[i] = 0xFF // Fill with garbage
+	}
+
+	_, err = mockDevice.WriteAt(slotData, slotOffset)
+	if err != nil {
+		t.Fatalf("Failed to write slot data: %v", err)
+	}
+
+	// Test reading peer heartbeat - should work without checksum errors
+	err = agent.readPeerHeartbeat(peerNodeID)
+	if err != nil {
+		t.Errorf("readPeerHeartbeat failed with checksum fix: %v", err)
+	}
+
+	// Verify peer was added to monitor
+	peers := agent.peerMonitor.GetPeerStatus()
+	if len(peers) != 1 {
+		t.Errorf("Expected 1 peer, got %d", len(peers))
+	}
+
+	if peer, exists := peers[peerNodeID]; !exists {
+		t.Error("Peer not found in monitor")
+	} else {
+		if peer.LastSequence != peerSequence {
+			t.Errorf("Expected peer sequence %d, got %d", peerSequence, peer.LastSequence)
+		}
+	}
+}
+
+// TestReadOwnSlotChecksumFix tests that readOwnSlotForFenceMessage handles checksum validation correctly
+func TestReadOwnSlotChecksumFix(t *testing.T) {
+	// Create mock device
+	deviceSize := int(sbdprotocol.SBD_SLOT_SIZE * 10)
+	mockDevice := NewMockBlockDevice("/dev/mock", deviceSize)
+
+	// Create SBD agent
+	mockWatchdog := &MockWatchdog{path: "/dev/watchdog0"}
+	agent, err := NewSBDAgentWithWatchdog(
+		mockWatchdog,
+		mockDevice.Path(),
+		"test-node",
+		"test-cluster",
+		3,             // nodeID
+		5*time.Second, // petInterval
+		5*time.Second, // sbdUpdateInterval
+		2*time.Second, // heartbeatInterval
+		3*time.Second, // peerCheckInterval
+		30,            // sbdTimeoutSeconds
+		"panic",       // rebootMethod
+		8080,          // metricsPort
+		time.Hour,     // staleNodeTimeout
+		false,         // fileLockingEnabled
+		nil,           // k8sClient
+		nil,           // k8sClientset
+		"",            // watchNamespace
+		false,         // enableFencing
+	)
+	if err != nil {
+		t.Fatalf("Failed to create SBD agent: %v", err)
+	}
+	agent.setSBDDevice(mockDevice)
+
+	t.Run("read own heartbeat from slot", func(t *testing.T) {
+		// Write a heartbeat to our own slot
+		heartbeat := sbdprotocol.SBDHeartbeatMessage{
+			Header: sbdprotocol.NewHeartbeat(agent.nodeID, agent.nodeName, 123),
+		}
+
+		msgBytes, err := sbdprotocol.MarshalHeartbeat(heartbeat)
+		if err != nil {
+			t.Fatalf("Failed to marshal heartbeat: %v", err)
+		}
+
+		// Create slot with message + garbage
+		slotOffset := int64(agent.nodeID) * sbdprotocol.SBD_SLOT_SIZE
+		slotData := make([]byte, sbdprotocol.SBD_SLOT_SIZE)
+		copy(slotData, msgBytes)
+		// Fill rest with garbage
+		for i := len(msgBytes); i < len(slotData); i++ {
+			slotData[i] = byte(i % 256)
+		}
+
+		_, err = mockDevice.WriteAt(slotData, slotOffset)
+		if err != nil {
+			t.Fatalf("Failed to write slot data: %v", err)
+		}
+
+		// Read own slot - should work without checksum errors
+		err = agent.readOwnSlotForFenceMessage()
+		if err != nil {
+			t.Errorf("readOwnSlotForFenceMessage failed: %v", err)
+		}
+	})
+}

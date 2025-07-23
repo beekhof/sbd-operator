@@ -281,8 +281,13 @@ func Unmarshal(data []byte) (*SBDMessageHeader, error) {
 		return nil, fmt.Errorf("invalid magic string: expected %q, got %q", SBD_MAGIC, string(msg.Magic[:]))
 	}
 
-	// Validate checksum by recalculating it from the data (excluding checksum field)
-	dataWithoutChecksum := data[:len(data)-4] // Exclude last 4 bytes (checksum)
+	// Validate checksum by recalculating it from the actual message data (excluding checksum field)
+	// Calculate the actual message size: fixed header + variable node name
+	actualMessageSize := SBD_HEADER_MIN_SIZE + len(msg.NodeName)
+	if len(data) < actualMessageSize {
+		return nil, fmt.Errorf("data too short for calculated message size: expected at least %d bytes, got %d", actualMessageSize, len(data))
+	}
+	dataWithoutChecksum := data[:actualMessageSize-4] // Exclude checksum from actual message
 	expectedChecksum := CalculateChecksum(dataWithoutChecksum)
 	if msg.Checksum != expectedChecksum {
 		return nil, fmt.Errorf("checksum mismatch: expected 0x%08x, got 0x%08x", expectedChecksum, msg.Checksum)
@@ -382,14 +387,11 @@ func UnmarshalFence(data []byte) (*SBDFenceMessage, error) {
 		return nil, fmt.Errorf("invalid message type for fence: expected %d, got %d", SBD_MSG_TYPE_FENCE, header.Type)
 	}
 
-	// Calculate the actual header size by marshaling it
-	headerData, err := Marshal(*header)
-	if err != nil {
-		return nil, fmt.Errorf("failed to determine header size: %w", err)
-	}
-	headerSize := len(headerData) - 4 // Exclude checksum from header size
+	// Calculate the actual header size directly from the node name length
+	// Header size = SBD_HEADER_MIN_SIZE + len(NodeName) (includes checksum)
+	headerSize := SBD_HEADER_MIN_SIZE + len(header.NodeName)
 
-	// Read fence-specific fields from after the header
+	// Read fence-specific fields from after the complete header
 	if len(data) < headerSize+3 {
 		return nil, fmt.Errorf("data too short for fence fields: expected at least %d bytes, got %d", headerSize+3, len(data))
 	}

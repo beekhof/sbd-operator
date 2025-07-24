@@ -963,12 +963,27 @@ func (s *SBDAgent) writeHeartbeatToSBDInternal() error {
 	return nil
 }
 
+// Check if the slot is empty (all bytes are zero)
+func isEmptySlot(slotData []byte) bool {
+	for _, b := range slotData {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // extractMessageFromSlot extracts the actual SBD message from a 512-byte slot
 // by detecting message boundaries and returning only the message portion
 func extractMessageFromSlot(slotData []byte) ([]byte, error) {
 	// Check minimum size for magic string
 	if len(slotData) < 8 {
 		return nil, fmt.Errorf("slot too small for magic string")
+	}
+
+	// Check if slot is empty first
+	if isEmptySlot(slotData) {
+		return nil, fmt.Errorf("no valid SBD message found in slot")
 	}
 
 	// Check if slot starts with SBD magic string
@@ -984,8 +999,8 @@ func extractMessageFromSlot(slotData []byte) ([]byte, error) {
 	}
 
 	// Read node name length to calculate actual header size
-	nodeNameLength := slotData[13]                              // Position after magic(8) + version(2) + type(1) + nodeID(2)
-	actualHeaderSize := minHeaderSize + int(nodeNameLength) - 1 // -1 because nodeNameLen is already counted in minHeaderSize
+	nodeNameLength := slotData[13]                          // Position after magic(8) + version(2) + type(1) + nodeID(2)
+	actualHeaderSize := minHeaderSize + int(nodeNameLength) // minHeaderSize includes nodeNameLen byte, add actual name bytes
 
 	// For heartbeat messages, the message is just the header
 	// For fence messages, add 3 bytes (targetNodeID + reason)
@@ -1029,6 +1044,11 @@ func (s *SBDAgent) readPeerHeartbeat(peerNodeID uint16) error {
 
 	if n != sbdprotocol.SBD_SLOT_SIZE {
 		return fmt.Errorf("partial read from peer %d slot: read %d bytes, expected %d", peerNodeID, n, sbdprotocol.SBD_SLOT_SIZE)
+	}
+
+	// Check if the slot is empty after reading the data
+	if isEmptySlot(slotData) {
+		return nil // Empty slot is normal, don't log as error
 	}
 
 	// Find the actual message boundaries and unmarshal only the message portion

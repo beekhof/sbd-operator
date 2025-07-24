@@ -20,8 +20,9 @@ func TestDebugMessageSizes(t *testing.T) {
 	t.Logf("Short name 'node1': size=%d, data=%x", len(msgBytes1), msgBytes1)
 
 	// Test heartbeat with long name
+	longNodeName := "very-long-node-name-for-testing-variable-length-parsing"
 	heartbeat2 := sbdprotocol.SBDHeartbeatMessage{
-		Header: sbdprotocol.NewHeartbeat(99, "very-long-node-name-for-testing", 456),
+		Header: sbdprotocol.NewHeartbeat(99, longNodeName, 456),
 	}
 
 	msgBytes2, err := sbdprotocol.MarshalHeartbeat(heartbeat2)
@@ -29,7 +30,18 @@ func TestDebugMessageSizes(t *testing.T) {
 		t.Fatalf("Failed to marshal: %v", err)
 	}
 
-	t.Logf("Long name 'very-long-node-name-for-testing': size=%d", len(msgBytes2))
+	t.Logf("Long name '%s': length=%d, size=%d", longNodeName, len(longNodeName), len(msgBytes2))
+
+	// Test extraction
+	slot := make([]byte, sbdprotocol.SBD_SLOT_SIZE)
+	copy(slot, msgBytes2)
+
+	extracted, err := extractMessageFromSlot(slot)
+	if err != nil {
+		t.Fatalf("Failed to extract: %v", err)
+	}
+
+	t.Logf("Extracted size: %d, expected: %d", len(extracted), 34+len(longNodeName))
 
 	// Test fence message
 	fence := sbdprotocol.SBDFenceMessage{

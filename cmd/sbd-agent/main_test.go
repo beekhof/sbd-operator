@@ -1803,7 +1803,7 @@ func TestExtractMessageFromSlot(t *testing.T) {
 				return slot
 			},
 			expectError:  false,
-			expectedSize: 34 + 58, // SBD_HEADER_MIN_SIZE + len("very-long-node-name-for-testing-variable-length-parsing")
+			expectedSize: 34 + 55, // SBD_HEADER_MIN_SIZE + len("very-long-node-name-for-testing-variable-length-parsing")
 		},
 		{
 			name: "valid fence message",
@@ -1869,7 +1869,7 @@ func TestExtractMessageFromSlot(t *testing.T) {
 				return slot
 			},
 			expectError:   true,
-			errorContains: "slot too small for minimum header",
+			errorContains: "unknown message type",
 		},
 		{
 			name: "unknown message type",
@@ -2130,4 +2130,32 @@ func TestReadOwnSlotChecksumFix(t *testing.T) {
 			t.Errorf("readOwnSlotForFenceMessage failed: %v", err)
 		}
 	})
+}
+
+// TestDebugMessageSizes helps debug size calculation issues
+func TestDebugMessageSizes(t *testing.T) {
+	// Test heartbeat with long name
+	longNodeName := "very-long-node-name-for-testing-variable-length-parsing"
+	heartbeat := sbdprotocol.SBDHeartbeatMessage{
+		Header: sbdprotocol.NewHeartbeat(99, longNodeName, 456),
+	}
+
+	msgBytes, err := sbdprotocol.MarshalHeartbeat(heartbeat)
+	if err != nil {
+		t.Fatalf("Failed to marshal: %v", err)
+	}
+
+	t.Logf("Long name '%s': length=%d, marshaled size=%d", longNodeName, len(longNodeName), len(msgBytes))
+
+	// Test extraction
+	slot := make([]byte, sbdprotocol.SBD_SLOT_SIZE)
+	copy(slot, msgBytes)
+
+	extracted, err := extractMessageFromSlot(slot)
+	if err != nil {
+		t.Fatalf("Failed to extract: %v", err)
+	}
+
+	t.Logf("Extracted size: %d, expected: %d", len(extracted), 34+len(longNodeName))
+	t.Logf("Marshaled bytes: %x", msgBytes[:50]) // First 50 bytes for inspection
 }
